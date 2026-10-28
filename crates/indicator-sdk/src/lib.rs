@@ -12,7 +12,7 @@ pub mod author;
 pub mod model;
 pub mod protocol;
 
-pub use author::{ComputeContext, Indicator, SeriesSet};
+pub use author::{ComputeContext, ComputePhase, Indicator, SeriesSet};
 pub use model::*;
 
 /// SDK crate version, informational only (compatibility is decided by ABI and

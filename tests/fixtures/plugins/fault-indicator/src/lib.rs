@@ -47,6 +47,8 @@ impl Indicator for Fault {
                 pane: Pane::Price,
                 pane_group: None,
                 colors: vec![],
+                widths: vec![],
+                readout_only: false,
                 kind: OutputKind::Line,
             }],
             live: true,

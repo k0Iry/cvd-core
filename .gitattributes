@@ -1,0 +1,2 @@
+# Preserve upstream license wording/formatting without code-style whitespace checks.
+THIRD_PARTY_LICENSES.txt text eol=lf -whitespace

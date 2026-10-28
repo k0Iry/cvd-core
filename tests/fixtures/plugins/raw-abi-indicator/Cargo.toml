@@ -1,0 +1,15 @@
+[package]
+license.workspace = true
+rust-version.workspace = true
+name = "raw-abi-indicator"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cvd-indicator-sdk = { path = "../../../../crates/indicator-sdk" }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+libc = "0.2"

@@ -9,7 +9,7 @@
 //! runner can emit protocol frames.
 
 use cvd_indicator_sdk::abi::*;
-use cvd_indicator_sdk::model::{codes, Descriptor, PluginError};
+use cvd_indicator_sdk::model::{codes, diagnostic_text, Descriptor, PluginError};
 use cvd_indicator_sdk::protocol::{read_frame, write_frame, Frame, FrameHeader, FrameKind, Limits};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
@@ -17,6 +17,12 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::fd::FromRawFd;
 use std::process::ExitCode;
+
+/// Hard cap on a library-produced error document, checked before the buffer
+/// is sliced, copied or decoded (independent of the response frame limit).
+const MAX_ABI_ERROR_BYTES: usize = 4096;
+/// Bytes of library error text retained for operator stderr diagnostics.
+const MAX_DIAGNOSTIC_BYTES: usize = 256;
 
 struct Library {
     _dl: *mut c_void,
@@ -36,9 +42,9 @@ fn dl_error() -> String {
 }
 
 /// Returns (library, descriptor JSON) or a public error (raw details → stderr).
-fn load(path: &str) -> Result<(Library, Vec<u8>), PluginError> {
+fn load(path: &str, max_descriptor: usize) -> Result<(Library, Vec<u8>), PluginError> {
     let incompatible = |public: &str, local: String| {
-        eprintln!("cvd-indicator-runner: {public}: {local}");
+        eprintln!("cvd-indicator-runner: {public}: {}", diagnostic_text(local.as_bytes(), 512));
         PluginError::new(codes::INCOMPATIBLE, public)
     };
     let c = CString::new(path).map_err(|_| incompatible("library load failed", "path contains NUL".into()))?;
@@ -65,8 +71,13 @@ fn load(path: &str) -> Result<(Library, Vec<u8>), PluginError> {
     let api: &'static CvdPluginApiV1 = unsafe { &*api };
     let mut buf = CvdBuffer::empty();
     let status = unsafe { (api.describe)(&mut buf) };
-    let bytes = unsafe { buf.as_slice().to_vec() };
+    // Bound the library-owned buffer before slicing; always free it.
+    let len = buf.len;
+    let bytes = if len <= max_descriptor { unsafe { buf.as_slice().to_vec() } } else { Vec::new() };
     unsafe { (api.free_buffer)(buf) };
+    if len > max_descriptor {
+        return Err(incompatible("descriptor too large", format!("{len} bytes")));
+    }
     if status != STATUS_OK {
         return Err(incompatible("describe failed", format!("status {status}")));
     }
@@ -98,22 +109,54 @@ impl Runner {
         let mut handle = std::ptr::null_mut();
         let mut err = CvdBuffer::empty();
         let status = unsafe { (self.lib.api.create)(params.as_ptr(), params.len(), &mut handle, &mut err) };
-        let err_bytes = unsafe { err.as_slice().to_vec() };
+        let e = if status == STATUS_OK { None } else { Some(self.status_error("create", status, &err)) };
         unsafe { (self.lib.api.free_buffer)(err) };
-        if status == STATUS_OK && !handle.is_null() {
-            return Ok(handle);
+        match e {
+            None if !handle.is_null() => Ok(handle),
+            None => Err(PluginError::public_for(codes::PROTOCOL)),
+            Some(e) => {
+                if !handle.is_null() {
+                    unsafe { (self.lib.api.destroy)(handle) };
+                }
+                Err(e)
+            }
         }
-        Err(self.status_error(status, &err_bytes))
     }
 
-    fn status_error(&self, status: i32, bytes: &[u8]) -> PluginError {
+    /// Maps a non-OK status and its (still library-owned, unfreed) buffer to a
+    /// public error with a fixed message. The buffer length is checked before
+    /// any slice/copy/decode; bounded library text goes to stderr only.
+    fn status_error(&self, op: &str, status: i32, buf: &CvdBuffer) -> PluginError {
         match status {
-            STATUS_PANIC => PluginError::new(codes::PANIC, "indicator panicked"),
-            STATUS_ERROR => serde_json::from_slice::<PluginError>(bytes)
-                .map(|e| PluginError::new(e.code, e.message))
-                .unwrap_or_else(|_| PluginError::compute("indicator returned an unreadable error")),
-            STATUS_INVALID_ARGUMENT => PluginError::new(codes::PROTOCOL, "invalid argument at ABI boundary"),
-            s => PluginError::new(codes::PROTOCOL, format!("unknown ABI status {s}")),
+            STATUS_PANIC => PluginError::public_for(codes::PANIC),
+            STATUS_ERROR => {
+                if buf.len > MAX_ABI_ERROR_BYTES {
+                    eprintln!("cvd-indicator-runner: {op}: oversized error buffer ({} bytes) rejected", buf.len);
+                    return PluginError::public_for(codes::COMPUTE_FAILED);
+                }
+                let bytes = unsafe { buf.as_slice() };
+                match serde_json::from_slice::<PluginError>(bytes) {
+                    Ok(e) => {
+                        let code =
+                            (e.code.len() <= codes::MAX_CODE_LEN).then(|| codes::library_allowed(&e.code)).flatten();
+                        eprintln!(
+                            "cvd-indicator-runner: {op}: library error code={} message={}",
+                            diagnostic_text(e.code.as_bytes(), codes::MAX_CODE_LEN),
+                            diagnostic_text(e.message.as_bytes(), MAX_DIAGNOSTIC_BYTES)
+                        );
+                        PluginError::public_for(code.unwrap_or(codes::COMPUTE_FAILED))
+                    }
+                    Err(_) => {
+                        eprintln!("cvd-indicator-runner: {op}: unreadable error document ({} bytes)", bytes.len());
+                        PluginError::public_for(codes::COMPUTE_FAILED)
+                    }
+                }
+            }
+            STATUS_INVALID_ARGUMENT => PluginError::public_for(codes::PROTOCOL),
+            s => {
+                eprintln!("cvd-indicator-runner: {op}: unknown ABI status {s}");
+                PluginError::public_for(codes::PROTOCOL)
+            }
         }
     }
 
@@ -130,7 +173,7 @@ impl Runner {
                 Ok(unsafe { out.as_slice().to_vec() })
             }
         } else {
-            Err(self.status_error(status, unsafe { out.as_slice() }))
+            Err(self.status_error("invoke", status, &out))
         };
         unsafe { (self.lib.api.free_buffer)(out) };
         (status, r)
@@ -238,9 +281,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Die with the host: never outlive the supervising process (Linux).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    }
     // Reserve the original stdout for protocol frames; point fd 1 at stderr so
     // stray library prints cannot corrupt the protocol stream.
-    let proto_fd = unsafe { libc::dup(1) };
+    // F_DUPFD_CLOEXEC: descendants the library may exec never inherit the
+    // protocol write end.
+    let proto_fd = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3) };
     if proto_fd < 0 || unsafe { libc::dup2(2, 1) } < 0 {
         eprintln!("cvd-indicator-runner: cannot isolate stdout");
         return ExitCode::from(2);
@@ -270,7 +320,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(3);
     }
-    let (lib, descriptor) = match load(&path) {
+    let (lib, descriptor) = match load(&path, limits.max_response_bytes) {
         Ok(x) => x,
         Err(e) => {
             let _ = reply(&mut out, hello.header, Reply::Err(e));

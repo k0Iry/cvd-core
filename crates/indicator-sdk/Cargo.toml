@@ -1,4 +1,6 @@
 [package]
+license.workspace = true
+rust-version.workspace = true
 name = "cvd-indicator-sdk"
 description = "Authoring SDK, stable C ABI and framed runner protocol for CVD indicator libraries"
 version.workspace = true
@@ -7,4 +9,4 @@ publish.workspace = true
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }

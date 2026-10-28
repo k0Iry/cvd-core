@@ -25,6 +25,8 @@ fn desc() -> Descriptor {
                 pane: Pane::Price,
                 pane_group: None,
                 colors: vec![],
+                widths: vec![],
+                readout_only: false,
                 kind: OutputKind::Line,
             },
             OutputSpec {
@@ -33,6 +35,8 @@ fn desc() -> Descriptor {
                 pane: Pane::Price,
                 pane_group: None,
                 colors: vec![],
+                widths: vec![],
+                readout_only: false,
                 kind: OutputKind::SegmentedLines { layers: 2, tail_marker: true },
             },
         ],
@@ -120,4 +124,29 @@ fn live_op_wire_shape() {
     assert_eq!(v["op"], "replace");
     assert_eq!(v["bar"]["time"], 5);
     assert!(v["bar"].get("lt").is_none());
+}
+
+#[test]
+fn output_style_metadata_is_optional_and_bounded() {
+    // Older descriptors without the fields still parse with defaults.
+    let v = serde_json::json!({"key":"l","pane":"price","type":"line"});
+    let o: OutputSpec = serde_json::from_value(v).unwrap();
+    assert!(o.widths.is_empty() && !o.readout_only);
+    let mut d = desc();
+    d.outputs[1].widths = vec![3, 1];
+    d.outputs[0].widths = vec![2];
+    d.outputs[0].readout_only = true;
+    d.validate().unwrap();
+    let mut bad = d.clone();
+    bad.outputs[1].widths = vec![1, 2, 3];
+    assert!(bad.validate().is_err());
+    let mut bad = d.clone();
+    bad.outputs[0].widths = vec![0];
+    assert!(bad.validate().is_err());
+    let mut bad = d.clone();
+    bad.outputs[0].widths = vec![MAX_LINE_WIDTH + 1];
+    assert!(bad.validate().is_err());
+    let mut bad = d;
+    bad.outputs[1].readout_only = true;
+    assert!(bad.validate().is_err(), "readout_only only on line");
 }

@@ -23,6 +23,8 @@ pub fn artifacts() -> &'static (PathBuf, PathBuf) {
                 "fault-indicator",
                 "-p",
                 "bad-abi-indicator",
+                "-p",
+                "raw-abi-indicator",
             ])
             .status()
             .expect("cargo build");
@@ -99,7 +101,7 @@ fn pid_alive(pid: u32) -> bool {
 async fn sample_history_matches_direct_computation_and_respects_warmup() {
     let mut c = RunnerClient::spawn(cfg("sample_indicator")).await.expect("spawn");
     assert_eq!(c.descriptor().id, "sample.channel");
-    assert_eq!(c.descriptor().outputs.len(), 4);
+    assert_eq!(c.descriptor().outputs.len(), 5);
     let bars: Vec<InputBar> = (1..=600).map(bar).collect();
     let req = HistoryRequest { scope: scope(Mode::Source), revision: 1, output_from: 100, bars: bars.clone() };
     let out = c.history(br#"{"length":20}"#, &req, 1).await.expect("history");
@@ -110,6 +112,11 @@ async fn sample_history_matches_direct_computation_and_respects_warmup() {
     assert!((sma[0].unwrap() - direct).abs() < 1e-9);
     // Projection of established per-bar delta, not recomputed.
     assert_eq!(line(&out, "delta")[5], Some(bars[105].delta_usdt));
+    let total = bars[105].buy_volume_usdt + bars[105].sell_volume_usdt;
+    assert_eq!(line(&out, "total")[5], Some(total), "readout-only quote total");
+    let ex = c.descriptor().outputs.iter().find(|o| o.key == "extremes").unwrap();
+    assert_eq!(ex.widths, vec![2, 1]);
+    assert!(c.descriptor().outputs.iter().find(|o| o.key == "total").unwrap().readout_only);
 
     // Aggregate mode reads aggregate fields.
     let req = HistoryRequest { scope: scope(Mode::Aggregate), ..req };
@@ -217,6 +224,11 @@ async fn plugin_error_and_panic_keep_runner_alive() {
 async fn stdout_noise_from_library_cannot_corrupt_protocol() {
     let (mut c, r) = fault("stdout_noise").await;
     assert_eq!(r.expect("noise is redirected to stderr").times.len(), 10);
+    // stderr is drained asynchronously; allow the reader task to catch up.
+    let t = Instant::now();
+    while !c.stderr_tail().contains("garbage on stdout") && t.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(c.stderr_tail().contains("garbage on stdout"));
     let req =
         HistoryRequest { scope: scope(Mode::Source), revision: 1, output_from: 0, bars: (1..=3).map(bar).collect() };

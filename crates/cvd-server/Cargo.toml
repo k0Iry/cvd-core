@@ -1,0 +1,32 @@
+[package]
+license.workspace = true
+rust-version.workspace = true
+name = "cvd-server"
+description = "CVD market-data host: ingestion, recovery, persistence, HTTP/WS and indicator runner supervision"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cvd"
+path = "src/main.rs"
+
+[dependencies]
+cvd-indicator-sdk = { path = "../indicator-sdk" }
+cvd-indicator-host = { path = "../indicator-host" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "process", "io-util"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+rand = "0.8"
+anyhow = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite", "macros", "tls-rustls"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

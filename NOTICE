@@ -1,0 +1,17 @@
+CVD core
+Copyright 2026 k0Iry
+
+This distribution includes the following third-party chart components:
+
+TradingView Lightweight Charts™
+Copyright (с) 2025 TradingView, Inc. https://www.tradingview.com/
+Version 5.1.0 — Apache License 2.0.
+See static/vendor/lightweight-charts-5.1.0/LICENSE and NOTICE.
+
+TradingView Lightweight Charts™ — Dual range histogram series plugin
+Copyright (c) 2026 TradingView, Inc. https://www.tradingview.com/
+Version 1.0.0 — Apache License 2.0.
+See static/vendor/lwc-plugin-dual-range-histogram-series-1.0.0/LICENSE and NOTICE.
+
+Rust dependencies retain their respective licenses. These notices do not
+imply affiliation with or endorsement by the named third parties.

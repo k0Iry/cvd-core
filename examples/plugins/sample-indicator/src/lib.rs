@@ -4,6 +4,8 @@
 //! * `channel` — rolling high/low band (dual range, price pane)
 //! * `delta` — projection of the established per-bar delta (histogram)
 //! * `extremes` — rolling max/min close as segmented lines with tail markers
+//!   and per-layer widths
+//! * `total` — readout-only quote volume total (buy + sell), not drawn
 //!
 //! In `aggregate` mode the aggregate fields (`apc/aph/apl/ad`) are used.
 
@@ -38,6 +40,8 @@ impl Indicator for SampleChannel {
                     pane: Pane::Price,
                     pane_group: None,
                     colors: vec!["#f5a623".into()],
+                    widths: vec![],
+                    readout_only: false,
                     kind: OutputKind::Line,
                 },
                 OutputSpec {
@@ -46,6 +50,8 @@ impl Indicator for SampleChannel {
                     pane: Pane::Price,
                     pane_group: None,
                     colors: vec!["rgba(80,140,255,0.15)".into()],
+                    widths: vec![],
+                    readout_only: false,
                     kind: OutputKind::DualRange,
                 },
                 OutputSpec {
@@ -54,6 +60,8 @@ impl Indicator for SampleChannel {
                     pane: Pane::Separate,
                     pane_group: Some("flow".into()),
                     colors: vec!["#26a69a".into(), "#ef5350".into()],
+                    widths: vec![],
+                    readout_only: false,
                     kind: OutputKind::Histogram,
                 },
                 OutputSpec {
@@ -62,7 +70,19 @@ impl Indicator for SampleChannel {
                     pane: Pane::Price,
                     pane_group: None,
                     colors: vec!["#ef5350".into(), "#26a69a".into()],
+                    widths: vec![2, 1],
+                    readout_only: false,
                     kind: OutputKind::SegmentedLines { layers: 2, tail_marker: true },
+                },
+                OutputSpec {
+                    key: "total".into(),
+                    label: "Total (quote)".into(),
+                    pane: Pane::Separate,
+                    pane_group: Some("flow".into()),
+                    colors: vec![],
+                    widths: vec![],
+                    readout_only: true,
+                    kind: OutputKind::Line,
                 },
             ],
             live: true,
@@ -79,10 +99,13 @@ impl Indicator for SampleChannel {
         let high = |b: &InputBar| if agg { b.aph } else { b.ph };
         let low = |b: &InputBar| if agg { b.apl } else { b.pl };
         let n = self.length;
+        let mut total = Vec::new();
         let (mut sma, mut up, mut lo, mut delta, mut mx, mut mn) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for i in from..bars.len() {
             delta.push(Some(if agg { bars[i].ad } else { bars[i].delta_usdt }));
+            let b = &bars[i];
+            total.push(Some(if agg { b.agb + b.ags } else { b.buy_volume_usdt + b.sell_volume_usdt }));
             if i + 1 < n {
                 for v in [&mut sma, &mut up, &mut lo, &mut mx, &mut mn] {
                     v.push(None);
@@ -101,6 +124,7 @@ impl Indicator for SampleChannel {
         s.insert("channel".into(), SeriesValues::DualRange { upper: up, lower: lo });
         s.insert("delta".into(), SeriesValues::Histogram { values: delta });
         s.insert("extremes".into(), SeriesValues::SegmentedLines { layers: vec![mx, mn] });
+        s.insert("total".into(), SeriesValues::Line { values: total });
         Ok(s)
     }
 }

@@ -75,6 +75,18 @@ Crate type `cdylib` (plus `rlib` if you want in-process unit tests). The SDK
 handles parameter defaults/range checks, input monotonicity/finite checks,
 live window bookkeeping and output validation. Reference: `examples/plugins/sample-indicator`.
 
+`ctx.phase` (`ComputePhase`, `#[non_exhaustive]`) states which operation
+triggered the call — `History` (`OP_HISTORY`; output `bars[output_from..]`),
+`LiveInit` (`OP_LIVE_INIT`; window truncated to `context + 1 + 64`, output is
+the last bar) or `LiveUpdate` (`OP_LIVE_UPDATE`; output from the earliest
+touched bar). Do not infer the phase from call counts. Canonical `time`,
+warm-up and output extents are unchanged by this field; it is in-process only
+and not part of the wire format.
+
+Floats: the SDK, runner and host enable `serde_json/float_roundtrip`, so every
+finite `f64` crosses the JSON wire bit-exactly regardless of the plugin
+crate's own feature set (regression: `crates/indicator-sdk/tests/float_roundtrip.rs`).
+
 ## 4. Descriptor
 
 ```json
@@ -85,7 +97,8 @@ live window bookkeeping and output validation. Reference: `examples/plugins/samp
   "outputs": [ { "key": "sma", "label": "SMA", "pane": "price", "pane_group": null, "colors": ["#f5a623"], "type": "line" },
                { "key": "channel", "pane": "price", "type": "dual_range" },
                { "key": "delta", "pane": "separate", "pane_group": "flow", "type": "histogram" },
-               { "key": "extremes", "pane": "price", "type": "segmented_lines", "layers": 2, "tail_marker": true } ],
+               { "key": "extremes", "pane": "price", "widths": [2, 1], "type": "segmented_lines", "layers": 2, "tail_marker": true },
+               { "key": "total", "label": "Total (quote)", "pane": "separate", "pane_group": "flow", "readout_only": true, "type": "line" } ],
   "live": true }
 ```
 
@@ -98,15 +111,25 @@ live window bookkeeping and output validation. Reference: `examples/plugins/samp
   `segmented_lines` (`layers` 1..=32 independent horizontal step lines; `null`
   breaks a segment; `tail_marker` asks the renderer to label the last value).
   Renderers dispatch on kind, never on indicator id.
+* Optional presentation metadata (v1, backward compatible; omitted = default):
+  * `widths: [u8]` — line widths in px, each 1..=16. `[]` = renderer default,
+    one value = whole series, for `segmented_lines` exactly `layers` values =
+    per-layer widths.
+  * `readout_only: bool` (default `false`) — the output is an ordinary `line`
+    column that is **not drawn**; it is shown only in readouts/legends with its
+    label and pane (e.g. a quote-volume Total). Only valid with `type: line`.
+  Descriptors violating these bounds are rejected as `incompatible`.
 
 ## 5. Canonical input (`InputBar`)
 
-Times are unix **seconds** of bucket open. Names reuse the established CVD bar
-wire names:
+`time` is the canonical CVD bar time exactly as stored and charted: unix
+**seconds of the last second of the bucket** (1m bucket starting 00:00 has
+`time` = 00:00:59). Treat it as an opaque strictly increasing key. Names reuse
+the established CVD bar wire names:
 
 | field | meaning |
 |---|---|
-| `time` | bucket open (s) |
+| `time` | canonical bar time (bucket-end second) |
 | `po ph pl price_close` | source OHLC |
 | `apo aph apl apc` | aggregate OHLC |
 | `cvd_usdt` / `ac` | established cumulative CVD (source / aggregate) from persistence — plugins project it, never recompute it |

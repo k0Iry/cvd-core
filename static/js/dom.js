@@ -1,0 +1,16 @@
+export const elements = {
+    exchangeSel: document.getElementById("exchange"),
+    symbolSel: document.getElementById("symbol"),
+    marketSel: document.getElementById("market"),
+    tfSel: document.getElementById("tf"),
+    accessKeyInput: document.getElementById("access-key"),
+    aggToggle: document.getElementById("toggle-agg"),
+    pluginControlsEl: document.getElementById("plugin-controls"),
+    pluginStateEl: document.getElementById("plugin-state"),
+    screenshotBtn: document.getElementById("screenshot-btn"),
+    statusEl: document.getElementById("status"),
+    qualityStateEl: document.getElementById("quality-state"),
+    sourceSeriesEl: document.getElementById("source-series"),
+    chartEl: document.getElementById("chart"),
+    paneLabels: document.getElementById("pane-labels"),
+}

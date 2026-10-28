@@ -1,4 +1,6 @@
 [package]
+license.workspace = true
+rust-version.workspace = true
 name = "fault-indicator"
 version.workspace = true
 edition.workspace = true

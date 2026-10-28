@@ -67,6 +67,85 @@ pub mod codes {
     pub const TIMEOUT: &str = "timeout";
     pub const CRASHED: &str = "crashed";
     pub const INCOMPATIBLE: &str = "incompatible";
+
+    /// Maximum length of any public error code.
+    pub const MAX_CODE_LEN: usize = 32;
+
+    const ALL: [&str; 14] = [
+        INVALID_INPUT,
+        INVALID_PARAMS,
+        COMPUTE_FAILED,
+        PANIC,
+        SEQUENCE_GAP,
+        STALE_GENERATION,
+        UNKNOWN_SESSION,
+        LIMIT_EXCEEDED,
+        INVALID_OUTPUT,
+        PROTOCOL,
+        UNAVAILABLE,
+        TIMEOUT,
+        CRASHED,
+        INCOMPATIBLE,
+    ];
+
+    /// Codes a library may report itself via `STATUS_ERROR`. Transport and
+    /// session codes are reserved for the runner/host.
+    const LIBRARY: [&str; 7] =
+        [INVALID_INPUT, INVALID_PARAMS, COMPUTE_FAILED, SEQUENCE_GAP, STALE_GENERATION, LIMIT_EXCEEDED, INVALID_OUTPUT];
+
+    /// Returns the canonical `&'static` code if `code` is a documented code.
+    pub fn known(code: &str) -> Option<&'static str> {
+        ALL.iter().copied().find(|c| *c == code)
+    }
+    pub fn is_known(code: &str) -> bool {
+        known(code).is_some()
+    }
+    /// Returns the canonical code if a library may report it.
+    pub fn library_allowed(code: &str) -> Option<&'static str> {
+        LIBRARY.iter().copied().find(|c| *c == code)
+    }
+
+    /// Fixed, safe public message for a documented code.
+    pub fn public_message(code: &str) -> &'static str {
+        match code {
+            INVALID_INPUT => "indicator rejected the input",
+            INVALID_PARAMS => "indicator rejected the parameters",
+            COMPUTE_FAILED => "indicator computation failed",
+            PANIC => "indicator panicked",
+            SEQUENCE_GAP => "live update sequence gap",
+            STALE_GENERATION => "session generation mismatch",
+            UNKNOWN_SESSION => "live session not open",
+            LIMIT_EXCEEDED => "indicator limit exceeded",
+            INVALID_OUTPUT => "indicator output rejected",
+            PROTOCOL => "indicator protocol violation",
+            UNAVAILABLE => "indicator unavailable",
+            TIMEOUT => "indicator timed out",
+            CRASHED => "indicator process exited",
+            INCOMPATIBLE => "indicator is incompatible",
+            _ => "indicator computation failed",
+        }
+    }
+}
+
+impl PluginError {
+    /// Public error for `code` with a fixed message; unknown codes become
+    /// [`codes::COMPUTE_FAILED`]. Use at transport boundaries so that no
+    /// library- or host-chosen free text leaves the host.
+    pub fn public_for(code: &str) -> Self {
+        let c = codes::known(code).unwrap_or(codes::COMPUTE_FAILED);
+        Self { code: c.to_string(), message: codes::public_message(c).to_string() }
+    }
+}
+
+/// Bounded, printable-ASCII rendering of untrusted text for operator logs.
+/// Never splits a UTF-8 character; non-printables become `?`.
+pub fn diagnostic_text(raw: &[u8], max: usize) -> String {
+    let s = String::from_utf8_lossy(&raw[..raw.len().min(max)]);
+    let mut out: String = s.chars().take(max).map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' }).collect();
+    if raw.len() > max {
+        out.push_str("...");
+    }
+    out
 }
 
 // ---------------------------------------------------------------- descriptor
@@ -171,9 +250,21 @@ pub struct OutputSpec {
     /// CSS colour hint(s); purely presentational.
     #[serde(default)]
     pub colors: Vec<String>,
+    /// Optional line widths in CSS pixels (1..=MAX_LINE_WIDTH). Empty = renderer
+    /// default; one value = whole series; for `segmented_lines` exactly
+    /// `layers` values give per-layer widths. Presentational only.
+    #[serde(default)]
+    pub widths: Vec<u8>,
+    /// Non-drawn metric: values are an ordinary `line` column shown only in
+    /// readouts/legends with this output's label/pane. Requires `type: line`.
+    #[serde(default)]
+    pub readout_only: bool,
     #[serde(flatten)]
     pub kind: OutputKind,
 }
+
+/// Upper bound for [`OutputSpec::widths`] entries.
+pub const MAX_LINE_WIDTH: u8 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -280,8 +371,11 @@ pub fn resolve_params(desc: &Descriptor, raw: &[u8]) -> Result<ParamValues, Plug
 
 // ---------------------------------------------------------------- input
 
-/// Canonical OHLC + flow bar delivered to indicators. Times are unix seconds of
-/// bucket open (matching the chart backbone).
+/// Canonical OHLC + flow bar delivered to indicators. `time` is the canonical
+/// CVD bar time exactly as stored and charted by the host: unix seconds of the
+/// **last second of the bucket** (e.g. the 1m bucket [00:00, 01:00) has
+/// `time` = 00:00:59). Indicators must treat it as an opaque, strictly
+/// increasing key and never shift it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct InputBar {
     pub time: i64,
@@ -489,6 +583,19 @@ impl Descriptor {
         for o in &self.outputs {
             if o.key.is_empty() || !keys.insert(o.key.as_str()) {
                 return Err(PluginError::new(codes::INCOMPATIBLE, "duplicate or empty output key"));
+            }
+            let layers_n = match o.kind {
+                OutputKind::SegmentedLines { layers, .. } => layers as usize,
+                _ => 1,
+            };
+            if !(o.widths.is_empty() || o.widths.len() == 1 || o.widths.len() == layers_n) {
+                return Err(PluginError::new(codes::INCOMPATIBLE, "widths must have 0, 1 or one-per-layer entries"));
+            }
+            if o.widths.iter().any(|w| *w == 0 || *w > MAX_LINE_WIDTH) {
+                return Err(PluginError::new(codes::INCOMPATIBLE, "widths must be within 1..=16"));
+            }
+            if o.readout_only && o.kind != OutputKind::Line {
+                return Err(PluginError::new(codes::INCOMPATIBLE, "readout_only requires a line output"));
             }
             if let OutputKind::SegmentedLines { layers, .. } = o.kind {
                 if layers == 0 || layers > 32 {

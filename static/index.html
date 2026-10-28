@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CVD</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <link rel="stylesheet" href="/css/app.css?v=plugin-ui-2">
+
+    <script type="importmap">
+    {
+        "imports": {
+            "lightweight-charts": "/vendor/lightweight-charts-5.1.0/lightweight-charts.standalone.production.mjs",
+            "@tradingview/lwc-plugin-dual-range-histogram-series": "/vendor/lwc-plugin-dual-range-histogram-series-1.0.0/dual-range-histogram-series.standalone.js"
+        }
+    }
+    </script>
+
+</head>
+
+<body>
+
+    <div class="bar">
+        <div class="pill">Source: local axum</div>
+
+        <label for="exchange">Exchange</label>
+        <select id="exchange">
+            <option value="binance">Binance</option>
+            <option value="coinbase">Coinbase</option>
+        </select>
+
+        <label for="symbol">Symbol</label>
+        <select id="symbol">
+            <option>BTC</option>
+            <option>ETH</option>
+        </select>
+
+        <label for="market">Market</label>
+        <select id="market">
+            <option>spot</option>
+            <option>usdm</option>
+            <option>usdc</option>
+        </select>
+
+        <label for="tf">TF</label>
+        <select id="tf">
+            <option>1m</option>
+            <option>5m</option>
+            <option>15m</option>
+            <option>30m</option>
+            <option>1h</option>
+        </select>
+
+        <label for="access-key">Access Key</label>
+        <input id="access-key" type="password" placeholder="unlock realtime" />
+
+        <span id="plugin-controls" class="plugin-controls" role="group" aria-label="Indicators"></span>
+        <label class="toggle-pill" title="Current active contract basket: Binance + new Coinbase DRB USDC; retired INTX history is not continuous. Spot aggregates separately."><input id="toggle-agg" type="checkbox"> Agg</label>
+        <button id="screenshot-btn" class="toolbar-btn" type="button">Screenshot</button>
+
+        <div id="status" class="pill">loading…</div>
+        <span id="source-series" class="pill" role="note">Spot series</span>
+        <span id="plugin-state" class="quality-badge" data-state="quiet" role="status"></span>
+        <span id="quality-state" class="quality-badge" data-state="quiet" title="No retained source evidence">Quality unknown</span>
+    </div>
+
+    <div id="wrap">
+        <div id="chart">
+            <div id="pane-labels" class="pane-labels">
+                <div class="pane-label" data-pane="price">Price</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/js/app.js?v=plugin-ui-2"></script>
+</body>
+
+</html>

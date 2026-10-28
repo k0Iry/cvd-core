@@ -98,6 +98,16 @@ pub struct RunnerClient {
     stderr: StderrTail,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     dead: bool,
+    /// Runner pid == its process-group id; `None` once the group was killed
+    /// while the leader was still unreaped (so the pgid could not be reused).
+    pgid: Option<i32>,
+}
+
+impl Drop for RunnerClient {
+    fn drop(&mut self) {
+        // Covers drop without kill/shutdown and cancelled cleanup futures.
+        self.kill_group();
+    }
 }
 
 async fn read_frame_async(r: &mut ChildStdout, max: usize) -> Result<(FrameHeader, Vec<u8>), HostError> {
@@ -108,6 +118,11 @@ async fn read_frame_async(r: &mut ChildStdout, max: usize) -> Result<(FrameHeade
     r.read_exact(&mut payload).await.map_err(|e| HostError::Crashed { detail: format!("read payload: {e}") })?;
     Ok((h, payload))
 }
+
+/// Absolute bound for graceful shutdown (send + flush + exit wait).
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// Error frames larger than this are not decoded at all.
+const MAX_ERROR_FRAME: usize = 4096;
 
 impl RunnerClient {
     /// Spawn the runner with an empty environment, perform the handshake and
@@ -131,6 +146,10 @@ impl RunnerClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Own process group so cleanup reaches library-spawned descendants
+            // (fault isolation for trusted code; a library that deliberately
+            // calls setsid/setpgid can still escape).
+            .process_group(0)
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| spawn_err(format!("spawn {}: {e}", cfg.runner_path.display())))?;
         let stdin = child.stdin.take().ok_or_else(|| spawn_err("no stdin".into()))?;
@@ -155,7 +174,9 @@ impl RunnerClient {
                 }
             }));
         }
+        let pgid = child.id().map(|p| p as i32);
         let mut me = Self {
+            pgid,
             child,
             stdin,
             stdout,
@@ -185,17 +206,36 @@ impl RunnerClient {
             Ok((FrameKind::Ready, body)) => {
                 let desc: Descriptor = serde_json::from_slice(&body)
                     .map_err(|e| HostError::Protocol { detail: format!("descriptor json: {e}") })?;
-                desc.validate().map_err(|e| HostError::Spawn { public: e.clone(), detail: e.message })?;
+                desc.validate().map_err(|e| HostError::Spawn {
+                    public: PluginError::new(codes::INCOMPATIBLE, "indicator descriptor rejected"),
+                    detail: cvd_indicator_sdk::model::diagnostic_text(e.message.as_bytes(), 512),
+                })?;
                 me.descriptor = desc;
                 me.descriptor_json = body;
                 Ok(me)
             }
             Ok((_, body)) => {
-                let e: PluginError = serde_json::from_slice(&body)
-                    .unwrap_or_else(|_| PluginError::new(codes::INCOMPATIBLE, "handshake rejected"));
+                // Handshake errors are untrusted runner/library output: bound
+                // before decode, allowlist the code, keep any text private.
+                let code = if body.len() <= MAX_ERROR_FRAME {
+                    serde_json::from_slice::<PluginError>(&body).ok().map(|e| e.code)
+                } else {
+                    None
+                };
+                let public = match code.as_deref().and_then(codes::known) {
+                    Some(c) if c != codes::COMPUTE_FAILED && c != codes::PANIC => {
+                        PluginError::new(c, "indicator handshake rejected")
+                    }
+                    _ => PluginError::new(codes::INCOMPATIBLE, "indicator handshake rejected"),
+                };
                 me.kill().await;
-                let detail = format!("{} | stderr: {}", e, me.stderr.snapshot());
-                Err(HostError::Spawn { public: PluginError::new(codes::INCOMPATIBLE, e.message), detail })
+                let detail = format!(
+                    "handshake error ({} bytes): {} | stderr: {}",
+                    body.len(),
+                    cvd_indicator_sdk::model::diagnostic_text(&body, 512),
+                    me.stderr.snapshot()
+                );
+                Err(HostError::Spawn { public, detail })
             }
             Err(e) => {
                 me.kill().await;
@@ -220,10 +260,25 @@ impl RunnerClient {
         self.child.id()
     }
 
-    /// Kill and reap with a bounded wait, then drain remaining stderr
-    /// (bounded) so local diagnostics are complete.
+    /// SIGKILL the runner's whole process group. Must run before the leader is
+    /// reaped: an unreaped (zombie) leader keeps the pgid reserved, so the
+    /// signal can only reach processes this client owns. Idempotent.
+    fn kill_group(&mut self) {
+        if let Some(g) = self.pgid.take() {
+            if g > 1 {
+                // SAFETY: plain syscall on the group we created.
+                unsafe { libc::killpg(g, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// Kill the whole group (including TERM-ignoring descendants) and reap
+    /// the leader with a bounded wait, then drain remaining stderr (bounded).
+    /// Escalation is unconditional: a leader that already exited does not
+    /// cancel the group KILL.
     pub async fn kill(&mut self) {
         self.dead = true;
+        self.kill_group();
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         if let Some(t) = self.stderr_task.take() {
@@ -231,14 +286,38 @@ impl RunnerClient {
         }
     }
 
-    pub async fn shutdown(mut self) {
-        let h = FrameHeader::new(FrameKind::Shutdown, 0, 0, 0);
-        let _ = self.stdin.write_all(&h.encode()).await;
-        let _ = self.stdin.flush().await;
-        if tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await.is_err() {
-            self.kill().await;
+    /// Whether the leader has exited, without reaping it (pgid stays reserved).
+    fn leader_exited(&self) -> bool {
+        let Some(pid) = self.pgid else { return true };
+        // SAFETY: waitid with WNOWAIT only observes our own child.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r =
+                libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+            r != 0 || info.si_pid() != 0
         }
-        self.dead = true;
+    }
+
+    /// Graceful shutdown with a bounded wait for the leader, then always
+    /// clean the group so no descendant outlives the runner.
+    pub async fn shutdown(mut self) {
+        // One absolute bound covers send, flush AND the exit wait: a previously
+        // cancelled request may have left the pipe full, so write_all itself
+        // can block indefinitely. Group kill/reap always follows.
+        let h = FrameHeader::new(FrameKind::Shutdown, 0, 0, 0);
+        let graceful = async {
+            if self.dead {
+                return;
+            }
+            if self.stdin.write_all(&h.encode()).await.is_err() || self.stdin.flush().await.is_err() {
+                return;
+            }
+            while !self.leader_exited() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, graceful).await;
+        self.kill().await;
     }
 
     async fn round_trip(
@@ -310,9 +389,19 @@ impl RunnerClient {
     ) -> Result<Vec<u8>, HostError> {
         match self.round_trip(kind, session, generation, params, body, timeout).await? {
             (FrameKind::Result, v) => Ok(v),
-            (FrameKind::Error, v) => Err(HostError::Plugin(
-                serde_json::from_slice(&v).unwrap_or_else(|_| PluginError::new(codes::PROTOCOL, "unreadable error")),
-            )),
+            // Defence in depth: only a documented code with its fixed public
+            // message crosses the host boundary, regardless of runner text.
+            (FrameKind::Error, v) => {
+                let code = if v.len() <= MAX_ERROR_FRAME {
+                    serde_json::from_slice::<PluginError>(&v).ok().map(|e| e.code)
+                } else {
+                    None
+                };
+                Err(HostError::Plugin(match code {
+                    Some(c) if c.len() <= codes::MAX_CODE_LEN => PluginError::public_for(&c),
+                    _ => PluginError::public_for(codes::PROTOCOL),
+                }))
+            }
             (k, _) => {
                 self.kill().await;
                 Err(HostError::Protocol { detail: format!("unexpected {k:?}") })

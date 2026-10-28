@@ -4,15 +4,20 @@ members = [
     "crates/indicator-sdk",
     "crates/indicator-runner",
     "crates/indicator-host",
+    "crates/cvd-server",
     "examples/plugins/sample-indicator",
     "tests/fixtures/plugins/fault-indicator",
     "tests/fixtures/plugins/bad-abi-indicator",
+    "tests/fixtures/plugins/zero-context-indicator",
+    "tests/fixtures/plugins/raw-abi-indicator",
 ]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
 publish = false
+license = "Apache-2.0"
+rust-version = "1.96"
 
 [profile.release]
 panic = "unwind"

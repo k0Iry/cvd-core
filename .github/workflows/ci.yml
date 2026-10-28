@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Rust toolchain
+        run: rustup show
+      - name: Rust workspace (real runner tests, no external DB/feed)
+        run: cargo test --locked --workspace -- --test-threads=1
+      - name: Frontend unit contracts
+        run: node --test tests/*.test.cjs static/js/*.test.cjs
+      - name: Public-only container build
+        run: docker build --tag cvd-core:ci .

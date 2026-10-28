@@ -13,6 +13,23 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// recent corrections (`Replace`) can still be applied.
 pub const LIVE_REPLACE_SLACK: usize = 64;
 
+/// Which host operation triggered a computation. Supplied explicitly so
+/// authors never infer history-vs-live semantics from call counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ComputePhase {
+    /// Stateless history page (`OP_HISTORY`). `bars` is the full requested
+    /// window including warm-up; output covers `bars[output_from..]`.
+    History,
+    /// First computation of a live session (`OP_LIVE_INIT`). `bars` is the
+    /// live window truncated to `context + 1 + LIVE_REPLACE_SLACK`; output is
+    /// the last bar only.
+    LiveInit,
+    /// Recompute after an applied append/replace delta (`OP_LIVE_UPDATE`);
+    /// output covers bars from the earliest touched bar onward.
+    LiveUpdate,
+}
+
 /// Information available to a computation.
 #[derive(Debug, Clone)]
 pub struct ComputeContext<'a> {
@@ -21,6 +38,8 @@ pub struct ComputeContext<'a> {
     pub params: &'a ParamValues,
     /// Declared warm-up for this scope's timeframe.
     pub context_bars: usize,
+    /// Operation that triggered this computation.
+    pub phase: ComputePhase,
 }
 
 /// Columns for `bars[output_from..]`, keyed by descriptor output key.
@@ -80,12 +99,20 @@ impl<T: Indicator> Instance<T> {
         Ok(Self { desc, params, inner, live: None })
     }
 
-    fn run(&mut self, scope: &Scope, revision: u64, bars: &[InputBar], from: usize) -> Result<Output, PluginError> {
+    fn run(
+        &mut self,
+        phase: ComputePhase,
+        scope: &Scope,
+        revision: u64,
+        bars: &[InputBar],
+        from: usize,
+    ) -> Result<Output, PluginError> {
         let ctx = ComputeContext {
             scope,
             revision,
             params: &self.params,
             context_bars: self.desc.context.bars_for(&scope.tf) as usize,
+            phase,
         };
         let series = self.inner.compute(&ctx, bars, from)?;
         let out = Output { times: bars[from..].iter().map(|b| b.time).collect(), series };
@@ -98,7 +125,7 @@ impl<T: Indicator> Instance<T> {
             return Err(PluginError::invalid_input("output_from beyond bars"));
         }
         check_bars(&req.bars)?;
-        self.run(&req.scope, req.revision, &req.bars, req.output_from)
+        self.run(ComputePhase::History, &req.scope, req.revision, &req.bars, req.output_from)
     }
 
     pub fn live_init(&mut self, init: LiveInit) -> Result<Output, PluginError> {
@@ -112,7 +139,7 @@ impl<T: Indicator> Instance<T> {
             window.drain(..window.len() - cap);
         }
         let from = window.len().saturating_sub(1);
-        let out = self.run(&init.scope, init.revision, &window, from)?;
+        let out = self.run(ComputePhase::LiveInit, &init.scope, init.revision, &window, from)?;
         self.live = Some(LiveState { scope: init.scope, revision: init.revision, seq: 0, window, cap });
         Ok(out)
     }
@@ -167,7 +194,13 @@ impl<T: Indicator> Instance<T> {
         let revision = st.revision;
         let out = {
             let ctx_bars = self.desc.context.bars_for(&scope.tf) as usize;
-            let ctx = ComputeContext { scope: &scope, revision, params: &self.params, context_bars: ctx_bars };
+            let ctx = ComputeContext {
+                scope: &scope,
+                revision,
+                params: &self.params,
+                context_bars: ctx_bars,
+                phase: ComputePhase::LiveUpdate,
+            };
             let series = self.inner.compute(&ctx, &window, from)?;
             let out = Output { times: window[from..].iter().map(|b| b.time).collect(), series };
             out.validate(&self.desc, None)?;
