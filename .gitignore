@@ -1,0 +1,8 @@
+/target/
+/artifacts/
+/.worktrees/
+.env
+.env.local
+*.so
+*.dylib
+*.dll
