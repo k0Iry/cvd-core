@@ -1701,9 +1701,7 @@ fn new_usdc_stream_routes_without_panicking() {
 }
 
 fn binance_market_stream_url(market: Market) -> Result<String> {
-    let instruments: Vec<_> =
-        types::INSTRUMENTS.iter().filter(|i| i.exchange == Exchange::Binance && i.market == market).collect();
-    anyhow::ensure!(!instruments.is_empty(), "unsupported Binance market {}", market.as_str());
+    let instruments = binance::market_symbols(market)?;
     let streams = instruments
         .iter()
         .map(|i| format!("{}@aggTrade", i.native_symbol.to_ascii_lowercase()))

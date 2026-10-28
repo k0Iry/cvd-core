@@ -53,7 +53,7 @@ pub struct BarQuality {
 }
 
 impl BarQuality {
-    pub fn observe(
+    pub(crate) fn observe(
         symbol: Symbol,
         category: MarketCategory,
         bar_time: i64,

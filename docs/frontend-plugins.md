@@ -67,10 +67,28 @@ under the REAL runner (do not hand-edit). The browser harness
 TMPDIR=... CVD_INDICATOR_RUNNER=<runner> CVD_INDICATOR_LIBS=<abs .so list> CVD_REPS=1 node tests/browser-interaction.mjs
 ```
 
-## Known gaps
+## Responsibilities
 
-* No as-of/revision correlation yet between a live indicator frame and the
-  base-bar revision it was computed from (needs a host field); a delayed frame
-  for an older forming-bar revision is applied by time.
-* `session` / `api_version` on live frames are accepted when absent (treated as
-  implicit session 0 / v1) until the host adds them.
+* Host (`cvd-server`) owns ingestion, recovery, persistence and the canonical
+  bars, including the fixed cumulative CVD (`cvd_usdt` / `ac`, see
+  `plugin-api-v1.md`). The default `cvd` plugin only projects those
+  established CVD values and never re-accumulates CVD in bounded-window plugin
+  state; other plugins compute derived outputs from the canonical bars.
+* Runner processes execute plugin libraries; the host relays their outputs and
+  the browser consumes and renders them (see Modules above).
+* Plugin set changes (add/remove/enable/disable) take effect on an application
+  restart. Hot reload is not implemented.
+
+## Wire compatibility
+
+* Live `indicator` frames carry `as_of_rev`, the newest base-frame `rev` they
+  include. It is required: `plugin-wire.mjs` rejects a frame without a
+  non-negative safe integer. `plugin-store.mjs` uses it to correlate each
+  result with the base-bar revisions it has observed: results stale relative
+  to what is already written or displayed are suppressed, and results computed
+  at a revision not yet observed are held pending until that base arrives.
+* The current host also sends `api_version` and `session` on live frames. The
+  parser still intentionally accepts frames without them: missing
+  `api_version` is read as v1 (any other value is rejected), and a missing or
+  non-safe-integer `session` is read as session 0. This is a compatibility
+  allowance, not a sign the host omits them.

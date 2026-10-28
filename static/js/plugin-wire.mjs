@@ -14,7 +14,7 @@
 //   /history        -> { ...base page, indicator_api_version: 1,
 //                        indicators: { <id>: { version, modes: { source|aggregate: { status: ok|unavailable, output?, error? } } } } }
 //   /ws typed frames (base bar frames have no `type`):
-//     { type: "indicator", api_version, id, version, mode, generation, session, seq, output }
+//     { type: "indicator", api_version, id, version, mode, generation, session, seq, as_of_rev, output }
 //     { type: "indicator_status", api_version, id, mode, generation, session?, status: ok|unavailable, error? }
 //     { type: "indicator_reset", api_version, generation }
 

@@ -81,11 +81,6 @@ pub enum QuantitySemantics {
     BaseAsset,
     InverseContracts,
 }
-impl Instrument {
-    pub fn quantity_semantics(self) -> QuantitySemantics {
-        self.market.quantity_semantics()
-    }
-}
 impl Market {
     pub fn quantity_semantics(self) -> QuantitySemantics {
         if self == Self::Coinm {

@@ -146,14 +146,7 @@ pub(super) async fn run_spot_worker_with_fetch<F, Fut>(
             continue;
         }
         let (deadline, attempts) = budget.get_or_insert_with(|| (Instant::now() + RECOVERY_DEADLINE, 0));
-        let anchor = RecoveryAnchor {
-            cursor: cursor.map(|id| id.to_string()),
-            from_ms: from_ms.unwrap_or(0),
-            through_ms: match &input {
-                SpotInput::Trade(t) => t.timestamp_ms,
-                _ => 0,
-            },
-        };
+        let anchor = RecoveryAnchor { cursor: cursor.map(|id| id.to_string()), from_ms: from_ms.unwrap_or(0) };
         let mut coordinator = RecoveryCoordinator::new(anchor.clone(), RECOVERY_CHANNEL_CAPACITY);
         coordinator.set_spot_target(id);
         if let SpotInput::Trade(trade) = input {

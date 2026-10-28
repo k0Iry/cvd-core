@@ -12,7 +12,7 @@ fn descriptor_routing_is_exact_and_rejects_cross_venue_or_wrong_stream() {
         assert_eq!(types::instrument(i.exchange, i.market, i.symbol).unwrap().native_symbol, i.native_symbol);
         assert_eq!(i.category == "spot", i.market.is_spot());
         assert_eq!(
-            i.quantity_semantics() == types::QuantitySemantics::InverseContracts,
+            i.market.quantity_semantics() == types::QuantitySemantics::InverseContracts,
             i.contract_kind == Some("inverse")
         );
         if i.exchange == Exchange::Binance {

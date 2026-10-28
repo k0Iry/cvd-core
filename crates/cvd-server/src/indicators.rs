@@ -468,6 +468,7 @@ pub fn window_poisoned(invalid_times: &[i64], window_start: Option<i64>) -> bool
     }
 }
 
+#[cfg(test)]
 pub async fn compute_history(
     mgr: &IndicatorManager,
     ids: &[String],

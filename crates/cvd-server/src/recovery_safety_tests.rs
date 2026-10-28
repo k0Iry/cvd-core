@@ -29,7 +29,13 @@ async fn public_worker_probe() {
         .unwrap();
     let (tx, rx) = mpsc::channel(RECOVERY_CHANNEL_CAPACITY);
     let mut workers = tokio::task::JoinSet::new();
-    workers.spawn(run_recent_worker(state.clone(), Exchange::Coinbase, market, Symbol::Btc, rx));
+    // Production Coinbase spot entrypoint (coinbase.rs) with the production REST base.
+    workers.spawn(spot::run_spot_worker_with_base(
+        state.clone(),
+        Symbol::Btc,
+        rx,
+        "https://api.exchange.coinbase.com".into(),
+    ));
     let result: Result<()> = async {
         let deadline=Instant::now()+Duration::from_secs(45);
         loop {
@@ -41,7 +47,7 @@ async fn public_worker_probe() {
                     if let Ok(row)=serde_json::from_str::<crate::models::CoinbaseMatch>(&text) {
                         if row.msg_type=="match" {
                             let trade=base_trade(row.trade_id.to_string(),crate::parse_iso8601_to_ms(&row.time)?,&row.price,&row.size,&row.side,true)?;
-                            enqueue_trade(&state,Exchange::Coinbase,market,Symbol::Btc,&tx,trade).await;
+                            enqueue_spot(&state,Symbol::Btc,&tx,SpotInput::Trade(trade)).await;
                         }
                     }
                 }
@@ -167,22 +173,21 @@ async fn queue_overflow_is_terminal_and_health_cannot_hide_recovery() {
 
 #[test]
 fn spot_handoff_rejects_missing_numeric_ids() {
-    let anchor = RecoveryAnchor { cursor: Some("100".into()), from_ms: 1000, through_ms: 2000 };
+    let anchor = RecoveryAnchor { cursor: Some("100".into()), from_ms: 1000 };
     assert!(validate_spot_handoff(&anchor, &[t("101", 1100), t("104", 1400)]).is_err());
     assert!(validate_spot_handoff(&anchor, &[t("101", 1100), t("102", 1200)]).is_ok());
 }
 
 #[test]
 fn verified_time_range_allows_an_idle_start_without_a_fake_trade() {
-    let mut c = RecoveryCoordinator::new(RecoveryAnchor { cursor: None, from_ms: 1000, through_ms: 2000 }, 8);
+    let mut c = RecoveryCoordinator::new(RecoveryAnchor { cursor: None, from_ms: 1000 }, 8);
     c.push_ws(t("20", 2000)).unwrap();
     assert!(matches!(c.observe_batch(vec![t("10", 1500), t("20", 2000)], Some(1000)), RecoveryDecision::Ready(_)));
 }
 
 #[test]
 fn stale_rest_cursor_is_retryable_not_a_permanent_gap() {
-    let mut c =
-        RecoveryCoordinator::new(RecoveryAnchor { cursor: Some("100".into()), from_ms: 1000, through_ms: 0 }, 8);
+    let mut c = RecoveryCoordinator::new(RecoveryAnchor { cursor: Some("100".into()), from_ms: 1000 }, 8);
     c.push_ws(t("101", 1100)).unwrap();
     assert!(matches!(c.observe_rest(vec![t("99", 999)]), RecoveryDecision::Retry(_)));
     assert!(matches!(c.observe_rest(vec![t("99", 1000)]), RecoveryDecision::Retry(_)));
@@ -190,7 +195,7 @@ fn stale_rest_cursor_is_retryable_not_a_permanent_gap() {
 
 #[test]
 fn rest_never_runs_ahead_of_the_received_websocket_fence() {
-    let mut c = RecoveryCoordinator::new(RecoveryAnchor { cursor: Some("a".into()), from_ms: 1000, through_ms: 0 }, 8);
+    let mut c = RecoveryCoordinator::new(RecoveryAnchor { cursor: Some("a".into()), from_ms: 1000 }, 8);
     c.push_ws(t("overlap", 2000)).unwrap();
     let RecoveryDecision::Ready(rows) = c.observe_rest(vec![t("a", 1000), t("overlap", 2000), t("ahead", 3000)]) else {
         panic!("no overlap")

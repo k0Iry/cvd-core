@@ -74,7 +74,6 @@ impl RecoveryDiagnostics {
 pub struct RecoveryAnchor {
     pub cursor: Option<String>,
     pub from_ms: i64,
-    pub through_ms: i64,
 }
 
 #[derive(Debug)]
@@ -368,16 +367,6 @@ fn base_trade(id: String, timestamp_ms: i64, price: &str, size: &str, side: &str
     Ok(Trade { id, timestamp_ms, price, base, quote: price * base, is_buy })
 }
 
-async fn fetch_recent(
-    state: &AppState,
-    exchange: Exchange,
-    market: Market,
-    symbol: Symbol,
-    anchor: &RecoveryAnchor,
-) -> Result<Vec<Trade>> {
-    fetch_recent_with_spot_base(state, exchange, market, symbol, anchor, "https://api.exchange.coinbase.com").await
-}
-
 async fn fetch_recent_with_spot_base(
     state: &AppState,
     exchange: Exchange,
@@ -532,239 +521,6 @@ pub async fn mark_live(state: &AppState, exchange: Exchange, market: Market, sym
     }
 }
 
-pub async fn run_recent_worker(
-    state: Arc<AppState>,
-    exchange: Exchange,
-    market: Market,
-    symbol: Symbol,
-    rx: mpsc::Receiver<Trade>,
-) {
-    let fetch_state = state.clone();
-    run_recent_worker_with_fetch(state, exchange, market, symbol, rx, move |anchor| {
-        let fetch_state = fetch_state.clone();
-        async move { fetch_recent(&fetch_state, exchange, market, symbol, &anchor).await }
-    })
-    .await;
-}
-
-async fn run_recent_worker_with_fetch<F, Fut>(
-    state: Arc<AppState>,
-    exchange: Exchange,
-    market: Market,
-    symbol: Symbol,
-    mut rx: mpsc::Receiver<Trade>,
-    mut fetch: F,
-) where
-    F: FnMut(RecoveryAnchor) -> Fut,
-    Fut: Future<Output = Result<Vec<Trade>>>,
-{
-    let shard = crate::pick_shard(&state, exchange, market, symbol).clone();
-    if shard.recovery.read().await.needs_backfill() {
-        while rx.recv().await.is_some() {}
-        return;
-    }
-
-    let (cursor, from_ms) = {
-        let engine = shard.engine.lock().await;
-        (engine.last_trade_id.clone(), engine.last_trade_ms.or(engine.recovery_from_ms))
-    };
-    let Some(from_ms) = from_ms else {
-        let mut recovery = shard.recovery.read().await.clone();
-        recovery.state = "live".into();
-        recovery.detail = None;
-        if !store_recovery(&shard, recovery).await {
-            while rx.recv().await.is_some() {}
-            return;
-        }
-        *shard.stream_error.write().await = None;
-        while let Some(trade) = rx.recv().await {
-            if let Err(error) = ingest_trade(&state, exchange, market, symbol, trade).await {
-                let diagnostics = shard.recovery.read().await.clone();
-                set_needs_backfill(
-                    &shard,
-                    diagnostics,
-                    format!("live ingestion failed: {error}; authoritative historical backfill required"),
-                )
-                .await;
-                return;
-            }
-        }
-        return;
-    };
-
-    let mut anchor = RecoveryAnchor { cursor, from_ms, through_ms: 0 };
-    let mut diagnostics = RecoveryDiagnostics {
-        state: "recovering".into(),
-        durable_cursor: anchor.cursor.clone(),
-        durable_from_ms: Some(anchor.from_ms),
-        detail: Some("waiting for validated REST/WebSocket overlap".into()),
-        ..RecoveryDiagnostics::default()
-    };
-    if !store_recovery(&shard, diagnostics.clone()).await {
-        return;
-    }
-    *shard.stream_error.write().await = Some("recovering: waiting for REST/WebSocket overlap".into());
-
-    let first = loop {
-        let Some(trade) = rx.recv().await else { return };
-        if trade.timestamp_ms >= anchor.from_ms {
-            break trade;
-        }
-        // A saved-minute prefix is already durable. With a live cursor, however,
-        // an unseen older execution is a discontinuity, not a duplicate.
-        if anchor.cursor.is_some() && !shard.engine.lock().await.is_duplicate(&trade, true) {
-            set_needs_backfill(
-                &shard,
-                diagnostics,
-                "unseen pre-anchor websocket trade; source paused rather than discarding delta".into(),
-            )
-            .await;
-            return;
-        }
-    };
-    anchor.through_ms = first.timestamp_ms;
-    let mut coordinator = RecoveryCoordinator::new(anchor.clone(), RECOVERY_CHANNEL_CAPACITY);
-    if let Err(error) = coordinator.push_ws(first) {
-        set_needs_backfill(&shard, diagnostics, error.to_string()).await;
-        return;
-    }
-    let deadline = Instant::now() + RECOVERY_DEADLINE;
-
-    for attempt in 1..=RECOVERY_ATTEMPTS {
-        diagnostics.attempts = attempt;
-        diagnostics.buffered_trades = coordinator.buffered_len();
-        if !store_recovery(&shard, diagnostics.clone()).await {
-            return;
-        }
-
-        let request = fetch(anchor.clone());
-        tokio::pin!(request);
-        let result = loop {
-            tokio::select! {
-                trade = rx.recv() => match trade {
-                    Some(trade) => {
-                        if let Err(error) = coordinator.push_ws(trade) {
-                            set_needs_backfill(&shard, diagnostics, error.to_string()).await;
-                            return;
-                        }
-                    }
-                    None => return,
-                },
-                result = &mut request => break result,
-                _ = tokio::time::sleep_until(deadline) => {
-                    set_needs_backfill(
-                        &shard,
-                        diagnostics,
-                        "recovery deadline expired without a validated overlap; authoritative historical backfill required".into(),
-                    ).await;
-                    return;
-                }
-            }
-        };
-
-        let decision = match result {
-            Ok(trades) => {
-                diagnostics.rest_count = trades.len();
-                diagnostics.rest_earliest_ms = trades.iter().map(|trade| trade.timestamp_ms).min();
-                diagnostics.rest_latest_ms = trades.iter().map(|trade| trade.timestamp_ms).max();
-                coordinator.observe_batch(trades, None)
-            }
-
-            Err(error) => RecoveryDecision::Retry(format!("history transport error: {error}")),
-        };
-        match decision {
-            RecoveryDecision::Ready(trades) => {
-                if exchange == Exchange::Coinbase && market == Market::Spot {
-                    if let Err(error) = validate_spot_handoff(&anchor, &trades) {
-                        set_needs_backfill(&shard, diagnostics, error.to_string()).await;
-                        return;
-                    }
-                }
-                if shard.recovery.read().await.needs_backfill() {
-                    return;
-                }
-                for trade in &trades {
-                    if let Err(error) = ingest_trade(&state, exchange, market, symbol, trade.clone()).await {
-                        set_needs_backfill(
-                            &shard,
-                            diagnostics,
-                            format!("recovery replay failed: {error}; authoritative historical backfill required"),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-                {
-                    let mut engine = shard.engine.lock().await;
-                    engine.remember_replay(&trades);
-                }
-                diagnostics.state = "live".into();
-                diagnostics.buffered_trades = 0;
-                diagnostics.detail = None;
-                if !store_recovery(&shard, diagnostics).await {
-                    return;
-                }
-                *shard.stream_error.write().await = None;
-                while let Some(trade) = rx.recv().await {
-                    if let Err(error) = ingest_trade(&state, exchange, market, symbol, trade).await {
-                        let diagnostics = shard.recovery.read().await.clone();
-                        set_needs_backfill(
-                            &shard,
-                            diagnostics,
-                            format!("live ingestion failed: {error}; authoritative historical backfill required"),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-                return;
-            }
-            RecoveryDecision::NeedsBackfill(detail) => {
-                set_needs_backfill(&shard, diagnostics, detail).await;
-                return;
-            }
-            RecoveryDecision::Retry(detail) => {
-                diagnostics.detail = Some(detail);
-                diagnostics.buffered_trades = coordinator.buffered_len();
-                if !store_recovery(&shard, diagnostics.clone()).await {
-                    return;
-                }
-            }
-        }
-
-        let sleep = tokio::time::sleep(RECOVERY_RETRY_DELAY);
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                trade = rx.recv() => match trade {
-                    Some(trade) => {
-                        if let Err(error) = coordinator.push_ws(trade) {
-                            set_needs_backfill(&shard, diagnostics, error.to_string()).await;
-                            return;
-                        }
-                    }
-                    None => return,
-                },
-                _ = &mut sleep => break,
-                _ = tokio::time::sleep_until(deadline) => {
-                    set_needs_backfill(
-                        &shard,
-                        diagnostics,
-                        "recovery deadline expired without a validated overlap; authoritative historical backfill required".into(),
-                    ).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    let detail = format!(
-        "recovery attempt budget ({RECOVERY_ATTEMPTS}) exhausted; source paused; last observation: {}",
-        diagnostics.detail.as_deref().unwrap_or("none")
-    );
-    set_needs_backfill(&shard, diagnostics, detail).await;
-}
-
 #[cfg(test)]
 #[path = "recovery_safety_tests.rs"]
 mod safety_tests;
@@ -775,6 +531,7 @@ mod spot_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::spot::run_spot_worker_with_fetch;
     use super::*;
 
     #[tokio::test]
@@ -866,7 +623,7 @@ mod tests {
 
     #[test]
     fn coordinator_waits_for_lagging_rest_then_hands_off_without_loss_or_duplicates() {
-        let anchor = RecoveryAnchor { cursor: Some("100".into()), from_ms: 1_000, through_ms: 0 };
+        let anchor = RecoveryAnchor { cursor: Some("100".into()), from_ms: 1_000 };
         let mut coordinator = RecoveryCoordinator::new(anchor, 8);
         coordinator.push_ws(trade("103", 1_003)).unwrap();
         coordinator.push_ws(trade("104", 1_004)).unwrap();
@@ -894,7 +651,7 @@ mod tests {
 
     #[test]
     fn coordinator_marks_insufficient_history_and_bounds_its_buffer() {
-        let anchor = RecoveryAnchor { cursor: Some("100".into()), from_ms: 1_000, through_ms: 0 };
+        let anchor = RecoveryAnchor { cursor: Some("100".into()), from_ms: 1_000 };
         let mut coordinator = RecoveryCoordinator::new(anchor, 2);
         coordinator.push_ws(trade("200", 2_000)).unwrap();
         coordinator.push_ws(trade("201", 2_001)).unwrap();
@@ -907,7 +664,7 @@ mod tests {
 
     #[test]
     fn overlap_may_move_forward_while_the_original_target_ages_out() {
-        let anchor = RecoveryAnchor { cursor: Some("10".into()), from_ms: 10, through_ms: 0 };
+        let anchor = RecoveryAnchor { cursor: Some("10".into()), from_ms: 10 };
         let mut coordinator = RecoveryCoordinator::new(anchor, 8);
         for id in 13..=16 {
             coordinator.push_ws(trade(&id.to_string(), id)).unwrap();
@@ -942,7 +699,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let worker_state = state.clone();
         let worker = tokio::spawn(async move {
-            run_recent_worker_with_fetch(worker_state, Exchange::Coinbase, Market::Spot, Symbol::Btc, rx, move |_| {
+            run_spot_worker_with_fetch(worker_state, Symbol::Btc, rx, move |_| {
                 let attempt = fetch_attempts.fetch_add(1, Ordering::SeqCst);
                 async move {
                     Ok(if attempt == 0 {
@@ -961,7 +718,7 @@ mod tests {
             .await;
         });
         for id in 103..=105 {
-            tx.send(trade(&id.to_string(), id + 900)).await.unwrap();
+            tx.send(SpotInput::Trade(trade(&id.to_string(), id + 900))).await.unwrap();
         }
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -989,30 +746,21 @@ mod tests {
         let btc = crate::pick_shard(&state, Exchange::Coinbase, Market::Spot, Symbol::Btc);
         let eth = crate::pick_shard(&state, Exchange::Coinbase, Market::Spot, Symbol::Eth);
         {
+            // Durable cursor 100 is absent from the newer public history below.
             let mut engine = btc.engine.lock().await;
-            engine.last_trade_id = Some("missing".into());
+            engine.last_trade_id = Some("100".into());
             engine.last_trade_ms = Some(1_000);
         }
         let (btc_tx, btc_rx) = mpsc::channel(8);
         let (eth_tx, eth_rx) = mpsc::channel(8);
-        let btc_worker = tokio::spawn(run_recent_worker_with_fetch(
-            state.clone(),
-            Exchange::Coinbase,
-            Market::Spot,
-            Symbol::Btc,
-            btc_rx,
-            |_| async { Ok(vec![trade("other", 1_050)]) },
-        ));
-        let eth_worker = tokio::spawn(run_recent_worker_with_fetch(
-            state.clone(),
-            Exchange::Coinbase,
-            Market::Spot,
-            Symbol::Eth,
-            eth_rx,
-            |_| async { panic!("fresh bootstrap must not fetch history") },
-        ));
-        btc_tx.send(trade("live-btc", 1_100)).await.unwrap();
-        eth_tx.send(trade("live-eth", 1_100)).await.unwrap();
+        let btc_worker = tokio::spawn(run_spot_worker_with_fetch(state.clone(), Symbol::Btc, btc_rx, |_| async {
+            Ok(vec![trade("150", 1_050)])
+        }));
+        let eth_worker = tokio::spawn(run_spot_worker_with_fetch(state.clone(), Symbol::Eth, eth_rx, |_| -> std::future::Ready<Result<Vec<Trade>>> {
+            panic!("fresh bootstrap must not fetch history")
+        }));
+        btc_tx.send(SpotInput::Trade(trade("200", 1_100))).await.unwrap();
+        eth_tx.send(SpotInput::Trade(trade("201", 1_100))).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if btc.recovery.read().await.needs_backfill() {
@@ -1028,23 +776,16 @@ mod tests {
         btc_worker.await.unwrap();
         eth_worker.await.unwrap();
         assert!(btc.recovery.read().await.needs_backfill());
-        assert_eq!(eth.engine.lock().await.last_trade_id.as_deref(), Some("live-eth"));
+        assert_eq!(eth.engine.lock().await.last_trade_id.as_deref(), Some("201"));
 
         let calls = Arc::new(AtomicUsize::new(0));
         let reconnect_calls = calls.clone();
         let (tx, rx) = mpsc::channel(1);
-        let reconnect = tokio::spawn(run_recent_worker_with_fetch(
-            state,
-            Exchange::Coinbase,
-            Market::Spot,
-            Symbol::Btc,
-            rx,
-            move |_| {
-                reconnect_calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok(Vec::new()) }
-            },
-        ));
-        tx.send(trade("later", 1_200)).await.unwrap();
+        let reconnect = tokio::spawn(run_spot_worker_with_fetch(state, Symbol::Btc, rx, move |_| {
+            reconnect_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Vec::new()) }
+        }));
+        tx.send(SpotInput::Trade(trade("300", 1_200))).await.unwrap();
         drop(tx);
         reconnect.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1060,15 +801,10 @@ mod tests {
             engine.last_trade_ms = Some(1_000);
         }
         let (tx, rx) = mpsc::channel(1);
-        let worker = tokio::spawn(run_recent_worker_with_fetch(
-            state,
-            Exchange::Coinbase,
-            Market::Spot,
-            Symbol::Btc,
-            rx,
-            |_| std::future::pending::<Result<Vec<Trade>>>(),
-        ));
-        tx.send(trade("101", 1_001)).await.unwrap();
+        let worker = tokio::spawn(run_spot_worker_with_fetch(state, Symbol::Btc, rx, |_| {
+            std::future::pending::<Result<Vec<Trade>>>()
+        }));
+        tx.send(SpotInput::Trade(trade("101", 1_001))).await.unwrap();
         drop(tx);
         tokio::time::timeout(Duration::from_millis(100), worker)
             .await
@@ -1131,12 +867,21 @@ mod tests {
         })
         .await
         .unwrap();
-        let anchor = RecoveryAnchor { cursor: None, from_ms: live.timestamp_ms - 30_000, through_ms: 0 };
+        let anchor = RecoveryAnchor { cursor: None, from_ms: live.timestamp_ms - 30_000 };
         let mut coordinator = RecoveryCoordinator::new(anchor.clone(), 8);
         coordinator.push_ws(live).unwrap();
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let rows = fetch_recent(&state, Exchange::Coinbase, Market::Spot, Symbol::Btc, &anchor).await.unwrap();
+                let rows = fetch_recent_with_spot_base(
+                    &state,
+                    Exchange::Coinbase,
+                    Market::Spot,
+                    Symbol::Btc,
+                    &anchor,
+                    "https://api.exchange.coinbase.com",
+                )
+                .await
+                .unwrap();
                 if matches!(coordinator.observe_rest(rows), RecoveryDecision::Ready(_)) {
                     break;
                 }

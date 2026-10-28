@@ -12,7 +12,7 @@ use crate::AppState;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 
-fn market_symbols(market: Market) -> Result<Vec<&'static crate::types::Instrument>> {
+pub(crate) fn market_symbols(market: Market) -> Result<Vec<&'static crate::types::Instrument>> {
     let sources: Vec<_> =
         crate::types::INSTRUMENTS.iter().filter(|i| i.exchange == Exchange::Binance && i.market == market).collect();
     anyhow::ensure!(!sources.is_empty(), "unsupported Binance market {}", market.as_str());
