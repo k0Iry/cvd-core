@@ -1,7 +1,7 @@
 name: CI
+# Local tests are the default; remote CI runs only on explicit request.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
