@@ -16,7 +16,23 @@ jobs:
       - name: Rust toolchain
         run: rustup show
       - name: Rust workspace (real runner tests, no external DB/feed)
-        run: cargo test --locked --workspace -- --test-threads=1
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --workspace -- --test-threads=1 > "$RUNNER_TEMP/cvd-tests.log" 2>&1
+          result=$?
+          cat "$RUNNER_TEMP/cvd-tests.log"
+          if [ "$result" -ne 0 ]; then
+            # Bounded annotations remain readable via the public Checks API.
+            # This suite uses public synthetic fixtures only, never private libraries.
+            diagnostic=$(tail -n 80 "$RUNNER_TEMP/cvd-tests.log")
+            diagnostic=${diagnostic:0:12000}
+            diagnostic=${diagnostic//'%'/'%25'}
+            diagnostic=${diagnostic//$'\r'/'%0D'}
+            diagnostic=${diagnostic//$'\n'/'%0A'}
+            printf '::error title=Rust test diagnostic::%s\n' "$diagnostic"
+          fi
+          exit "$result"
       - name: Frontend unit contracts
         run: node --test tests/*.test.cjs static/js/*.test.cjs
       - name: Public-only container build
