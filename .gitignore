@@ -2,7 +2,9 @@
 /artifacts/
 /.worktrees/
 .env
-.env.local
+.env.*
+!.env.example
+/data/
 *.so
 *.dylib
 *.dll

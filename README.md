@@ -20,6 +20,23 @@ of this repository or public image. Browser clients receive values only.
 | `docs/plugin-api-v1.md` | normative library contract |
 | `docs/host-indicator-integration.md` | HTTP/WS indicator contract |
 
+## Deploy with Docker Compose
+
+**[Start here: English deployment guide](docs/deployment.md) · [中文部署指南](docs/deployment.zh-CN.md)**
+
+The public quick start builds core and the public CVD/Flow plugins locally, then
+starts PostgreSQL and the application with [`compose.yaml`](compose.yaml).
+It includes persistent database/outbox volumes, a localhost-only port, plugin
+configuration and existing-deployment upgrade instructions. No private repository
+or CI run is required; private/custom libraries are optional.
+
+- Copy [`.env.example`](.env.example) to `.env` and choose a strong password.
+- Use [`config/cvd.public.toml`](config/cvd.public.toml) for public CVD/Flow.
+- Adding/disabling plugins needs an application restart, **not** a core rebuild;
+  hot reload is not implemented.
+- Existing deployments must retain their database and outbox rather than blindly
+  adopt the fresh-install volumes. The guide shows the distinction.
+
 ## Build
 
     cargo build --release -p cvd-server -p cvd-indicator-runner   # host + runner

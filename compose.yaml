@@ -1,0 +1,53 @@
+# Fresh installations only. For an existing database, see docs/deployment.md.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cvdadmin
+      POSTGRES_DB: cvd
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cvdadmin -d cvd"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    shm_size: "1gb"
+
+  cvd:
+    image: cvd-core:local
+    pull_policy: never
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://cvdadmin:${POSTGRES_PASSWORD}@postgres:5432/cvd
+      LIVE_ACCESS_KEY: ${LIVE_ACCESS_KEY:-}
+      CVD_CONFIG: /app/config.toml
+      CVD_OUTBOX_PATH: /app/data/outbox.sqlite
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - type: bind
+        source: ./artifacts/cvd.toml
+        target: /app/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./artifacts/plugins
+        target: /plugins
+        read_only: true
+        bind:
+          create_host_path: false
+      - outbox-data:/app/data
+
+volumes:
+  postgres-data:
+  outbox-data:

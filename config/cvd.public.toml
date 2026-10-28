@@ -1,0 +1,22 @@
+# Public CVD + Flow; copy to artifacts/cvd.toml before editing.
+[server]
+http_addr = "0.0.0.0:8080"
+static_dir = "/app/static"
+
+[indicators]
+runner = "/usr/local/bin/cvd-indicator-runner"
+history_timeout_ms = 10000
+live_timeout_ms = 2000
+queue_depth = 64
+
+[[indicators.library]]
+id = "cvd"
+path = "/plugins/libcvd_indicator_cvd.so"
+enabled = true
+modes = ["source", "aggregate"]
+
+[[indicators.library]]
+id = "flow"
+path = "/plugins/libcvd_indicator_flow.so"
+enabled = true
+modes = ["source", "aggregate"]
