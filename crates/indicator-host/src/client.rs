@@ -151,6 +151,25 @@ impl RunnerClient {
             // calls setsid/setpgid can still escape).
             .process_group(0)
             .kill_on_drop(true);
+        // Linux: mark every inherited descriptor >= 3 close-on-exec in the
+        // child just before exec, so stray parent fds (CI jobserver pipes,
+        // other non-CLOEXEC handles) never reach the runner or its
+        // descendants. CLOSE_RANGE_CLOEXEC (Linux >= 5.11) only flags fds, so
+        // std's own CLOEXEC exec-error pipe keeps working; 0/1/2 untouched.
+        // Async-signal-safe (one raw syscall, no allocation). Fails closed: if
+        // the syscall is unsupported/denied, spawn returns an error.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                let r = libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC);
+                if r == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
         let mut child = cmd.spawn().map_err(|e| spawn_err(format!("spawn {}: {e}", cfg.runner_path.display())))?;
         let stdin = child.stdin.take().ok_or_else(|| spawn_err("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| spawn_err("no stdout".into()))?;

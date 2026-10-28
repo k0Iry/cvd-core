@@ -62,3 +62,12 @@ Owned public code is Apache-2.0. Retain `LICENSE`, `NOTICE` and vendored
 component notices, including TradingView attribution. Private libraries keep
 their own terms; using this SDK does not automatically make them public.
 Operators remain responsible for the terms governing their market-data feeds.
+
+## Native indicator runner: platform contract (Linux)
+
+The host requires Linux >= 5.11 for native runners: before exec it calls
+`close_range(3, UINT_MAX, CLOSE_RANGE_CLOEXEC)` so no inherited parent
+descriptor (e.g. CI/jobserver pipes) reaches the runner or its descendants;
+stdin/stdout/stderr are preserved. If the kernel or a seccomp policy rejects
+the syscall, runner spawn fails closed (indicator unavailable) rather than
+leaking descriptors. This is fault isolation for trusted code, not a sandbox.

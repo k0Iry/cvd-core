@@ -356,3 +356,44 @@ async fn shutdown_is_bounded_after_cancelled_requests_fill_the_pipe() {
     assert!(runner_gone, "runner reaped");
     assert!(ok, "descendant survived shutdown");
 }
+
+/// Owned, deliberately NON-CLOEXEC high descriptor in the host process,
+/// emulating inherited CI/jobserver pipes. Closed on drop.
+struct InheritableFd(i32);
+impl InheritableFd {
+    fn new() -> Self {
+        let src = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(src >= 0);
+        let fd = unsafe { libc::fcntl(src, libc::F_DUPFD, 300) }; // F_DUPFD: no CLOEXEC
+        unsafe { libc::close(src) };
+        assert!(fd >= 300);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        InheritableFd(fd)
+    }
+}
+impl Drop for InheritableFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+#[tokio::test]
+async fn inherited_parent_fd_does_not_reach_runner_or_descendant() {
+    let inj = InheritableFd::new();
+    let (c, runner, s, r) = spawn_sleeper("inh", false).await;
+    let runner_fds = extra_fds(runner);
+    r.expect("sleeper mode computes normally");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let fds = extra_fds(s);
+    let group = pgid(runner);
+    drop(c);
+    let ok = gone_within(s, Duration::from_secs(3)).await;
+    owned_cleanup(group, s);
+    drop(inj);
+    assert!(fds.is_empty(), "descendant inherited non-stdio fds: {fds:?}");
+    assert!(
+        !runner_fds.iter().any(|f| f.starts_with("\"300\"") || f.contains("/dev/null")),
+        "runner inherited parent fd: {runner_fds:?}"
+    );
+    assert!(ok, "descendant survived drop");
+}
