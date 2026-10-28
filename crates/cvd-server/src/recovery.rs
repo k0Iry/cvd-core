@@ -253,6 +253,31 @@ pub async fn binance_before(
     current: &Trade,
     contract_size: Option<f64>,
 ) -> Result<()> {
+    binance_before_with_base(state, market, symbol, current, contract_size, None).await
+}
+
+pub(crate) fn binance_replay_route(market: Market, symbol: Symbol) -> Result<(&'static str, &'static str)> {
+    let source = crate::types::instrument(Exchange::Binance, market, symbol)
+        .ok_or_else(|| anyhow::anyhow!("unsupported Binance recovery source"))?;
+    let url = match market {
+        Market::Spot | Market::SpotUsdc => "https://api.binance.com/api/v3/aggTrades",
+        Market::Usdm | Market::UsdmUsdc => "https://fapi.binance.com/fapi/v1/aggTrades",
+        Market::Coinm => "https://dapi.binance.com/dapi/v1/aggTrades",
+        Market::Usdc => anyhow::bail!("Coinbase USDC is not a Binance recovery source"),
+    };
+    Ok((url, source.native_symbol))
+}
+
+async fn binance_before_with_base(
+    state: &AppState,
+    market: Market,
+    symbol: Symbol,
+    current: &Trade,
+    contract_size: Option<f64>,
+    override_url: Option<&str>,
+) -> Result<()> {
+    let (base_url, product) = binance_replay_route(market, symbol)?;
+    let base_url = override_url.unwrap_or(base_url);
     let shard = crate::pick_shard(state, Exchange::Binance, market, symbol);
     let (cursor, from_ms) = {
         let engine = shard.engine.lock().await;
@@ -268,12 +293,6 @@ pub async fn binance_before(
     if cursor.is_none() {
         validate_binance_startup_window(from_ms.unwrap(), current.timestamp_ms)?;
     }
-    let (base_url, product) = match market {
-        Market::Spot => ("https://api.binance.com/api/v3/aggTrades", symbol.spot_usdm_stream()),
-        Market::Usdm => ("https://fapi.binance.com/fapi/v1/aggTrades", symbol.spot_usdm_stream()),
-        Market::Coinm => ("https://dapi.binance.com/dapi/v1/aggTrades", symbol.coinm_stream()),
-        Market::Usdc => anyhow::bail!("Binance has no USDC DRB recovery source"),
-    };
     let mut next_id = cursor.map(|id| id + 1);
     for _ in 0..MAX_REPLAY_PAGES {
         let mut request =
@@ -286,6 +305,10 @@ pub async fn binance_before(
         let rows: Vec<AggTrade> = request.send().await?.error_for_status()?.json().await?;
         anyhow::ensure!(!rows.is_empty(), "Binance replay not yet available; retaining cursor for retry");
         for row in rows {
+            anyhow::ensure!(
+                row.symbol.as_deref().is_none_or(|native| native == product),
+                "Binance replay symbol mismatch"
+            );
             if row.id >= target {
                 anyhow::ensure!(
                     row.id == target && next_id.is_none_or(|expected| expected == target),
@@ -753,6 +776,51 @@ mod spot_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn binance_usdc_replay_queries_native_symbol_and_preserves_source_cursor() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use serde_json::json;
+        use std::{collections::HashMap, future::IntoFuture};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/aggTrades",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                assert_eq!(q["symbol"], "BTCUSDC");
+                assert_eq!(q["fromId"], "101");
+                Json(json!([
+                    {"a":101,"s":"BTCUSDC","p":"100","q":"2","T":1001,"m":false},
+                    {"a":102,"s":"BTCUSDC","p":"100","q":"3","T":2001,"m":true},
+                    {"a":103,"s":"BTCUSDC","p":"100","q":"4","T":3001,"m":false}
+                ]))
+            }),
+        );
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let state = crate::tests::state().await;
+        for market in [Market::SpotUsdc, Market::UsdmUsdc] {
+            let shard = crate::pick_shard(&state, Exchange::Binance, market, Symbol::Btc);
+            {
+                let mut engine = shard.engine.lock().await;
+                engine.last_trade_id = Some("100".into());
+                engine.last_trade_ms = Some(1000);
+            }
+            binance_before_with_base(
+                &state,
+                market,
+                Symbol::Btc,
+                &Trade { id: "103".into(), timestamp_ms: 3001, price: 100.0, base: 4.0, quote: 400.0, is_buy: true },
+                None,
+                Some(&format!("http://{addr}/aggTrades")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(shard.engine.lock().await.last_trade_id.as_deref(), Some("102"));
+            assert_eq!(shard.engine.lock().await.sec.trades, 1);
+        }
+        server.abort();
+        let _ = server.await;
+    }
 
     fn trade(id: &str, timestamp_ms: i64) -> Trade {
         Trade { id: id.into(), timestamp_ms, price: 10.0, base: 1.0, quote: 10.0, is_buy: true }

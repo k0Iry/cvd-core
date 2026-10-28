@@ -13,6 +13,8 @@ mod recovery;
 #[cfg(test)]
 mod retirement_tests;
 mod types;
+#[cfg(test)]
+mod usdc_tests;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
@@ -54,7 +56,7 @@ enum MarketCategory {
 
 impl MarketCategory {
     fn from_market(market: &str) -> Self {
-        if market == "spot" {
+        if matches!(market, "spot" | "spot_usdc") {
             Self::Spot
         } else {
             Self::Contract
@@ -63,16 +65,19 @@ impl MarketCategory {
 
     fn matches_market(self, market: Market) -> bool {
         match self {
-            Self::Spot => market == Market::Spot,
-            Self::Contract => matches!(market, Market::Usdm | Market::Usdc | Market::Coinm),
+            Self::Spot => market.is_spot(),
+            Self::Contract => !market.is_spot(),
         }
     }
 
-    fn market_names(self) -> &'static [&'static str] {
-        match self {
-            Self::Spot => &["spot"],
-            Self::Contract => &["usdm", "usdc", "coinm"],
+    fn market_names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for source in types::INSTRUMENTS {
+            if self.matches_market(source.market) && !names.contains(&source.market.as_str()) {
+                names.push(source.market.as_str());
+            }
         }
+        names
     }
 }
 
@@ -80,7 +85,7 @@ const CONTRACT_SERIES: &str = "contracts-drb-v1";
 const SPOT_SERIES: &str = "spot-v1";
 
 fn series_for_market(market: Market) -> &'static str {
-    if market == Market::Spot {
+    if market.is_spot() {
         SPOT_SERIES
     } else {
         CONTRACT_SERIES
@@ -280,19 +285,7 @@ fn has_realtime_access(state: &AppState, key: Option<&str>) -> bool {
 
 // Helper: Get valid (market, symbol) pairs for a given exchange
 fn get_market_symbol_pairs(exchange: Exchange) -> Vec<(Market, Symbol)> {
-    match exchange {
-        Exchange::Coinbase => vec![
-            (Market::Spot, Symbol::Btc),
-            (Market::Spot, Symbol::Eth),
-            (Market::Usdc, Symbol::Btc),
-            (Market::Usdc, Symbol::Eth),
-        ],
-        Exchange::Binance => {
-            let markets = [Market::Spot, Market::Usdm, Market::Coinm];
-            let symbols = [Symbol::Btc, Symbol::Eth];
-            markets.iter().flat_map(|&m| symbols.iter().map(move |&s| (m, s))).collect()
-        }
-    }
+    types::INSTRUMENTS.iter().filter(|i| i.exchange == exchange).map(|i| (i.market, i.symbol)).collect()
 }
 
 // ==============================
@@ -338,6 +331,7 @@ struct ExchangeMeta {
 struct MetaPayload {
     indicators: Vec<indicators::IndicatorInfo>,
     exchanges: Vec<ExchangeMeta>,
+    instruments: &'static [types::Instrument],
     contract_series: &'static str,
     spot_series: &'static str,
     coinbase_contract_source: &'static str,
@@ -636,7 +630,7 @@ async fn apply_live_aggregates(
     tf: Tf,
     current: &mut Bar,
 ) {
-    let category = if market == Market::Spot { MarketCategory::Spot } else { MarketCategory::Contract };
+    let category = MarketCategory::from_market(market.as_str());
     let mut observations = Vec::new();
     let mut cvd = 0.0;
     let mut flow = (0.0, 0.0, 0.0, 0.0, 0.0);
@@ -707,7 +701,7 @@ async fn aggregate_live_cvd(
     tf: Tf,
     current_bar: &Bar,
 ) -> f64 {
-    let category = if market == Market::Spot { MarketCategory::Spot } else { MarketCategory::Contract };
+    let category = MarketCategory::from_market(market.as_str());
 
     let mut total = 0.0;
     for ((src_exchange, src_market, src_symbol), shard) in state.shards.iter() {
@@ -742,7 +736,7 @@ async fn aggregate_live_flow(
     tf: Tf,
     current_bar: &Bar,
 ) -> (f64, f64, f64, f64, f64) {
-    let category = if market == Market::Spot { MarketCategory::Spot } else { MarketCategory::Contract };
+    let category = MarketCategory::from_market(market.as_str());
 
     let mut delta_total = 0.0;
     let mut buy_base_total = 0.0;
@@ -797,7 +791,7 @@ async fn aggregate_live_ohlc(
     tf: Tf,
     current_bar: &Bar,
 ) -> Option<(f64, f64, f64, f64)> {
-    let category = if market == Market::Spot { MarketCategory::Spot } else { MarketCategory::Contract };
+    let category = MarketCategory::from_market(market.as_str());
 
     let mut bars = Vec::new();
     for ((src_exchange, src_market, src_symbol), shard) in state.shards.iter() {
@@ -1077,7 +1071,7 @@ async fn load_history_page(
     let newest_time = v.last().map(|b| b.time);
 
     Ok(models::HistoryPayload {
-        series: if market == "spot" { SPOT_SERIES } else { CONTRACT_SERIES },
+        series: if MarketCategory::from_market(market) == MarketCategory::Spot { SPOT_SERIES } else { CONTRACT_SERIES },
         bars: v,
         has_more_before,
         has_more_after,
@@ -1148,7 +1142,7 @@ async fn hydrate_shard(state: &AppState, exchange: Exchange, market: Market, sym
     let mut h15 = h15;
     let mut h30 = h30;
     let mut h1h = h1h;
-    let category = if market == Market::Spot { MarketCategory::Spot } else { MarketCategory::Contract };
+    let category = MarketCategory::from_market(market.as_str());
     apply_aggregate_cvd_to_bars(&state.db, h1.make_contiguous(), s, category, "1m").await?;
     apply_aggregate_cvd_to_bars(&state.db, h5.make_contiguous(), s, category, "5m").await?;
     apply_aggregate_cvd_to_bars(&state.db, h15.make_contiguous(), s, category, "15m").await?;
@@ -1248,14 +1242,24 @@ async fn seed_cvd_closed_from_db(state: &AppState) -> Result<()> {
 }
 
 fn spawn_market_engines(state: Arc<AppState>) {
-    for market in [Market::Spot, Market::Usdm, Market::Coinm] {
-        let state_clone = state.clone();
-        tokio::spawn(binance_market_engine_loop(state_clone, market));
-    }
-
-    for market in [Market::Spot, Market::Usdc] {
-        let state_clone = state.clone();
-        tokio::spawn(coinbase_market_engine_loop(state_clone, market));
+    for exchange in Exchange::ALL {
+        let mut markets = Vec::new();
+        for source in types::INSTRUMENTS.iter().filter(|source| source.exchange == exchange) {
+            if !markets.contains(&source.market) {
+                markets.push(source.market);
+            }
+        }
+        for market in markets {
+            let state_clone = state.clone();
+            match exchange {
+                Exchange::Binance => {
+                    tokio::spawn(binance_market_engine_loop(state_clone, market));
+                }
+                Exchange::Coinbase => {
+                    tokio::spawn(coinbase_market_engine_loop(state_clone, market));
+                }
+            }
+        }
     }
 }
 
@@ -1432,10 +1436,10 @@ fn selection_response(
         let status = if error.starts_with("retired Coinbase") { StatusCode::GONE } else { StatusCode::BAD_REQUEST };
         (status, error)
     })?;
-    if selection.1 == Market::Spot && p.series.as_deref().is_some_and(|series| series != SPOT_SERIES) {
+    if selection.1.is_spot() && p.series.as_deref().is_some_and(|series| series != SPOT_SERIES) {
         return Err((StatusCode::CONFLICT, "spot series mismatch; require spot-v1 or omit series"));
     }
-    if selection.1 != Market::Spot && p.series.as_deref() != Some(CONTRACT_SERIES) {
+    if !selection.1.is_spot() && p.series.as_deref() != Some(CONTRACT_SERIES) {
         return Err((StatusCode::CONFLICT, "contract series mismatch; require contracts-drb-v1"));
     }
     Ok(selection)
@@ -1510,6 +1514,7 @@ async fn meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     Json(MetaPayload {
         exchanges,
+        instruments: types::INSTRUMENTS,
         contract_series: CONTRACT_SERIES,
         spot_series: SPOT_SERIES,
         indicators: state.indicators.infos(),
@@ -1688,36 +1693,34 @@ async fn mark_market_error(state: &AppState, exchange: Exchange, market: Market,
     }
 }
 
-fn binance_market_symbols(market: Market) -> &'static [Symbol] {
-    match market {
-        Market::Spot | Market::Usdm | Market::Coinm => &[Symbol::Btc, Symbol::Eth],
-        Market::Usdc => panic!("Binance does not support the Coinbase USDC gateway"),
-    }
+#[cfg(test)]
+#[test]
+fn new_usdc_stream_routes_without_panicking() {
+    assert!(binance_market_stream_url(Market::SpotUsdc).unwrap().contains("btcusdc@aggTrade"));
+    assert!(binance_market_stream_url(Market::UsdmUsdc).unwrap().contains("ethusdc@aggTrade"));
 }
 
-fn binance_market_stream_url(market: Market) -> String {
-    let streams = binance_market_symbols(market)
+fn binance_market_stream_url(market: Market) -> Result<String> {
+    let instruments: Vec<_> =
+        types::INSTRUMENTS.iter().filter(|i| i.exchange == Exchange::Binance && i.market == market).collect();
+    anyhow::ensure!(!instruments.is_empty(), "unsupported Binance market {}", market.as_str());
+    let streams = instruments
         .iter()
-        .map(|symbol| {
-            let name = match market {
-                Market::Coinm => symbol.coinm_stream(),
-                _ => symbol.spot_usdm_stream(),
-            };
-            format!("{name}@aggTrade")
-        })
+        .map(|i| format!("{}@aggTrade", i.native_symbol.to_ascii_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
-
-    match market {
-        Market::Spot => format!("wss://stream.binance.com:9443/stream?streams={streams}"),
-        Market::Usdm => format!("wss://fstream.binance.com/market/stream?streams={streams}"),
-        Market::Coinm => format!("wss://dstream.binance.com/stream?streams={streams}"),
-        Market::Usdc => panic!("Binance has no USDC gateway stream"),
-    }
+    let base = match market {
+        Market::Spot | Market::SpotUsdc => "wss://stream.binance.com:9443/stream",
+        Market::Usdm | Market::UsdmUsdc => "wss://fstream.binance.com/market/stream",
+        Market::Coinm => "wss://dstream.binance.com/stream",
+        Market::Usdc => anyhow::bail!("Coinbase USDC is not a Binance gateway"),
+    };
+    Ok(format!("{base}?streams={streams}"))
 }
 
 async fn run_binance_market_once(state: &AppState, market: Market) -> Result<()> {
-    let url = binance_market_stream_url(market);
+    let url = binance_market_stream_url(market)?;
+    binance::validate_market_metadata(market).await?;
     println!("[binance:{}] Connecting to: {}", market.as_str(), url);
 
     let (ws_stream, _resp) = connect_async(&url).await?;
@@ -1732,6 +1735,9 @@ async fn run_coinbase_market_once(state: &Arc<AppState>, market: Market) -> Resu
         Market::Usdc => "wss://streams.drb.coinbase.com/ws/api/v2",
         Market::Usdm => return Err(anyhow::anyhow!("retired Coinbase INTX feed must not run")),
         Market::Coinm => return Err(anyhow::anyhow!("Coinbase does not support coin-m market")),
+        Market::SpotUsdc | Market::UsdmUsdc => {
+            return Err(anyhow::anyhow!("Binance USDC market is not a Coinbase source"))
+        }
     };
     println!("[coinbase:{}] Connecting to: {}", market.as_str(), url);
 
@@ -1743,6 +1749,7 @@ async fn run_coinbase_market_once(state: &Arc<AppState>, market: Market) -> Resu
         Market::Usdc => coinbase_perp::run_coinbase_perp_market_engine(state.clone(), write, read).await,
         Market::Usdm => Err(anyhow::anyhow!("retired Coinbase INTX feed must not run")),
         Market::Coinm => Err(anyhow::anyhow!("Coinbase does not support coin-m market")),
+        Market::SpotUsdc | Market::UsdmUsdc => Err(anyhow::anyhow!("Binance USDC market is not a Coinbase source")),
     }
 }
 

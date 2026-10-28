@@ -6,11 +6,12 @@ const vm = require('node:vm')
 
 function prefsHarness(metaPayload, failMeta = false) {
     function select(options) {
-        let allowed = options, value = options[0];
+        let allowed = options, value = options[0], markup = '';
         return {
             get value() { return value },
             set value(v) { value = allowed.includes(v) ? v : '' },
-            set innerHTML(html) { allowed = [...html.matchAll(/value="([^"]+)"/g)].map(m => m[1]); value = allowed[0] || '' },
+            get innerHTML() { return markup },
+            set innerHTML(html) { markup = html; allowed = [...html.matchAll(/value="([^"]+)"/g)].map(m => m[1]); value = allowed[0] || '' },
         }
     }
     const saved = {};
@@ -23,9 +24,9 @@ function prefsHarness(metaPayload, failMeta = false) {
         pluginPrefs: { enabled: {}, modes: {} },
         localStorage: {setItem: (k,v) => saved[k] = v},
     });
-    const config = fs.readFileSync(require('node:path').join(__dirname,'../static/js/config.js'),'utf8').replaceAll('export const','const');
+    const config = fs.readFileSync(require('node:path').join(__dirname,'../static/js/config.js'),'utf8').replaceAll('export const','const').replaceAll('export function','function');
     const legacy = fs.readFileSync(require('node:path').join(__dirname,'../static/js/legacy-prefs.mjs'),'utf8').replaceAll('export function','function');
-    vm.runInContext(config + '\n' + legacy + '\n' + section('let exchangeMeta','function mkChart') + '\n' + section('function setSelectOptions','const chart =') + '\n' + section('function sanitizePluginPrefs','function pluginEnabled'), context);
+    vm.runInContext(config + '\n' + legacy + '\n' + section('const fallbackInstruments','function mkChart') + '\n' + section('function marketLabel','const chart =') + '\n' + section('function sanitizePluginPrefs','function pluginEnabled'), context);
     return { run: code => vm.runInContext(code, context), saved };
 }
 
@@ -148,7 +149,8 @@ function harness() {
         CONFIG: { FETCH_COOLDOWN: 0, DELAY_POLL_MS: 1000 },
     })
     vm.runInContext(fs.readFileSync(require('node:path').join(__dirname, '../static/js/quality-display.mjs'), 'utf8').replaceAll('export function', 'function'), context)
-    vm.runInContext(section('let programmaticRangeChange', 'function emptyHistoryPayload')
+    const config = fs.readFileSync(require('node:path').join(__dirname,'../static/js/config.js'),'utf8').replaceAll('export const','const').replaceAll('export function','function');
+    vm.runInContext(config + '\nCONFIG.DELAY_POLL_MS=1000; CONFIG.FETCH_COOLDOWN=0;\n' + section('const fallbackInstruments', 'function savePrefs') + '\n' + section('let programmaticRangeChange', 'function emptyHistoryPayload')
         + '\n' + section('function assertSourceSeries', 'function updateOptionsForExchange')
         + '\n' + section('let timelineTimes', 'function selectRenderWindow')
         + '\nfunction setBars(bars) { fullWrites++; page.bars = bars; renderedWindow.bars = bars.slice(); page.oldestTime = bars[0]?.time ?? null; page.newestTime = bars.at(-1)?.time ?? null }\n'
@@ -313,6 +315,98 @@ test('Coinbase meta, stale meta, and fallback never resurrect retired usdm', asy
     }
 });
 
+const instrument = (exchange, market, symbol) => {
+    const quote = exchange === 'coinbase' ? (market === 'spot' ? 'USD' : 'USDC') : market.endsWith('_usdc') ? 'USDC' : market === 'coinm' ? 'USD' : 'USDT';
+    const category = ['spot', 'spot_usdc'].includes(market) ? 'spot' : 'contract';
+    return {exchange, market, symbol, native_symbol: exchange === 'binance' ? (market === 'coinm' ? `${symbol}USD_PERP` : `${symbol}${quote}`) : market === 'spot' ? `${symbol}-USD` : `${symbol}_USDC-PERPETUAL`,
+        category, contract_kind: category === 'spot' ? null : market === 'coinm' ? 'inverse' : 'linear', quote_asset: quote,
+        settlement_asset: category === 'spot' ? null : market === 'coinm' ? symbol : quote};
+};
+test('only validated producer instruments expose new combinations; old metadata stays legacy-only', async () => {
+    const payload = {spot_series:'spot-v1', contract_series:'contracts-drb-v1', exchanges:[{exchange:'binance', markets:['spot','usdm','spot_usdc','usdm_usdc'],symbols:['BTC','ETH']}],
+        instruments:[instrument('binance','spot','BTC'), instrument('binance','usdm','BTC'), instrument('binance','spot_usdc','BTC'), instrument('binance','usdm_usdc','ETH'),
+            instrument('coinbase','spot_usdc','BTC'), {...instrument('binance','spot_usdc','ETH'), quote_asset:'USDT'}]};
+    const {run} = prefsHarness(payload); await run('loadMeta()');
+    assert.equal(run('exchangeMeta.binance.markets.includes("spot_usdc")'),true);
+    run('applyPrefs({exchange:"binance",market:"spot_usdc",symbol:"BTC"})');
+    assert.equal(run('marketSel.value'),'spot_usdc');
+    assert.match(run('marketSel.innerHTML'), /value="spot_usdc">USDC spot<\/option>/);
+    assert.match(run('marketSel.innerHTML'), /value="usdm">USDT linear perpetual<\/option>/);
+    assert.match(run('sourceSeriesEl.textContent'), /USDC spot/);
+    run('symbolSel.value="ETH";updateOptionsForSymbol()');
+    assert.match(run('marketSel.innerHTML'), /value="usdm_usdc">USDC linear perpetual<\/option>/);
+    assert.equal(run('marketSel.value'),'usdm_usdc', 'invalid market/symbol pairing cannot be constructed');
+    run('applyPrefs({exchange:"binance",market:"usdm_usdc",symbol:"ETH"})');
+    assert.equal(run('marketSel.value'),'usdm_usdc');
+    assert.match(run('sourceSeriesEl.textContent'), /USDC linear perpetual/);
+    for (const meta of [{...payload, instruments:undefined}, {...payload, spot_series:'stale'}, {...payload, instruments:[{...instrument('binance','spot_usdc','BTC'),native_symbol:'BTCUSDT'}]}]) {
+        const old = prefsHarness(meta); await old.run('loadMeta()');
+        assert.equal(old.run('exchangeMeta.binance.markets.includes("spot_usdc")'),false);
+    }
+});
+
+test('new spot uses spot-v1 and refuses absent series and mismatched source identity', async () => {
+    const {run,requests,sockets} = harness();
+    run('marketSel.value="spot_usdc"; availableInstruments=[...availableInstruments,SOURCE_INSTRUMENTS["binance:spot_usdc:BTC"]]');
+    let pending=run('fetchHistory(2)');
+    assert.equal(requests.at(-1).url.searchParams.get('series'),'spot-v1');
+    respond(requests.at(-1),[{time:60}],{});
+    await assert.rejects(pending,/series/i);
+    pending=run('fetchHistory(2)');
+    respond(requests.at(-1),[{time:60}],{series:'spot-v1',exchange:'binance',market:'spot'});
+    await assert.rejects(pending,/source/i);
+    run('connectWs()');
+    assert.equal(new URL(sockets[0].url).searchParams.get('series'),'spot-v1');
+    sockets[0].onmessage({data:JSON.stringify({series:'spot-v1',market:'spot',bar:{time:60}})});
+    assert.equal(sockets[0].readyState,3);
+    assert.equal(run('page.bars.length'),0);
+});
+
+test('new-source empty history is labeled unknown, never complete or zero', () => {
+    const {run}=harness();
+    run('availableInstruments=[...availableInstruments,SOURCE_INSTRUMENTS["binance:usdm_usdc:BTC"]]; marketSel.value="usdm_usdc"; applyHistoryPage({bars:[],has_more_before:false,has_more_after:false,realtime_enabled:true})');
+    assert.equal(run('statusEl.textContent'),'no stored history yet');
+    assert.equal(run('page.bars.length'),0);
+    run('applyRealtimePayload({series:"contracts-drb-v1",bar:{time:60,cvd_usdt:5}})');
+    assert.equal(run('statusEl.textContent'),'live · history starting');
+});
+
+test('USDT→USDC switch fences late same-series history and old socket frames; delayed poll stays on USDC', async () => {
+    const {run,requests,sockets} = harness();
+    run('availableInstruments=[...availableInstruments,SOURCE_INSTRUMENTS["binance:spot_usdc:BTC"]]');
+    const old = run('reload()');
+    run('connectWs()');
+    const oldSocket = sockets.at(-1);
+    run('marketSel.value="spot_usdc"');
+    const current = run('reload()');
+    assert.equal(requests[0].options.signal.aborted,true);
+    assert.equal(oldSocket.readyState,3);
+    assert.equal(requests[1].url.searchParams.get('market'),'spot_usdc');
+    assert.equal(requests[1].url.searchParams.get('series'),'spot-v1');
+    respond(requests[1],[{time:60,cvd_usdt:7}],{series:'spot-v1'});
+    await current;
+    respond(requests[0],[{time:60,cvd_usdt:900}],{series:'spot-v1'});
+    await old;
+    oldSocket.onmessage({data:JSON.stringify({series:'spot-v1',bar:{time:120,cvd_usdt:999}})});
+    assert.equal(run('page.bars[0].cvd_usdt'),7);
+    assert.equal(run('page.bars.length'),1);
+    run('realtimeEnabled=false');
+    const poll=run('pollDelayedUpdates()');
+    assert.equal(requests[2].url.searchParams.get('market'),'spot_usdc');
+    assert.equal(requests[2].url.searchParams.get('series'),'spot-v1');
+    respond(requests[2],[],{series:'spot-v1',realtime_enabled:false});
+    await poll;
+});
+
+test('unsupported venue/market pair is refused before opening HTTP or WS', async () => {
+    const {run,requests,sockets}=harness();
+    run('exchangeSel.value="coinbase"; marketSel.value="spot_usdc"');
+    await assert.rejects(run('fetchHistory(2)'), /Unsupported source/);
+    assert.throws(() => run('connectWs()'), /Unsupported source/);
+    assert.equal(requests.length,0);
+    assert.equal(sockets.length,0);
+});
+
 test('contract history URL carries series and refuses wrong or missing responses before chart changes', async () => {
     const {run,requests} = harness();
     run('marketSel.value="usdc"; exchangeSel.value="coinbase"');
@@ -393,4 +487,18 @@ test('history merge touches only the changed suffix yet stays correct for prepen
     assert.equal(merged, JSON.stringify([[30,9],[60,1],[90,6],[120,1],[6000,8],[960060,5],[960090,4]]), 'prepend, gap insert, duplicate-last-wins and append')
     const sorted = run('(() => { const out = mergeHistoryBars([{time:6030,price_close:3},{time:45,price_close:3}]); return out.every((b,i)=>i===0||out[i-1].time<b.time) && out.length === 16003 })()')
     assert.equal(sorted, true)
+})
+
+test('producer-derived instruments fixture matches frontend descriptors exactly (A types.rs INSTRUMENTS)', async () => {
+    const { SOURCE_INSTRUMENTS, validInstrument, sourceSeries } = await import('../static/js/config.js')
+    const produced = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, 'fixtures/usdc-producer-instruments.json'), 'utf8'))
+    assert.equal(produced.length, Object.keys(SOURCE_INSTRUMENTS).length)
+    for (const item of produced) assert.ok(validInstrument(item), JSON.stringify(item))
+    const usdcSpot = produced.filter(i => i.market === 'spot_usdc')
+    assert.deepEqual(usdcSpot.map(i => [i.category, i.contract_kind, i.quote_asset, sourceSeries(i.market)]),
+        [['spot', null, 'USDC', 'spot-v1'], ['spot', null, 'USDC', 'spot-v1']])
+    assert.ok(produced.filter(i => i.market === 'usdm_usdc').every(i => i.category === 'contract' && i.settlement_asset === 'USDC' && sourceSeries(i.market) === 'contracts-drb-v1'))
+    assert.ok(!produced.some(i => i.exchange === 'bybit' || (i.exchange === 'coinbase' && i.market === 'usdm')))
+    for (const field of ['quote_asset', 'native_symbol', 'category'])
+        assert.ok(!validInstrument({ ...produced.find(i => i.market === 'usdm_usdc'), [field]: 'USDT' }), field)
 })

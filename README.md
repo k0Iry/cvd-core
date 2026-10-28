@@ -37,6 +37,19 @@ or CI run is required; private/custom libraries are optional.
 - Existing deployments must retain their database and outbox rather than blindly
   adopt the fresh-install volumes. The guide shows the distinction.
 
+## Market sources
+
+BTC and ETH are supported on Binance USDT/USDC spot, USDT/USDC linear perpetuals,
+COIN-M inverse perpetuals, Coinbase USD spot and Coinbase USDC perpetuals.
+See [instrument identities and units](docs/instruments.md) and
+[USDC source selection](docs/usdc-ui.md) for exact keys and UI behavior.
+
+New Binance USDC sources have independent history, cursors and CVD seeds; existing
+USDT/Coinbase rows are neither relabelled nor backfilled. Aggregate turnover is
+nominal USD/USDT/USDC without FX conversion. This addition changes no database
+schema or indicator ABI: retain existing data/outbox and rebuild only the core
+application to upgrade. Longer-context indicators may need new-source warm-up.
+
 ## Build
 
     cargo build --release -p cvd-server -p cvd-indicator-runner   # host + runner
@@ -76,6 +89,29 @@ connection-local `TEMP bars` table under `search_path = pg_temp`):
     CVD_PLUGIN_PG_TEST_URL='postgresql://<user>@localhost:<port>/cvd_plugin_test?host=<socket-dir>' \
     CVD_RETIREMENT_TEST_URL='postgresql://<user>@localhost:<port>/cvd_retirement_test?host=<socket-dir>' \
       cargo test --offline -p cvd-server -- --ignored --test-threads=1 pg_plugin postgres_retirement
+
+Frontend regression tests:
+
+    node --test tests/*.test.cjs static/js/*.test.cjs
+
+The opt-in USDC producer-to-browser gate uses the disposable
+`CVD_RETIREMENT_TEST_URL` above, public CVD/Flow libraries and a pre-created artifact
+directory (all paths below are operator-selected absolute paths):
+
+    CVD_RETIREMENT_TEST_URL='postgresql://<user>@localhost:<port>/cvd_retirement_test?host=<socket-dir>' \
+    CVD_PUBLIC_INDICATOR_DIR=/absolute/public-libs \
+    CVD_R_EXPORT_DIR=/absolute/test-artifacts \
+      cargo test --locked --offline -p cvd-server --bin cvd postgres_router_http_ws -- --ignored --test-threads=1
+    CVD_PRODUCER_CORPUS=/absolute/test-artifacts/producer-corpus.json \
+    CVD_R_OUT=/absolute/test-artifacts \
+      node tests/browser-usdc-producer.mjs
+
+Chromium defaults to `/usr/bin/chromium` (`CVD_CHROMIUM` overrides it); the Node
+runtime must provide global `fetch` and `WebSocket`. Input trades are synthetic,
+but the corpus contains actual Rust router/runner responses. The browser replays
+those responses through the real frontend; health is mocked. This is not a
+production or Safari acceptance test. Omitting the public-library directory tests
+the bare host instead, not plugin rendering.
 
 Format only owned packages
 (`cargo fmt -p <pkg>`), never `cargo fmt --all` from a repository that has

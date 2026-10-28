@@ -8,6 +8,8 @@ pub struct BinanceCombinedMsg {
 
 #[derive(Debug, Deserialize)]
 pub struct AggTrade {
+    #[serde(rename = "s")]
+    pub symbol: Option<String>,
     #[serde(rename = "a")]
     pub id: u64,
     #[serde(rename = "e")]

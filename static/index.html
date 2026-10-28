@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 
-    <link rel="stylesheet" href="/css/app.css?v=plugin-ui-2">
+    <link rel="stylesheet" href="/css/app.css?v=usdc-ui-1">
 
     <script type="importmap">
     {
@@ -41,9 +41,9 @@
 
         <label for="market">Market</label>
         <select id="market">
-            <option>spot</option>
-            <option>usdm</option>
-            <option>usdc</option>
+            <option value="spot">USDT spot</option>
+            <option value="usdm">USDT linear perpetual</option>
+            <option value="coinm">USD inverse perpetual</option>
         </select>
 
         <label for="tf">TF</label>
@@ -76,7 +76,7 @@
         </div>
     </div>
 
-    <script type="module" src="/js/app.js?v=plugin-ui-2"></script>
+    <script type="module" src="/js/app.js?v=usdc-ui-1"></script>
 </body>
 
 </html>

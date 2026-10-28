@@ -27,6 +27,25 @@ async function realHarness(options = {}) {
 }
 const event = (h, message) => h.run(`handleIndicatorEvent(parseIndicatorFrame(${JSON.stringify(message)}))`)
 
+test('production app source labels and pane readouts use actual quote units, aggregate stays nominal', () => {
+    const h = harness()
+    h.run('modeConnectionsReady=true; availableInstruments=Object.values(SOURCE_INSTRUMENTS); setBars([{time:60,price_close:100,cvd_usdt:8,buy_volume_usdt:6,sell_volume_usdt:5,delta_usdt:1}])')
+    h.flushFrames()
+    const panes = h.run('registry.panes.length')
+    for (const [exchange,market,unit,label] of [
+        ['binance','spot','USDT','USDT spot'], ['binance','spot_usdc','USDC','USDC spot'],
+        ['binance','usdm','USDT','USDT linear perpetual'], ['binance','usdm_usdc','USDC','USDC linear perpetual'],
+        ['binance','coinm','USD','USD inverse perpetual'], ['coinbase','spot','USD','USD spot'], ['coinbase','usdc','USDC','USDC DRB perpetual'],
+    ]) {
+        h.run(`exchangeSel.value=${JSON.stringify(exchange)};marketSel.value=${JSON.stringify(market)};updateSourceSeriesLabel();updateFlowReadout()`)
+        assert.match(h.run('sourceSeriesEl.textContent'),new RegExp(label))
+        assert.match(h.run('flowSummaryEl.textContent'),new RegExp(`${unit} quote turnover$`))
+    }
+    h.run('aggToggle.checked=true;refreshModeData()'); h.flushFrames()
+    assert.match(h.run('flowSummaryEl.textContent'), /nominal USD\/USDT\/USDC quote · no FX conversion$/)
+    assert.equal(h.run('registry.panes.length'),panes)
+});
+
 test('bare host: no indicators -> price pane + host backbone only; no plugin series or controls', () => {
     const h = harness({}, { descriptors: [] })
     h.run(`modeConnectionsReady = true; setBars(${JSON.stringify([bar(60), bar(120), bar(180)])})`)
@@ -98,9 +117,9 @@ test('real fixture: CVD/Flow/Total and a generic non-LEVELS plugin render from r
     assert.deepEqual(bs[gapIndex], { time: bars[gapIndex].time }, 'gap, never zero')
     assert.deepEqual(bs[zeroIndex].values, [0, 0, 0, 0])
     assert.deepEqual(bs[0].values, [fx.upper[0], 0, fx.lower[0], 0])
-    assert.match(h.run('flowSummaryEl.textContent'), /· Total \d[\d.]*K$/)
+    assert.match(h.run('flowSummaryEl.textContent'), /· Total \d[\d.]*K · (USDT quote turnover|nominal USD\/USDT\/USDC quote · no FX conversion)$/)
     h.run('flowModeSel.value = "flow/delta"; flowModeSel.onchange()')
-    assert.match(h.run('flowSummaryEl.textContent'), /· Total \d[\d.]*K$/, 'Total shown in both visual modes')
+    assert.match(h.run('flowSummaryEl.textContent'), /· Total \d[\d.]*K · (USDT quote turnover|nominal USD\/USDT\/USDC quote · no FX conversion)$/, 'Total shown in both visual modes')
     assert.equal(h.run('renderers.has("flow/total")'), false, 'readout_only output has no native series')
     h.emit('chart', 'crosshair', { time: bars[gapIndex].time, sourceEvent: {} })
     assert.match(h.run('flowSummaryEl.textContent'), /Buy\/Sell unavailable \/ unavailable · Total unavailable/)

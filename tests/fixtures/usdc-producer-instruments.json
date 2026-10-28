@@ -1,0 +1,142 @@
+[
+ {
+  "exchange": "binance",
+  "market": "spot",
+  "symbol": "BTC",
+  "native_symbol": "BTCUSDT",
+  "category": "spot",
+  "contract_kind": null,
+  "quote_asset": "USDT",
+  "settlement_asset": null
+ },
+ {
+  "exchange": "binance",
+  "market": "spot",
+  "symbol": "ETH",
+  "native_symbol": "ETHUSDT",
+  "category": "spot",
+  "contract_kind": null,
+  "quote_asset": "USDT",
+  "settlement_asset": null
+ },
+ {
+  "exchange": "binance",
+  "market": "spot_usdc",
+  "symbol": "BTC",
+  "native_symbol": "BTCUSDC",
+  "category": "spot",
+  "contract_kind": null,
+  "quote_asset": "USDC",
+  "settlement_asset": null
+ },
+ {
+  "exchange": "binance",
+  "market": "spot_usdc",
+  "symbol": "ETH",
+  "native_symbol": "ETHUSDC",
+  "category": "spot",
+  "contract_kind": null,
+  "quote_asset": "USDC",
+  "settlement_asset": null
+ },
+ {
+  "exchange": "binance",
+  "market": "usdm",
+  "symbol": "BTC",
+  "native_symbol": "BTCUSDT",
+  "category": "contract",
+  "contract_kind": "linear",
+  "quote_asset": "USDT",
+  "settlement_asset": "USDT"
+ },
+ {
+  "exchange": "binance",
+  "market": "usdm",
+  "symbol": "ETH",
+  "native_symbol": "ETHUSDT",
+  "category": "contract",
+  "contract_kind": "linear",
+  "quote_asset": "USDT",
+  "settlement_asset": "USDT"
+ },
+ {
+  "exchange": "binance",
+  "market": "usdm_usdc",
+  "symbol": "BTC",
+  "native_symbol": "BTCUSDC",
+  "category": "contract",
+  "contract_kind": "linear",
+  "quote_asset": "USDC",
+  "settlement_asset": "USDC"
+ },
+ {
+  "exchange": "binance",
+  "market": "usdm_usdc",
+  "symbol": "ETH",
+  "native_symbol": "ETHUSDC",
+  "category": "contract",
+  "contract_kind": "linear",
+  "quote_asset": "USDC",
+  "settlement_asset": "USDC"
+ },
+ {
+  "exchange": "binance",
+  "market": "coinm",
+  "symbol": "BTC",
+  "native_symbol": "BTCUSD_PERP",
+  "category": "contract",
+  "contract_kind": "inverse",
+  "quote_asset": "USD",
+  "settlement_asset": "BTC"
+ },
+ {
+  "exchange": "binance",
+  "market": "coinm",
+  "symbol": "ETH",
+  "native_symbol": "ETHUSD_PERP",
+  "category": "contract",
+  "contract_kind": "inverse",
+  "quote_asset": "USD",
+  "settlement_asset": "ETH"
+ },
+ {
+  "exchange": "coinbase",
+  "market": "spot",
+  "symbol": "BTC",
+  "native_symbol": "BTC-USD",
+  "category": "spot",
+  "contract_kind": null,
+  "quote_asset": "USD",
+  "settlement_asset": null
+ },
+ {
+  "exchange": "coinbase",
+  "market": "spot",
+  "symbol": "ETH",
+  "native_symbol": "ETH-USD",
+  "category": "spot",
+  "contract_kind": null,
+  "quote_asset": "USD",
+  "settlement_asset": null
+ },
+ {
+  "exchange": "coinbase",
+  "market": "usdc",
+  "symbol": "BTC",
+  "native_symbol": "BTC_USDC-PERPETUAL",
+  "category": "contract",
+  "contract_kind": "linear",
+  "quote_asset": "USDC",
+  "settlement_asset": "USDC"
+ },
+ {
+  "exchange": "coinbase",
+  "market": "usdc",
+  "symbol": "ETH",
+  "native_symbol": "ETH_USDC-PERPETUAL",
+  "category": "contract",
+  "contract_kind": "linear",
+  "quote_asset": "USDC",
+  "settlement_asset": "USDC"
+ }
+]

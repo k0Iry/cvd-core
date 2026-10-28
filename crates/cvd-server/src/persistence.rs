@@ -38,7 +38,7 @@ impl PendingBar {
 }
 
 pub struct Outbox {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     notify: Notify,
 }
 

@@ -37,7 +37,7 @@ async fn live_http_contract_rejects_retired_selection_and_preserves_active_socke
     assert_eq!(response.status(), 101);
     ws.close(None).await.unwrap();
     let h: serde_json::Value = client.get(format!("http://{addr}/health")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(h["sources"].as_array().unwrap().len(), 10);
+    assert_eq!(h["sources"].as_array().unwrap().len(), 14);
     assert_eq!(h["retired_pending_bars"], 0);
     // Static assets are owned by the frontend tree; check them when present.
     if std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../static/index.html").is_file() {
@@ -59,6 +59,8 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
     let db = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     let database: String = sqlx::query_scalar("SELECT current_database()").fetch_one(&db).await.unwrap();
     assert_eq!(database, "cvd_retirement_test", "use the dedicated disposable test database");
+    let unix_socket: bool = sqlx::query_scalar("SELECT inet_server_addr() IS NULL").fetch_one(&db).await.unwrap();
+    assert!(unix_socket, "only the disposable Unix socket may be used");
     sqlx::query("SET search_path TO pg_temp").execute(&db).await.unwrap();
     // A connection-local table shadows public.bars. No production schema/data is changed.
     sqlx::query("CREATE TEMP TABLE bars (exchange TEXT NOT NULL, market TEXT NOT NULL, symbol TEXT NOT NULL, tf TEXT NOT NULL, time BIGINT NOT NULL, price_open DOUBLE PRECISION NOT NULL, price_high DOUBLE PRECISION NOT NULL, price_low DOUBLE PRECISION NOT NULL, price_close DOUBLE PRECISION NOT NULL, delta_usdt DOUBLE PRECISION NOT NULL, cvd_usdt DOUBLE PRECISION NOT NULL, buy_volume_base DOUBLE PRECISION NOT NULL, sell_volume_base DOUBLE PRECISION NOT NULL, buy_volume_usdt DOUBLE PRECISION NOT NULL, sell_volume_usdt DOUBLE PRECISION NOT NULL, trades BIGINT NOT NULL, PRIMARY KEY(exchange,market,symbol,tf,time))").execute(&db).await.unwrap();
@@ -322,7 +324,7 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
 #[tokio::test]
 async fn retired_sources_are_absent_from_shards_and_metadata() {
     let state = tests::state().await;
-    assert_eq!(state.shards.len(), 10);
+    assert_eq!(state.shards.len(), 14);
     assert!(state.shards.keys().all(|(exchange, _, _)| exchange.as_str() != "bybit"));
     let response = meta(State(Arc::new(tests::state().await))).await.into_response();
     let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();

@@ -10,7 +10,7 @@ fn expected_scope_and_time_boundary_are_not_completeness() {
         vec![(Exchange::Binance, Market::Usdm, Some(119))],
         119999,
     );
-    assert_eq!(forming.expected_sources, 3);
+    assert_eq!(forming.expected_sources, 4);
     assert_eq!(forming.present_sources, 1);
     assert_eq!(forming.bar_state, BarState::Forming);
     assert_eq!(forming.coverage, Coverage::Unverified);
@@ -22,7 +22,12 @@ fn expected_scope_and_time_boundary_are_not_completeness() {
         vec![(Exchange::Binance, Market::Spot, Some(119)), (Exchange::Coinbase, Market::Spot, Some(119))],
         120000,
     );
-    assert_eq!(elapsed.present_sources, elapsed.expected_sources);
+    assert_eq!(elapsed.expected_sources, 3);
+    assert_eq!(elapsed.present_sources, 2);
+    assert!(elapsed
+        .sources
+        .iter()
+        .any(|s| s.market == "spot_usdc" && s.contribution == quality::Contribution::Missing));
     assert_eq!(elapsed.bar_state, BarState::Elapsed);
     assert_eq!(elapsed.coverage, Coverage::Unverified);
 }
@@ -137,7 +142,7 @@ async fn live_aggregate_reports_participation_without_claiming_completeness() {
     let q = &encoded["quality"];
     assert_eq!(q["coverage"], "unverified");
     assert_eq!(q["bar_state"], "elapsed");
-    assert_eq!(q["expected_sources"], 2);
+    assert_eq!(q["expected_sources"], 3);
     assert_eq!(q["present_sources"], 1);
     let sources = q["sources"].as_array().unwrap();
     assert_eq!(sources.iter().find(|s| s["exchange"] == "coinbase").unwrap()["contribution"], "carried");

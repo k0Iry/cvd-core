@@ -47,7 +47,7 @@ test('frontend source has no retired indicator renderers, keys or readiness help
 
 test('changed frontend modules share one coherent import version', () => {
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...app.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['plugin-ui-2'])
+    assert.deepEqual([...versions], ['usdc-ui-1'])
 })
 
 function section(start, end) {
@@ -73,9 +73,9 @@ test('stored legacy Strength preferences are pruned without resetting useful set
         aggToggle: { checked: false }, pluginPrefs: { enabled: {}, modes: {} },
         localStorage: { setItem: (k, v) => { saved[k] = v } },
     })
-    const config = read('static/js/config.js').replaceAll('export const', 'const')
+    const config = read('static/js/config.js').replaceAll('export const', 'const').replaceAll('export function', 'function')
     const legacyModule = read('static/js/legacy-prefs.mjs').replaceAll('export function', 'function')
-    vm.runInContext(config + '\n' + legacyModule + '\n' + section('let exchangeMeta', 'function mkChart') + '\n' + section('function setSelectOptions', 'const chart =') + '\n' + section('function sanitizePluginPrefs', 'function pluginEnabled'), context)
+    vm.runInContext(config + '\n' + legacyModule + '\n' + section('const fallbackInstruments', 'function mkChart') + '\n' + section('function marketLabel', 'const chart =') + '\n' + section('function sanitizePluginPrefs', 'function pluginEnabled'), context)
     const run = code => vm.runInContext(code, context)
     const legacy = { exchange: 'coinbase', market: 'usdc', symbol: 'ETH', tf: '5m', accessKey: 'k', showRd: true, showKd: true,
         showFd: false, showHd: true, showLevels: false, showAgg: true, flowMode: 'buy-sell' }

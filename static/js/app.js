@@ -1,14 +1,14 @@
-import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, STORAGE_KEY, THEMES } from "./config.js?v=plugin-ui-2"
-import { elements } from "./dom.js?v=plugin-ui-2"
+import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=usdc-ui-1"
+import { elements } from "./dom.js?v=usdc-ui-1"
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=plugin-ui-2"
-import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=plugin-ui-2"
-import { DISCOVERY_PATH, historyResults, parseDiscovery, parseIndicatorFrame } from "./plugin-wire.mjs?v=plugin-ui-2"
-import { createIndicatorStore } from "./plugin-store.mjs?v=plugin-ui-2"
-import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=plugin-ui-2"
-import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=plugin-ui-2"
-import { createOutputRenderer } from "./plugin-render.mjs?v=plugin-ui-2"
+import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=usdc-ui-1"
+import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=usdc-ui-1"
+import { DISCOVERY_PATH, historyResults, parseDiscovery, parseIndicatorFrame } from "./plugin-wire.mjs?v=usdc-ui-1"
+import { createIndicatorStore } from "./plugin-store.mjs?v=usdc-ui-1"
+import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=usdc-ui-1"
+import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=usdc-ui-1"
+import { createOutputRenderer } from "./plugin-render.mjs?v=usdc-ui-1"
 
 const {
     exchangeSel,
@@ -27,8 +27,18 @@ const {
     paneLabels,
 } = elements
 
+const fallbackInstruments = Object.values(SOURCE_INSTRUMENTS).filter(legacySource)
+let availableInstruments = fallbackInstruments
 let exchangeMeta = { ...FALLBACK_EXCHANGE_META }
 let prefsHydrated = false
+const available = (exchange, market, symbol) => availableInstruments.some(item =>
+    item.exchange === exchange && item.market === market && item.symbol === symbol)
+function availableMarkets(exchange, symbol) {
+    return (exchangeMeta[exchange]?.markets || []).filter(market => available(exchange, market, symbol))
+}
+function availableSymbols(exchange, market) {
+    return (exchangeMeta[exchange]?.symbols || []).filter(symbol => available(exchange, market, symbol))
+}
 
 function savePrefs() {
     if (!prefsHydrated) return
@@ -77,38 +87,57 @@ function mkChart(el) {
     })
 }
 
+function marketLabel(exchange, market) {
+    if (market === "spot_usdc") return "USDC spot"
+    if (market === "usdm_usdc") return "USDC linear perpetual"
+    if (market === "usdm") return "USDT linear perpetual"
+    if (market === "coinm") return "USD inverse perpetual"
+    if (market === "usdc" && exchange === "coinbase") return "USDC DRB perpetual"
+    return market === "spot" ? `${exchange === "coinbase" ? "USD" : "USDT"} spot` : market
+}
 function setSelectOptions(sel, options, preferValue) {
-    sel.innerHTML = options.map(v => `<option value="${v}">${v}</option>`).join("")
+    sel.innerHTML = options.map(v => `<option value="${v}">${sel === marketSel ? marketLabel(exchangeSel.value, v) : v}</option>`).join("")
     if (preferValue && options.includes(preferValue)) sel.value = preferValue
     else sel.value = options[0]
 }
 
 function updateSourceSeriesLabel(note = "") {
-    const gateway = exchangeSel.value === "coinbase" && marketSel.value === "usdc"
-    sourceSeriesEl.textContent = marketSel.value === "spot"
-        ? (note ? "Spot · separate series (INTX retired)" : "Spot series")
-        : gateway ? `USDC · independent series${note ? " · INTX retired" : ""}` : "Agg basket · DRB v1"
-    sourceSeriesEl.title = `Coinbase DRB USDC is an independent new series; old INTX CVD is not carried over. Contract Agg uses the current active basket; Binance single-source history is unchanged. ${note}`
+    const descriptor = SOURCE_INSTRUMENTS[sourceKey(exchangeSel.value, marketSel.value, symbolSel.value)]
+    const market = marketSel.value
+    const name = marketLabel(exchangeSel.value, market)
+    sourceSeriesEl.textContent = `${name}${market === "usdc" && exchangeSel.value === "coinbase" ? " · independent series" : ""}${note ? " · separate series · INTX retired" : ""}`
+    sourceSeriesEl.title = `${exchangeSel.value} ${descriptor?.native_symbol ?? "unsupported"}; source quote turnover ${descriptor?.quote_asset ?? "unknown"}. New USDC sources have independent history; missing history is not zero or complete. Aggregate is nominal USD/USDT/USDC quote turnover without FX conversion; Coinbase INTX history is retired. ${note}`
 }
 
-function assertSourceSeries(payload, market) {
-    const expected = market === "spot" ? "spot-v1" : "contracts-drb-v1"
+function assertSourceSeries(payload, market, exchange = exchangeSel.value, symbol = symbolSel.value) {
+    const expected = sourceSeries(market)
     if (payload?.series !== expected && !(market === "spot" && payload != null && !Object.prototype.hasOwnProperty.call(payload, "series"))) {
         throw new Error(`Source series mismatch: expected ${expected}`)
+    }
+    for (const [field, selected] of [["exchange", exchange], ["market", market], ["symbol", symbol]]) {
+        if (Object.hasOwn(payload, field) && payload[field] !== selected) throw new Error(`Source identity mismatch: ${field}`)
     }
 }
 
 function updateOptionsForExchange(preserveContract = false) {
     const ex = exchangeSel.value
     const cfg = exchangeMeta[ex] || Object.values(exchangeMeta)[0] || FALLBACK_EXCHANGE_META.binance
-
     const prevMarket = marketSel.value
     const prevSymbol = symbolSel.value
-
     const preferredMarket = preserveContract && ex === "binance" && prevMarket === "usdc" ? "usdm"
-        : preserveContract && ex === "coinbase" && prevMarket === "usdm" ? "usdc" : prevMarket
-    setSelectOptions(marketSel, cfg.markets, preferredMarket)
+        : preserveContract && ex === "coinbase" && ["usdm", "usdm_usdc"].includes(prevMarket) ? "usdc" : prevMarket
+    const markets = availableMarkets(ex, prevSymbol)
+    setSelectOptions(marketSel, markets.length ? markets : cfg.markets, preferredMarket)
     setSelectOptions(symbolSel, cfg.symbols, prevSymbol)
+    updateSourceSeriesLabel()
+}
+function updateOptionsForSymbol() {
+    setSelectOptions(marketSel, availableMarkets(exchangeSel.value, symbolSel.value), marketSel.value)
+    updateSourceSeriesLabel()
+}
+function updateOptionsForMarket() {
+    const symbols = exchangeMeta[exchangeSel.value]?.symbols || []
+    setSelectOptions(symbolSel, symbols, availableSymbols(exchangeSel.value, marketSel.value).includes(symbolSel.value) ? symbolSel.value : availableSymbols(exchangeSel.value, marketSel.value)[0])
     updateSourceSeriesLabel()
 }
 
@@ -121,11 +150,10 @@ function applyPrefs(prefs) {
     updateOptionsForExchange()
     const markets = exchangeMeta[exchangeSel.value].markets
     const retired = exchangeSel.value === "coinbase" && prefs.market === "usdm"
-    if (retired && markets.includes("usdc")) marketSel.value = "usdc"
-    else if (markets.includes(prefs.market)) marketSel.value = prefs.market
-    else if (prefs.market) marketSel.value = markets[0]
-    if (prefs.symbol) symbolSel.value = exchangeMeta[exchangeSel.value].symbols.includes(prefs.symbol)
-        ? prefs.symbol : exchangeMeta[exchangeSel.value].symbols[0]
+    setSelectOptions(symbolSel, exchangeMeta[exchangeSel.value].symbols, prefs.symbol)
+    const preferredMarket = retired && available(exchangeSel.value, "usdc", symbolSel.value) ? "usdc" : prefs.market
+    setSelectOptions(marketSel, availableMarkets(exchangeSel.value, symbolSel.value), preferredMarket)
+    updateOptionsForMarket()
     tfSel.value = ["1m", "5m", "15m", "30m", "1h"].includes(prefs.tf) ? prefs.tf : "1m"
     if (typeof prefs.accessKey === "string") accessKeyInput.value = prefs.accessKey
     if (typeof prefs.showAgg === "boolean") aggToggle.checked = prefs.showAgg
@@ -143,14 +171,29 @@ async function loadMeta() {
         const payload = await response.json()
         if (payload.contract_series !== "contracts-drb-v1") throw new Error("stale meta contract series")
         const nextMeta = {}
+        const hasInstruments = Array.isArray(payload.instruments) && payload.spot_series === "spot-v1"
+        const advertised = hasInstruments ? payload.instruments.filter(validInstrument) : fallbackInstruments
+        const nextInstruments = []
         for (const item of payload.exchanges || []) {
-            if (!Object.prototype.hasOwnProperty.call(FALLBACK_EXCHANGE_META, item?.exchange)) continue
+            if (!Object.hasOwn(FALLBACK_EXCHANGE_META, item?.exchange)) continue
             const supported = FALLBACK_EXCHANGE_META[item.exchange]
-            const markets = (Array.isArray(item.markets) ? item.markets : []).filter(v => supported.markets.includes(v))
+            const markets = (Array.isArray(item.markets) ? item.markets : []).filter(v =>
+                (supported.markets.includes(v) || (hasInstruments && ["spot_usdc", "usdm_usdc"].includes(v) && item.exchange === "binance")))
             const symbols = (Array.isArray(item.symbols) ? item.symbols : []).filter(v => supported.symbols.includes(v))
-            if (markets.length && symbols.length) nextMeta[item.exchange] = { markets, symbols }
+            const pairs = advertised.filter(instrument => instrument.exchange === item.exchange &&
+                markets.includes(instrument.market) && symbols.includes(instrument.symbol))
+            if (pairs.length) {
+                nextInstruments.push(...pairs)
+                nextMeta[item.exchange] = {
+                    markets: [...new Set(pairs.map(pair => pair.market))],
+                    symbols: [...new Set(pairs.map(pair => pair.symbol))],
+                }
+            }
         }
-        if (Object.keys(nextMeta).length) exchangeMeta = nextMeta
+        if (Object.keys(nextMeta).length) {
+            exchangeMeta = nextMeta
+            availableInstruments = nextInstruments
+        }
     } catch (err) {
         console.warn("meta load failed, using fallback config", err)
     }
@@ -891,7 +934,11 @@ function paneSummaryText(pane, bar) {
         if (fault) { parts.push(`${output.label} unavailable (${fault.state})`); continue }
         parts.push(readoutText(output, bar ? storeValue(bar, output.key, useAggregateMode()) : undefined))
     }
-    return parts.join(" · ")
+    const text = parts.join(" · ")
+    const quote = SOURCE_INSTRUMENTS[sourceKey(exchangeSel.value, marketSel.value, symbolSel.value)]?.quote_asset
+    if (!text || !quote || !pane.outputs.some(output => ["cvd", "flow"].includes(output.pluginId))) return text
+    const unit = useAggregateMode() ? "nominal USD/USDT/USDC quote · no FX conversion" : `${quote} quote turnover`
+    return `${text} · ${unit}`
 }
 
 function updateFlowReadout() {
@@ -1146,23 +1193,27 @@ function setBars(bars, keepRange = null) {
 async function fetchHistory(limit, before = null, after = null) {
     const generation = historyGeneration
     const signal = historyController.signal
+    const requestedExchange = exchangeSel.value
+    const requestedSymbol = symbolSel.value
+    const requestedMarket = marketSel.value
+    if (!available(requestedExchange, requestedMarket, requestedSymbol)) throw new Error("Unsupported source selection")
     const u = new URL("/history", location.origin)
-    u.searchParams.set("exchange", exchangeSel.value)
-    u.searchParams.set("symbol", symbolSel.value)
-    u.searchParams.set("market", marketSel.value)
+    u.searchParams.set("exchange", requestedExchange)
+    u.searchParams.set("symbol", requestedSymbol)
+    u.searchParams.set("market", requestedMarket)
     u.searchParams.set("tf", tfSel.value)
     u.searchParams.set("limit", limit)
     const key = currentAccessKey()
     if (key) u.searchParams.set("key", key)
-    const requestedMarket = marketSel.value
-    if (requestedMarket !== "spot") u.searchParams.set("series", "contracts-drb-v1")
+    // Legacy USDT spot omits series for older servers; new spot is explicit.
+    if (requestedMarket !== "spot") u.searchParams.set("series", sourceSeries(requestedMarket))
     if (before != null) u.searchParams.set("before", before)
     if (after != null) u.searchParams.set("after", after)
     const r = await fetch(u, { signal })
     if (!r.ok) throw new Error(`History HTTP ${r.status}`)
     const data = await r.json()
     if (signal.aborted || generation !== historyGeneration) throw new DOMException("Stale history", "AbortError")
-    assertSourceSeries(data, requestedMarket)
+    assertSourceSeries(data, requestedMarket, requestedExchange, requestedSymbol)
     applyHistoryIndicators(data)
     return data
 }
@@ -1263,7 +1314,8 @@ function applyHistoryPage(data, keepRange = null, confirmedBars = data.bars || [
     page.reachedStart = !data.has_more_before
     page.reachedEnd = !data.has_more_after
     realtimeEnabled = !!data.realtime_enabled
-    statusEl.textContent = realtimeEnabled ? "live" : "delay 1h"
+    statusEl.textContent = !page.bars.length && ["spot_usdc", "usdm_usdc"].includes(marketSel.value)
+        ? "no stored history yet" : realtimeEnabled ? "live" : "delay 1h"
     updateDocumentTitle()
 }
 
@@ -1315,6 +1367,7 @@ function applyRealtimeBase(payload) {
         return
     }
     applyTailBars([b])
+    if (statusEl.textContent === "no stored history yet") statusEl.textContent = "live · history starting"
 }
 
 function applyTailBars(bars, keepRange = null) {
@@ -1534,15 +1587,17 @@ function ensureModeConnections() {
 
 function connectWs() {
     stopRealtimeSocket()
-
+    const requestedExchange = exchangeSel.value
+    const requestedSymbol = symbolSel.value
+    const requestedMarket = marketSel.value
+    if (!available(requestedExchange, requestedMarket, requestedSymbol)) throw new Error("Unsupported source selection")
     const proto = location.protocol === "https:" ? "wss" : "ws"
     const url = new URL(`${proto}://${location.host}/ws`)
-    url.searchParams.set("exchange", exchangeSel.value)
-    url.searchParams.set("symbol", symbolSel.value)
-    url.searchParams.set("market", marketSel.value)
+    url.searchParams.set("exchange", requestedExchange)
+    url.searchParams.set("symbol", requestedSymbol)
+    url.searchParams.set("market", requestedMarket)
     url.searchParams.set("tf", tfSel.value)
-    const requestedMarket = marketSel.value
-    if (requestedMarket !== "spot") url.searchParams.set("series", "contracts-drb-v1")
+    if (requestedMarket !== "spot") url.searchParams.set("series", sourceSeries(requestedMarket))
     const key = currentAccessKey()
     if (key) url.searchParams.set("key", key)
 
@@ -1561,7 +1616,8 @@ function connectWs() {
             if (!await catchUpHistory(generation, buffered)) return
             syncing = false
             buffered.clear()
-            statusEl.textContent = "live"
+            statusEl.textContent = !page.bars.length && ["spot_usdc", "usdm_usdc"].includes(requestedMarket)
+                ? "no stored history yet" : "live"
         } catch (error) {
             if (generation !== wsGeneration) return
             reportHistoryError(error)
@@ -1596,7 +1652,7 @@ function connectWs() {
                 return
             }
             if (event) { handleIndicatorEvent(event); return }
-            assertSourceSeries(payload, requestedMarket)
+            assertSourceSeries(payload, requestedMarket, requestedExchange, requestedSymbol)
             if (!payload?.bar?.time) return
             if (syncing) {
                 buffered.set(payload.bar.time, payload)
@@ -1692,8 +1748,8 @@ exchangeSel.onchange = () => {
     updateOptionsForExchange(true)
     persistAndReload()
 }
-symbolSel.onchange = () => persistAndReload()
-marketSel.onchange = () => { updateSourceSeriesLabel(); persistAndReload() }
+symbolSel.onchange = () => { updateOptionsForSymbol(); persistAndReload() }
+marketSel.onchange = () => { updateOptionsForMarket(); persistAndReload() }
 tfSel.onchange = () => persistAndReload()
 accessKeyInput.oninput = () => savePrefs()
 accessKeyInput.onchange = () => persistAndReload()

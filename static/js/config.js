@@ -50,5 +50,31 @@ export const FALLBACK_EXCHANGE_META = {
     },
 }
 
+// Stable source identities. Metadata must match the complete descriptor before
+// a new market is offered; legacy fallback deliberately contains no new USDC.
+const source = (exchange, market, symbol) => {
+    const category = market === "spot" || market === "spot_usdc" ? "spot" : "contract"
+    const quote_asset = exchange === "coinbase" ? (market === "spot" ? "USD" : "USDC")
+        : market === "coinm" ? "USD" : market.endsWith("_usdc") ? "USDC" : "USDT"
+    return { exchange, market, symbol,
+        native_symbol: exchange === "coinbase" ? (market === "spot" ? `${symbol}-USD` : `${symbol}_USDC-PERPETUAL`)
+            : market === "coinm" ? `${symbol}USD_PERP` : `${symbol}${quote_asset}`,
+        category, contract_kind: category === "spot" ? null : market === "coinm" ? "inverse" : "linear",
+        quote_asset, settlement_asset: category === "spot" ? null : market === "coinm" ? symbol : quote_asset }
+}
+export const SOURCE_INSTRUMENTS = Object.fromEntries(
+    [["binance", ["spot", "spot_usdc", "usdm", "usdm_usdc", "coinm"]], ["coinbase", ["spot", "usdc"]]]
+        .flatMap(([exchange, markets]) => markets.flatMap(market => ["BTC", "ETH"].map(symbol => {
+            const descriptor = source(exchange, market, symbol)
+            return [`${exchange}:${market}:${symbol}`, descriptor]
+        }))))
+export const sourceKey = (exchange, market, symbol) => `${exchange}:${market}:${symbol}`
+export const sourceSeries = market => market === "spot" || market === "spot_usdc" ? "spot-v1" : "contracts-drb-v1"
+export const legacySource = descriptor => descriptor.market !== "spot_usdc" && descriptor.market !== "usdm_usdc"
+export function validInstrument(item) {
+    if (!item || typeof item !== "object") return false
+    const expected = SOURCE_INSTRUMENTS[sourceKey(item.exchange, item.market, item.symbol)]
+    return !!expected && Object.keys(expected).every(field => item[field] === expected[field])
+}
 export const STORAGE_KEY = "cvd_prefs_v1"
 export const DEFAULT_TITLE = "CVD"

@@ -28,14 +28,18 @@ impl Exchange {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Market {
     Spot,
+    SpotUsdc,
     Usdm,
+    UsdmUsdc,
     Usdc,
     Coinm,
 }
 impl Market {
     pub fn from_str(s: &str) -> Self {
         match s {
+            "spot_usdc" => Self::SpotUsdc,
             "usdm" => Self::Usdm,
+            "usdm_usdc" => Self::UsdmUsdc,
             "usdc" => Self::Usdc,
             "coinm" => Self::Coinm,
             _ => Self::Spot,
@@ -44,11 +48,208 @@ impl Market {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Spot => "spot",
+            Self::SpotUsdc => "spot_usdc",
             Self::Usdm => "usdm",
+            Self::UsdmUsdc => "usdm_usdc",
             Self::Usdc => "usdc",
             Self::Coinm => "coinm",
         }
     }
+    pub fn is_spot(self) -> bool {
+        matches!(self, Self::Spot | Self::SpotUsdc)
+    }
+}
+
+/// Stable persisted source identity and native execution semantics. Binance
+/// spot/linear q is base quantity; inverse q is face-value contract count.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct Instrument {
+    #[serde(serialize_with = "serialize_exchange")]
+    pub exchange: Exchange,
+    #[serde(serialize_with = "serialize_market")]
+    pub market: Market,
+    #[serde(serialize_with = "serialize_symbol")]
+    pub symbol: Symbol,
+    pub native_symbol: &'static str,
+    pub category: &'static str,
+    pub contract_kind: Option<&'static str>,
+    pub quote_asset: &'static str,
+    pub settlement_asset: Option<&'static str>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantitySemantics {
+    BaseAsset,
+    InverseContracts,
+}
+impl Instrument {
+    pub fn quantity_semantics(self) -> QuantitySemantics {
+        self.market.quantity_semantics()
+    }
+}
+impl Market {
+    pub fn quantity_semantics(self) -> QuantitySemantics {
+        if self == Self::Coinm {
+            QuantitySemantics::InverseContracts
+        } else {
+            QuantitySemantics::BaseAsset
+        }
+    }
+}
+fn serialize_exchange<S: serde::Serializer>(x: &Exchange, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(x.as_str())
+}
+fn serialize_market<S: serde::Serializer>(x: &Market, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(x.as_str())
+}
+fn serialize_symbol<S: serde::Serializer>(x: &Symbol, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(x.as_str())
+}
+
+pub const INSTRUMENTS: &[Instrument] = &[
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::Spot,
+        symbol: Symbol::Btc,
+        native_symbol: "BTCUSDT",
+        category: "spot",
+        contract_kind: None,
+        quote_asset: "USDT",
+        settlement_asset: None,
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::Spot,
+        symbol: Symbol::Eth,
+        native_symbol: "ETHUSDT",
+        category: "spot",
+        contract_kind: None,
+        quote_asset: "USDT",
+        settlement_asset: None,
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::SpotUsdc,
+        symbol: Symbol::Btc,
+        native_symbol: "BTCUSDC",
+        category: "spot",
+        contract_kind: None,
+        quote_asset: "USDC",
+        settlement_asset: None,
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::SpotUsdc,
+        symbol: Symbol::Eth,
+        native_symbol: "ETHUSDC",
+        category: "spot",
+        contract_kind: None,
+        quote_asset: "USDC",
+        settlement_asset: None,
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::Usdm,
+        symbol: Symbol::Btc,
+        native_symbol: "BTCUSDT",
+        category: "contract",
+        contract_kind: Some("linear"),
+        quote_asset: "USDT",
+        settlement_asset: Some("USDT"),
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::Usdm,
+        symbol: Symbol::Eth,
+        native_symbol: "ETHUSDT",
+        category: "contract",
+        contract_kind: Some("linear"),
+        quote_asset: "USDT",
+        settlement_asset: Some("USDT"),
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::UsdmUsdc,
+        symbol: Symbol::Btc,
+        native_symbol: "BTCUSDC",
+        category: "contract",
+        contract_kind: Some("linear"),
+        quote_asset: "USDC",
+        settlement_asset: Some("USDC"),
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::UsdmUsdc,
+        symbol: Symbol::Eth,
+        native_symbol: "ETHUSDC",
+        category: "contract",
+        contract_kind: Some("linear"),
+        quote_asset: "USDC",
+        settlement_asset: Some("USDC"),
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::Coinm,
+        symbol: Symbol::Btc,
+        native_symbol: "BTCUSD_PERP",
+        category: "contract",
+        contract_kind: Some("inverse"),
+        quote_asset: "USD",
+        settlement_asset: Some("BTC"),
+    },
+    Instrument {
+        exchange: Exchange::Binance,
+        market: Market::Coinm,
+        symbol: Symbol::Eth,
+        native_symbol: "ETHUSD_PERP",
+        category: "contract",
+        contract_kind: Some("inverse"),
+        quote_asset: "USD",
+        settlement_asset: Some("ETH"),
+    },
+    Instrument {
+        exchange: Exchange::Coinbase,
+        market: Market::Spot,
+        symbol: Symbol::Btc,
+        native_symbol: "BTC-USD",
+        category: "spot",
+        contract_kind: None,
+        quote_asset: "USD",
+        settlement_asset: None,
+    },
+    Instrument {
+        exchange: Exchange::Coinbase,
+        market: Market::Spot,
+        symbol: Symbol::Eth,
+        native_symbol: "ETH-USD",
+        category: "spot",
+        contract_kind: None,
+        quote_asset: "USD",
+        settlement_asset: None,
+    },
+    Instrument {
+        exchange: Exchange::Coinbase,
+        market: Market::Usdc,
+        symbol: Symbol::Btc,
+        native_symbol: "BTC_USDC-PERPETUAL",
+        category: "contract",
+        contract_kind: Some("linear"),
+        quote_asset: "USDC",
+        settlement_asset: Some("USDC"),
+    },
+    Instrument {
+        exchange: Exchange::Coinbase,
+        market: Market::Usdc,
+        symbol: Symbol::Eth,
+        native_symbol: "ETH_USDC-PERPETUAL",
+        category: "contract",
+        contract_kind: Some("linear"),
+        quote_asset: "USDC",
+        settlement_asset: Some("USDC"),
+    },
+];
+
+pub fn instrument(exchange: Exchange, market: Market, symbol: Symbol) -> Option<&'static Instrument> {
+    INSTRUMENTS.iter().find(|i| (i.exchange, i.market, i.symbol) == (exchange, market, symbol))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -79,64 +280,26 @@ impl Symbol {
         }
     }
 
-    // Spot / USDM use <asset>USDT
-    pub fn spot_usdm_stream(self) -> &'static str {
-        match self {
-            Self::Btc => "btcusdt",
-            Self::Eth => "ethusdt",
-            Self::Sol => "solusdt",
-            Self::Bnb => "bnbusdt",
-            Self::Aave => "aaveusdt",
-        }
-    }
-
-    // COINM uses <asset>USD_PERP
-    pub fn coinm_stream(self) -> &'static str {
-        match self {
-            Self::Btc => "btcusd_perp",
-            Self::Eth => "ethusd_perp",
-            Self::Sol => "solusd_perp",
-            Self::Bnb => "bnbusd_perp",
-            Self::Aave => "aaveusd_perp",
-        }
-    }
-
     pub fn coinbase_spot_product(self) -> Option<&'static str> {
-        match self {
-            Self::Btc => Some("BTC-USD"),
-            Self::Eth => Some("ETH-USD"),
-            _ => None,
-        }
+        instrument(Exchange::Coinbase, Market::Spot, self).map(|i| i.native_symbol)
     }
 
     pub fn from_coinbase_spot_product(product_id: &str) -> Option<Self> {
-        match product_id {
-            "BTC-USD" => Some(Self::Btc),
-            "ETH-USD" => Some(Self::Eth),
-            _ => None,
-        }
+        INSTRUMENTS
+            .iter()
+            .find(|i| i.exchange == Exchange::Coinbase && i.market == Market::Spot && i.native_symbol == product_id)
+            .map(|i| i.symbol)
     }
 
     pub fn from_binance_stream_name(stream: &str, market: Market) -> Option<Self> {
-        let base = stream.split('@').next()?;
-        match market {
-            Market::Coinm => match base {
-                "btcusd_perp" => Some(Self::Btc),
-                "ethusd_perp" => Some(Self::Eth),
-                "solusd_perp" => Some(Self::Sol),
-                "bnbusd_perp" => Some(Self::Bnb),
-                "aaveusd_perp" => Some(Self::Aave),
-                _ => None,
-            },
-            _ => match base {
-                "btcusdt" => Some(Self::Btc),
-                "ethusdt" => Some(Self::Eth),
-                "solusdt" => Some(Self::Sol),
-                "bnbusdt" => Some(Self::Bnb),
-                "aaveusdt" => Some(Self::Aave),
-                _ => None,
-            },
-        }
+        INSTRUMENTS
+            .iter()
+            .find(|source| {
+                source.exchange == Exchange::Binance
+                    && source.market == market
+                    && stream == format!("{}@aggTrade", source.native_symbol.to_ascii_lowercase())
+            })
+            .map(|source| source.symbol)
     }
 }
 
