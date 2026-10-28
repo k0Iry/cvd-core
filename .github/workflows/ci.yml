@@ -1,6 +1,8 @@
 name: CI
-# Local tests are the default; remote CI runs only on explicit request.
+# Run local gates first; CI verifies pushes and pull requests.
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
