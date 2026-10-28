@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/indicator-sdk",
+    "crates/indicator-runner",
+    "crates/indicator-host",
+    "examples/plugins/sample-indicator",
+    "tests/fixtures/plugins/fault-indicator",
+    "tests/fixtures/plugins/bad-abi-indicator",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+publish = false
+
+[profile.release]
+panic = "unwind"

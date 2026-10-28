@@ -1,0 +1,15 @@
+[package]
+name = "cvd-indicator-runner"
+description = "Isolated process that loads one operator-configured indicator dynamic library"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cvd-indicator-runner"
+path = "src/main.rs"
+
+[dependencies]
+cvd-indicator-sdk = { path = "../indicator-sdk" }
+serde_json = "1.0"
+libc = "0.2"
