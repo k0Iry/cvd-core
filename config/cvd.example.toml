@@ -15,7 +15,9 @@ queue_depth = 64
 
 # Libraries are loaded only from operator-owned absolute paths listed here.
 # [[indicators.library]]
-# id = "sample.channel"                                   # must equal descriptor id
-# path = "/opt/cvd/indicators/libsample_indicator.so"
+# Public example built independently in github.com/k0Iry/cvd-indicators
+# (cargo build --release -p cvd-indicator-example-range).
+# id = "example.range"                                    # must equal descriptor id
+# path = "/opt/cvd/indicators/libcvd_indicator_example_range.so"
 # params = { length = 20 }
 # modes = ["source", "aggregate"]

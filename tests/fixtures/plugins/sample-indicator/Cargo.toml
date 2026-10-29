@@ -10,4 +10,4 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-cvd-indicator-sdk = { path = "../../../crates/indicator-sdk" }
+cvd-indicator-sdk = { path = "../../../../crates/indicator-sdk" }

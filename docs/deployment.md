@@ -110,12 +110,16 @@ Use only trusted operator-provided native libraries; process isolation is not a
 sandbox for untrusted code. See the [SDK contract](plugin-api-v1.md) and the
 [public authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md).
 
-For example, after separately building the public sample library, add:
+For example, after building the public range example independently in a
+[cvd-indicators](https://github.com/k0Iry/cvd-indicators) checkout
+(`cargo build --release -p cvd-indicator-example-range`, output
+`target/release/libcvd_indicator_example_range.so`) and copying it into the
+plugins directory, add:
 
 ```toml
 [[indicators.library]]
-id = "sample.channel"
-path = "/plugins/libsample_indicator.so"
+id = "example.range"
+path = "/plugins/libcvd_indicator_example_range.so"
 params = { length = 20 }
 enabled = true
 modes = ["source", "aggregate"]

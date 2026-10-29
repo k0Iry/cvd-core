@@ -5,7 +5,7 @@ members = [
     "crates/indicator-runner",
     "crates/indicator-host",
     "crates/cvd-server",
-    "examples/plugins/sample-indicator",
+    "tests/fixtures/plugins/sample-indicator",
     "tests/fixtures/plugins/fault-indicator",
     "tests/fixtures/plugins/bad-abi-indicator",
     "tests/fixtures/plugins/zero-context-indicator",

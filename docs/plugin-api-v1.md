@@ -73,7 +73,10 @@ export_indicator!(MyInd);
 
 Crate type `cdylib` (plus `rlib` if you want in-process unit tests). The SDK
 handles parameter defaults/range checks, input monotonicity/finite checks,
-live window bookkeeping and output validation. Reference: `examples/plugins/sample-indicator`.
+live window bookkeeping and output validation. Author example: public
+[`examples/range`](https://github.com/k0Iry/cvd-indicators/tree/master/examples/range)
+([authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md)).
+`tests/fixtures/plugins/sample-indicator` is a host test fixture, not an author template.
 
 `ctx.phase` (`ComputePhase`, `#[non_exhaustive]`) states which operation
 triggered the call — `History` (`OP_HISTORY`; output `bars[output_from..]`),

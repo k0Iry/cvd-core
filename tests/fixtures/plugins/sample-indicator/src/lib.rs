@@ -1,4 +1,10 @@
-//! Public sample indicator demonstrating every output kind.
+//! Normal-path protocol test fixture (descriptor id `sample.channel`).
+//!
+//! This library is a local host/runner test fixture exercising every output
+//! kind; it is not the recommended starting point for plugin authors. New
+//! authors should start from the public `example.range` example:
+//! <https://github.com/k0Iry/cvd-indicators/tree/master/examples/range> and
+//! <https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md>.
 //!
 //! * `sma` — simple moving average of close (line, price pane)
 //! * `channel` — rolling high/low band (dual range, price pane)

@@ -15,8 +15,7 @@ of this repository or public image. Browser clients receive values only.
 | `crates/indicator-sdk` | ABI v1 / protocol v1 SDK for indicator authors (`Indicator` trait + `export_indicator!`) |
 | `crates/indicator-runner` | `cvd-indicator-runner`: loads one operator-configured library in its own process |
 | `crates/indicator-host` | async runner client used by the host |
-| `examples/plugins/sample-indicator` | public reference library |
-| `tests/fixtures/plugins` | fault-injection, bad-ABI and zero-context test libraries |
+| `tests/fixtures/plugins` | test libraries: `sample-indicator` (normal-path protocol fixture, `sample.channel`), fault-injection, bad-ABI, zero-context and raw-ABI |
 | `docs/plugin-api-v1.md` | normative library contract |
 | `docs/host-indicator-integration.md` | HTTP/WS indicator contract |
 
@@ -53,11 +52,16 @@ application to upgrade. Longer-context indicators may need new-source warm-up.
 ## Build
 
     cargo build --release -p cvd-server -p cvd-indicator-runner   # host + runner
-    cargo build --release -p sample-indicator                      # optional example library
 
 Indicator libraries (e.g. the separate cvd-indicators repository) are built
 against `crates/indicator-sdk` and deployed as `.so` files listed in the
 operator config. The core builds and runs without any of them.
+
+New plugin authors: start from the public
+[`examples/range`](https://github.com/k0Iry/cvd-indicators/tree/master/examples/range)
+example and the
+[authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md)
+in the cvd-indicators repository, built independently there.
 
 ## Run
 
