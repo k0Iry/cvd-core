@@ -47,7 +47,7 @@ test('frontend source has no retired indicator renderers, keys or readiness help
 
 test('changed frontend modules share one coherent import version', () => {
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...app.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['usdc-ui-1'])
+    assert.deepEqual([...versions], ['indicator-menu-2'])
 })
 
 function section(start, end) {

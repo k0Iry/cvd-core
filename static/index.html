@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 
-    <link rel="stylesheet" href="/css/app.css?v=usdc-ui-1">
+    <link rel="stylesheet" href="/css/app.css?v=indicator-menu-2">
 
     <script type="importmap">
     {
@@ -58,7 +58,7 @@
         <label for="access-key">Access Key</label>
         <input id="access-key" type="password" placeholder="unlock realtime" />
 
-        <span id="plugin-controls" class="plugin-controls" role="group" aria-label="Indicators"></span>
+        <span id="plugin-controls" class="plugin-controls"></span>
         <label class="toggle-pill" title="Current active contract basket: Binance + new Coinbase DRB USDC; retired INTX history is not continuous. Spot aggregates separately."><input id="toggle-agg" type="checkbox"> Agg</label>
         <button id="screenshot-btn" class="toolbar-btn" type="button">Screenshot</button>
 
@@ -67,6 +67,9 @@
         <span id="plugin-state" class="quality-badge" data-state="quiet" role="status"></span>
         <span id="quality-state" class="quality-badge" data-state="quiet" title="No retained source evidence">Quality unknown</span>
     </div>
+    <!-- Indicator popup: outside the overflow:auto toolbar so it never clips;
+         placed with position:fixed next to its trigger by indicator-menu.mjs. -->
+    <div id="plugin-menu" class="plugin-menu" hidden></div>
 
     <div id="wrap">
         <div id="chart">
@@ -76,7 +79,7 @@
         </div>
     </div>
 
-    <script type="module" src="/js/app.js?v=usdc-ui-1"></script>
+    <script type="module" src="/js/app.js?v=indicator-menu-2"></script>
 </body>
 
 </html>

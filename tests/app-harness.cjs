@@ -60,7 +60,13 @@ function __project(bars) {
 `
 // Names the original assertions used, mapped onto the generic plugin UI.
 const TEST_BRIDGE = `
-const __control = id => pluginControlsEl.children.find(label => label.dataset.plugin === id)?.children[0]
+// Rows live in the popup (outside the toolbar); collect them at any depth.
+function __pluginRows(node = pluginMenuEl, found = []) { for (const c of node.children ?? []) { if (c.dataset?.plugin) found.push(c); else __pluginRows(c, found) } return found }
+const __menuEmpty = () => { const walk = n => n.dataset?.empty !== undefined ? n : (n.children ?? []).map(walk).find(Boolean); return walk(pluginMenuEl) }
+const __menuKeydown = e => indicatorMenu.handleKeydown(e)
+const __menuGroup = () => pluginMenuEl.children.find(c => c.attributes?.role === 'group')
+const __menuPointer = e => indicatorMenu.handlePointer(e)
+const __control = id => __pluginRows().find(label => label.dataset.plugin === id)?.children[0]
 const __flowSelect = () => paneLabels.children.find(el => el.dataset.pane === 'flow:flow')?.children.find(el => el.dataset?.group)
 Object.defineProperties(globalThis, {
     cvdSeries: { get: () => renderers.get('cvd/cvd').seriesHandle() },
@@ -112,15 +118,18 @@ function harness(checked = {}, options = {}) {
         // Custom series keep the real pane view so tests can drive its renderer.
         addCustomSeries: (view, options = {}, pane = 0) => { const item = chart.addSeries('Custom', { ...view.defaultOptions(), ...options }, pane); item.view = view; return item },
     }
-    const element = (tag = 'div') => ({ tagName: tag, value: '', checked: false, disabled: false, style: {}, dataset: {}, textContent: '', title: '', className: '',
-        children: [], attributes: {}, classList: { add() {} },
+    const element = (tag = 'div') => ({ tagName: tag, value: '', checked: false, disabled: false, hidden: false, type: '', id: '', style: {}, dataset: {}, textContent: '', title: '', className: '',
+        children: [], attributes: {}, classList: { add() {}, toggle() {} },
         setAttribute(name, value) { this.attributes[name] = value },
+        removeAttribute(name) { delete this.attributes[name] },
         append(...items) { this.children.push(...items) },
         replaceChildren(...items) { this.children = items },
+        contains(node) { return node === this || this.children.some(c => typeof c === 'object' && c.contains?.(node)) },
+        focus() { document.activeElement = this },
         getBoundingClientRect: () => ({ width: 900, height: 600 }), addEventListener: (event, callback) => events.set('element:' + event, callback) })
     const elements = Object.fromEntries([
         'exchangeSel', 'symbolSel', 'marketSel', 'tfSel', 'accessKeyInput',
-        'aggToggle', 'pluginControlsEl', 'pluginStateEl',
+        'aggToggle', 'pluginControlsEl', 'pluginMenuEl', 'pluginStateEl',
         'screenshotBtn', 'statusEl', 'qualityStateEl', 'sourceSeriesEl', 'chartEl', 'paneLabels',
     ].map(key => [key, element()]))
     Object.assign(elements.exchangeSel, { value: 'binance' })
@@ -129,7 +138,7 @@ function harness(checked = {}, options = {}) {
     Object.assign(elements.tfSel, { value: '30m' })
     for (const [key, value] of Object.entries(checked)) elements[key].checked = value
     const listen = prefix => (event, callback) => events.set(prefix + event, callback)
-    const document = { hidden: false, title: '', documentElement: { style: { setProperty: noop } },
+    const document = { hidden: false, title: '', activeElement: null, documentElement: { style: { setProperty: noop } },
         addEventListener: listen('document:'), createElement: element }
     const context = vm.createContext({
         elements, document, console, URL, AbortController, DOMException,
@@ -152,7 +161,7 @@ function harness(checked = {}, options = {}) {
     const read = file => fs.readFileSync(path.join(__dirname, '../static/js', file), 'utf8')
     const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function')
     const source = read('app.js').replace(/^import .*\n/gm, '').replace(/\ninit\(\)\s*$/, '\n')
-    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs'].map(file => strip(read(file))).join('\n')
+    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs', 'indicator-menu.mjs'].map(file => strip(read(file))).join('\n')
     vm.runInContext(modules + '\n' + source + '\nconst realEnsureModeConnections = ensureModeConnections; ensureModeConnections = () => {};\n' + (options.projection === false ? '' : PROJECTION) + TEST_BRIDGE, context)
     if (options.descriptors !== null) vm.runInContext(`applyPluginDescriptors(${JSON.stringify(options.descriptors ?? TEST_DESCRIPTORS)})`, context)
     const run = code => vm.runInContext(code, context)

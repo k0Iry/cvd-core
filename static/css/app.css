@@ -210,4 +210,45 @@ input[type="password"] {
 
 .plugin-controls { display: inline-flex; gap: 6px; flex-wrap: wrap; }
 .plugin-controls:empty, #plugin-state:empty { display: none; }
+.plugin-menu-trigger { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.plugin-menu-caret { font-size: 10px; color: var(--muted); }
+/* Fixed overlay outside .bar: the toolbar keeps overflow:auto/max-height.
+   left/top/width/max-height are set from the trigger rect in JS. */
+.plugin-menu {
+    position: fixed;
+    top: 48px;
+    left: 8px;
+    z-index: 20;
+    width: min(340px, calc(100vw - 16px));
+    max-height: min(420px, calc(100vh - 64px));
+    display: flex;
+    flex-direction: column;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+.plugin-menu[hidden] { display: none; }
+.plugin-menu-heading { padding: 4px 8px 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.plugin-menu-list { overflow-y: auto; overscroll-behavior: contain; min-height: 0; }
+.plugin-menu-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--text);
+    cursor: pointer;
+}
+.plugin-menu-row:hover { background: var(--panel); }
+.plugin-menu-row:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; }
+.plugin-menu-row input { accent-color: var(--accent); margin: 0; }
+.plugin-menu-name { overflow-wrap: anywhere; }
+.plugin-menu-meta { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.plugin-menu-row[data-state="unavailable"] { cursor: default; opacity: 0.7; }
+.plugin-menu-empty { margin: 0; padding: 8px; font-size: 12px; color: var(--muted); }
 .pane-title { white-space: nowrap; }

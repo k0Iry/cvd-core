@@ -1,14 +1,15 @@
-import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=usdc-ui-1"
-import { elements } from "./dom.js?v=usdc-ui-1"
+import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=indicator-menu-2"
+import { elements } from "./dom.js?v=indicator-menu-2"
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=usdc-ui-1"
-import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=usdc-ui-1"
-import { DISCOVERY_PATH, historyResults, parseDiscovery, parseIndicatorFrame } from "./plugin-wire.mjs?v=usdc-ui-1"
-import { createIndicatorStore } from "./plugin-store.mjs?v=usdc-ui-1"
-import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=usdc-ui-1"
-import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=usdc-ui-1"
-import { createOutputRenderer } from "./plugin-render.mjs?v=usdc-ui-1"
+import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=indicator-menu-2"
+import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=indicator-menu-2"
+import { DISCOVERY_PATH, historyResults, parseDiscovery, parseIndicatorFrame } from "./plugin-wire.mjs?v=indicator-menu-2"
+import { createIndicatorStore } from "./plugin-store.mjs?v=indicator-menu-2"
+import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=indicator-menu-2"
+import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=indicator-menu-2"
+import { createOutputRenderer } from "./plugin-render.mjs?v=indicator-menu-2"
+import { createIndicatorMenu } from "./indicator-menu.mjs?v=indicator-menu-2"
 
 const {
     exchangeSel,
@@ -18,6 +19,7 @@ const {
     accessKeyInput,
     aggToggle,
     pluginControlsEl,
+    pluginMenuEl,
     pluginStateEl,
     screenshotBtn,
     statusEl,
@@ -428,33 +430,30 @@ function renderPluginState() {
     setText(pluginStateEl.dataset, "state", notes.length ? "attention" : "quiet")
 }
 
-// Toolbar toggles: one per ready plugin plus disabled placeholders for
-// configured-but-not-ready ones, generated from discovery.
+// Toolbar indicator multiselect: one trigger + popup of checkbox rows (one per
+// ready plugin plus disabled placeholders for configured-but-not-ready ones),
+// generated from discovery and reconciled in place across rerenders.
+let indicatorMenu = null
 function renderPluginControls() {
     renderPluginState()
-    if (!pluginControlsEl || typeof document.createElement !== "function") return
-    const pill = (id, text, title, checked, disabled, onchange) => {
-        const label = document.createElement("label")
-        label.className = "toggle-pill"
-        label.dataset.plugin = id
-        label.title = title
-        const input = document.createElement("input")
-        input.type = "checkbox"
-        input.checked = checked
-        input.disabled = disabled
-        if (onchange) input.onchange = () => onchange(input.checked)
-        label.append(input, ` ${text}`)
-        return label
-    }
-    pluginControlsEl.replaceChildren(
+    renderIndicatorMenu()
+    renderPaneLabels()
+}
+
+function renderIndicatorMenu() {
+    if (!pluginControlsEl || !pluginMenuEl || typeof document.createElement !== "function") return
+    indicatorMenu ??= createIndicatorMenu({ container: pluginControlsEl, popup: pluginMenuEl, onToggle: setPluginEnabled })
+    const items = [
         ...registry.plugins.map(plugin => {
             const fault = pluginFault(plugin)
-            return pill(plugin.id, plugin.label, `${plugin.label} ${plugin.version}${plugin.description ? " — " + plugin.description : ""}${fault ? ` (${faultText(fault)})` : ""}`,
-                pluginEnabled(plugin), false, checked => setPluginEnabled(plugin.id, checked))
+            return { id: plugin.id, name: plugin.label, meta: fault ? `${plugin.version} · ${faultText(fault)}` : plugin.version,
+                title: `${plugin.label} ${plugin.version}${plugin.description ? " — " + plugin.description : ""}${fault ? ` (${faultText(fault)})` : ""}`,
+                checked: pluginEnabled(plugin), disabled: false }
         }),
-        ...registry.pending.map(item => pill(item.id, `${item.id} (${item.status})`, `${item.id}: ${item.status}${item.error?.code ? " " + item.error.code : ""}`, false, true, null)),
-    )
-    renderPaneLabels()
+        ...registry.pending.map(item => ({ id: item.id, name: item.id, meta: `${item.status}${item.error?.code ? " " + item.error.code : ""}`,
+            title: `${item.id}: ${item.status}${item.error?.code ? " " + item.error.code : ""}`, checked: false, disabled: true })),
+    ]
+    indicatorMenu.render(items, registry.plugins.filter(pluginEnabled).length)
 }
 
 // Pane labels: one per pane; exclusive groups get a generic <select>.
@@ -510,6 +509,7 @@ function setGroupMode(groupKey, outputKey) {
 function applyPluginVisibility() {
     updateFlowReadout()
     renderPluginState()
+    renderIndicatorMenu()
     savePrefs()
     if (visualWorkSuspended()) {
         visualOptionsPending = true

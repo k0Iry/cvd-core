@@ -72,7 +72,7 @@ function makeBar(i) {
 }
 let dataset = []
 function resetDataset() { dataset = Array.from({ length: TOTAL }, (_, i) => makeBar(i)) }
-const control = { beforeDelayMs: 0, requests: [], discovery: null }
+const control = { beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0 }
 
 // ------------------------------------------------------------ real indicators
 const RUNNER = process.env.CVD_INDICATOR_RUNNER
@@ -196,6 +196,9 @@ globalThis.__cvd = {
     registry: () => ({ plugins: registry.plugins.map(p => p.id), pending: registry.pending.map(p => ({ id: p.id, status: p.status })) }),
     resync: () => resyncIndicators(),
     epoch: () => indicatorStore.epoch,
+    loadIndicators: () => loadIndicators(),
+    // Actual LWC series state per plugin (not app-level prefs).
+    pluginSeries: id => [...renderers.values()].filter(r => r.output.pluginId === id).map(r => { const s = r.seriesHandle?.(); return { key: r.output.key, visible: !!s && s.options().visible !== false, points: s ? s.data().length : 0 } }),
 }
 }
 `
@@ -250,6 +253,7 @@ const server = http.createServer(async (req, res) => {
         return
     }
     if (url.pathname === '/indicators') {
+        if (control.discovery === 'error') { res.writeHead(503); res.end(); return }
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(control.discovery ?? discovery))
         return
@@ -279,6 +283,7 @@ const server = http.createServer(async (req, res) => {
 server.on('upgrade', (req, socket) => {
     const key = req.headers['sec-websocket-key']
     const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    control.wsUpgrades++
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
     sockets.add(socket)
     socket.on('data', () => {}) // client pings are ignored
@@ -921,6 +926,302 @@ const scenarios = {
             missing_plugin_harmless: !x.missing.plugins.includes(id) && !x.missing.plugins.includes('not.installed') && x.missingStatus === 'live',
         } }
     },
+    async indicator_menu() {
+        // Compact indicator multiselect, driven ONLY by trusted CDP pointer
+        // and key input. Rows for 'cvd'/'flow' etc. come from REAL public
+        // cdylib descriptors under the real runner; rows named synthetic.* are
+        // SYNTHETIC discovery entries (pending/failed/overflow) served by the
+        // loopback /indicators fixture and never computed.
+        const shots = path.join(OUT, 'indicator-menu')
+        fs.mkdirSync(shots, { recursive: true })
+        const shot = async name => { const r = await call('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(shots, name + '.png'), Buffer.from(r.data, 'base64')); return name + '.png' }
+        const failures = []
+        const check = (name, ok, detail) => { x.checks[name] = !!ok; if (!ok) failures.push(name + ' ' + JSON.stringify(detail ?? null).slice(0, 400)) }
+        const x = { checks: {}, screenshots: [], details: {} }
+        const S = `document.querySelector('#plugin-controls > button')`
+        const state = () => evaluate(`(() => { const t = ${S}, p = document.getElementById('plugin-menu'), r = p.getBoundingClientRect()
+            return { label: t.textContent.trim(), expanded: t.getAttribute('aria-expanded'), controls: t.getAttribute('aria-controls'), type: t.type,
+                open: !p.hidden, rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height },
+                vw: innerWidth, vh: innerHeight, active: document.activeElement === t ? 'trigger' : (document.activeElement?.closest?.('[data-plugin]')?.dataset.plugin ?? document.activeElement?.tagName),
+                rows: [...p.querySelectorAll('[data-plugin]')].map(l => ({ id: l.dataset.plugin, checked: l.querySelector('input').checked, disabled: l.querySelector('input').disabled, name: l.querySelector('.plugin-menu-name').textContent, meta: l.querySelector('.plugin-menu-meta').textContent, title: l.title })),
+                empty: p.querySelector('[data-empty]')?.textContent ?? null, inBar: !!t.closest('.bar'), popupInBar: !!p.closest('.bar') } })()`)
+        const center = async selector => evaluate(`(() => { const e = ${selector}; e.scrollIntoView({ block: 'nearest', inline: 'nearest' }); const r = e.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 } })()`)
+        const click = async (selector) => {
+            const { x: cx, y: cy } = await center(selector)
+            const hit = await evaluate(`(() => { const e = ${selector}, h = document.elementFromPoint(${cx}, ${cy}); return !!h && (e === h || e.contains(h) || (e.labels && [...e.labels].some(l => l.contains(h)))) })()`)
+            if (!hit) throw new Error('trusted click target obscured: ' + selector)
+            await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy })
+            await call('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', buttons: 1, clickCount: 1 })
+            await call('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', buttons: 0, clickCount: 1 })
+            await frames(2)
+        }
+        const key = async (k, code, vk, text, modifiers = 0) => {
+            await call('Input.dispatchKeyEvent', { type: 'keyDown', key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers, ...(text ? { text } : {}) })
+            await call('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers })
+            await frames(2)
+        }
+        const row = id => `document.querySelector('#plugin-menu [data-plugin="${id}"] input')`
+        const realIds = discovery.indicators.map(e => e.id)
+        const trusted = await evaluate(`(() => { globalThis.__menuTrusted = { n: 0, untrusted: 0 }; for (const t of ['pointerdown', 'click', 'keydown', 'change']) document.addEventListener(t, e => { __menuTrusted.n++; if (!e.isTrusted) __menuTrusted.untrusted++ }, true); return true })()`)
+
+        // 1. default closed + count of enabled REAL plugins
+        let s0 = await state()
+        const enabled0 = s0.rows.filter(r => r.checked && !r.disabled).length
+        check('default_closed', !s0.open && s0.expanded === 'false', s0)
+        check('trigger_semantics', s0.type === 'button' && s0.controls === 'plugin-menu' && s0.inBar && !s0.popupInBar, s0)
+        check('default_count', s0.label.includes(`Indicators · ${enabled0}`) && enabled0 === realIds.length, { label: s0.label, enabled0, realIds })
+        check('real_rows_are_real_plugins', JSON.stringify(s0.rows.map(r => r.id)) === JSON.stringify(realIds) && s0.rows.every(r => r.title.includes(discovery.indicators.find(e => e.id === r.id).descriptor.version)), s0.rows)
+        // Disclosure semantics: no menu/haspopup claims; labelled checkbox group.
+        const sem = await evaluate(`(() => { const t = ${S}, p = document.getElementById('plugin-menu'), g = p.querySelector('[role="group"]')
+            return { haspopup: t.getAttribute('aria-haspopup'), title: t.title, menuRoles: p.querySelectorAll('[role^="menu"]').length + (t.getAttribute('role') ? 1 : 0),
+                group: !!g, groupLabel: g && document.getElementById(g.getAttribute('aria-labelledby'))?.textContent, boxes: p.querySelectorAll('input[type=checkbox]').length } })()`)
+        check('disclosure_semantics', sem.haspopup === null && sem.menuRoles === 0 && sem.group && sem.groupLabel === 'Indicators' && sem.boxes === realIds.length, sem)
+        check('tooltip_says_selected', /indicators selected/.test(sem.title) && !/shown/.test(sem.title), sem.title)
+        // NORMAL state with REAL ready plugin rows only (before any synthetic rows).
+        for (const scheme of ['dark', 'light']) {
+            await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] }); await frames(4)
+            await shot(`normal-closed-${scheme}`); x.screenshots.push(`normal-closed-${scheme}.png`)
+            await click(S); const no = await state()
+            check(`normal_open_real_rows_${scheme}`, no.open && JSON.stringify(no.rows.map(r => r.id)) === JSON.stringify(realIds) && no.rows.every(r => !r.disabled && r.checked), no.rows)
+            await shot(`normal-open-${scheme}`); x.screenshots.push(`normal-open-${scheme}.png`)
+            await click(S)
+        }
+        await call('Emulation.setEmulatedMedia', { features: [] }); await frames(2)
+
+        // 2. repeated open/close with trusted clicks
+        let cycles = 0
+        for (let i = 0; i < 3; i++) {
+            await click(S); const a = await state()
+            await click(S); const b = await state()
+            if (a.open && a.expanded === 'true' && !b.open && b.expanded === 'false') cycles++
+        }
+        check('repeated_open_close', cycles === 3, cycles)
+
+        // 3. multiple selections while open: no reload/WS/viewport change
+        const m = await measure(async () => {
+            await click(S)
+            const before = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades, sockets: sockets.size }
+            const visBefore = Object.fromEntries(await Promise.all(realIds.map(async id => [id, await evaluate(`__cvd.pluginSeries(${JSON.stringify(id)})`)])))
+            for (const id of realIds) await click(row(id))
+            const mid = await state()
+            const visOff = Object.fromEntries(await Promise.all(realIds.map(async id => [id, await evaluate(`__cvd.pluginSeries(${JSON.stringify(id)})`)])))
+            await click(row(realIds[0]))
+            const after = await state()
+            const visOn = await evaluate(`__cvd.pluginSeries(${JSON.stringify(realIds[0])})`)
+            await sleep(400); await frames(4)
+            const end = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades, sockets: sockets.size }
+            return { before, end, mid, after, visBefore, visOff, visOn }
+        })
+        const t = m.extra
+        check('stays_open_multi_select', t.mid.open && t.after.open, { mid: t.mid.open, after: t.after.open })
+        check('all_unchecked_count_zero', t.mid.rows.every(r => !r.checked) && t.mid.label.includes('Indicators · 0'), t.mid)
+        check('recheck_count_one', t.after.label.includes('Indicators · 1') && t.after.rows.find(r => r.id === realIds[0]).checked, t.after.label)
+        check('real_series_visible_before', realIds.every(id => t.visBefore[id].some(s => s.visible && s.points > 0)), t.visBefore)
+        check('real_series_hidden_after_uncheck', realIds.every(id => t.visOff[id].length && t.visOff[id].every(s => !s.visible)), t.visOff)
+        check('real_series_visible_after_recheck', t.visOn.some(s => s.visible && s.points > 0), t.visOn)
+        check('time_range_unchanged', JSON.stringify(t.before.time) === JSON.stringify(t.end.time) && JSON.stringify(t.before.logical) === JSON.stringify(t.end.logical) && !(m.calls.setVisibleLogicalRange > 0), { before: t.before, end: t.end, calls: m.calls })
+        check('no_history_or_ws_activity', t.end.requests === t.before.requests && t.end.ws === t.before.ws && t.end.sockets === t.before.sockets && m.requests.length === 0, { before: t.before, end: t.end })
+
+        // 4. outside click closes; Escape closes and returns focus
+        await click(`document.getElementById('chart')`)
+        const outside = await state()
+        check('outside_click_closes', !outside.open && outside.expanded === 'false', outside)
+        await click(S)
+        await click(row(realIds[1] ?? realIds[0])) // focus inside popup (toggles that row; reverted below)
+        await key('Escape', 'Escape', 27)
+        const esc = await state()
+        check('escape_closes_focus_trigger', !esc.open && esc.active === 'trigger', esc)
+        // keyboard: Space on trigger opens, Tab enters rows, Space toggles, stays open
+        await key(' ', 'Space', 32, ' ')
+        const spaceOpen = await state()
+        await key('Tab', 'Tab', 9)
+        const tabbed = await state()
+        await key(' ', 'Space', 32, ' ')
+        const spaced = await state()
+        check('keyboard_space_tab', spaceOpen.open && tabbed.active === realIds[0] && spaced.open && spaced.rows[0].checked !== tabbed.rows[0].checked, { spaceOpen: spaceOpen.open, tabbed: tabbed.active, spaced: spaced.rows[0], before: tabbed.rows[0] })
+        await key(' ', 'Space', 32, ' ') // restore
+        await key('Escape', 'Escape', 27)
+        await click(S); await click(row(realIds[1] ?? realIds[0])); await key('Escape', 'Escape', 27) // revert focus-click toggle
+
+        // 4b. Keyboard traversal with trusted Tab / Shift+Tab. Neighbours are
+        // computed from the live DOM (normal tab sequence around the trigger).
+        const ACTIVE = `(() => { const a = document.activeElement; return a === ${S} ? 'trigger' : a?.closest?.('#plugin-menu [data-plugin]')?.dataset.plugin ?? (a?.id || a?.tagName) })()`
+        const nbr = await evaluate(`(() => { const all = [...document.querySelectorAll('button, input, select, textarea, a[href], [tabindex]')].filter(e => !e.disabled && e.tabIndex >= 0 && !e.closest('#plugin-menu') && e.getClientRects().length); const i = all.indexOf(${S}); const id = e => e ? (e.id || e.tagName) : null; return { prev: id(all[i - 1]), next: id(all[i + 1]) } })()`)
+        const tab = (shift = false) => key('Tab', 'Tab', 9, null, shift ? 8 : 0)
+        const focusTrigger = () => evaluate(`${S}.focus()`) // focus only; open/close stays trusted
+        const travel = async () => {
+            const steps = []
+            await focusTrigger(); await key(' ', 'Space', 32, ' ')
+            steps.push({ open: (await state()).open, at: await evaluate(ACTIVE) })
+            for (let i = 0; i < 12; i++) { await tab(); const st = await state(); steps.push({ open: st.open, at: await evaluate(ACTIVE) }); if (!st.open) break }
+            return steps
+        }
+        const kbm = await measure(async () => {
+            const before = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades }
+            const r = {}
+            const enabledIds = (await state()).rows.filter(q => !q.disabled).map(q => q.id)
+            r.forward = await travel()
+            // backward: into first row, Shift+Tab -> trigger (open), Shift+Tab -> prev control (closed)
+            await focusTrigger(); await key(' ', 'Space', 32, ' '); await tab()
+            const b0 = await evaluate(ACTIVE); await tab(true)
+            const b1 = { at: await evaluate(ACTIVE), open: (await state()).open }; await tab(true)
+            const b2 = { at: await evaluate(ACTIVE), open: (await state()).open }
+            r.backward = { b0, b1, b2 }
+            // pure keyboard traversal ends here: no fetch/WS/range change allowed
+            r.end = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades }
+            // (the discovery fixture swaps below deliberately refetch /indicators; excluded from the no-reload check)
+            // reordered discovery (real rows reversed): first/last follow rendered order
+            control.discovery = { ...discovery, indicators: [...discovery.indicators].reverse() }
+            await evaluate('__cvd.loadIndicators()'); await frames(3)
+            r.reorderedRows = (await state()).rows.map(q => q.id)
+            r.reordered = await travel()
+            // all-disabled (synthetic pending only) and empty (discovery error)
+            control.discovery = { api_version: 1, indicators: [{ id: 'synthetic.pending', status: 'starting', descriptor: null, error: null }] }
+            await evaluate('__cvd.loadIndicators()'); await frames(3)
+            r.allDisabled = await travel()
+            control.discovery = 'error'
+            await evaluate('__cvd.loadIndicators()'); await frames(3)
+            r.empty = await travel()
+            control.discovery = null
+            await evaluate('__cvd.loadIndicators()'); await frames(3)
+            r.enabledIds = enabledIds
+            r.afterFixtures = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades }
+            r.before = before
+            return r
+        })
+        const kb = kbm.extra
+        x.details.keyboard = { neighbours: nbr, ...kb }
+        const path_ = steps => steps.map(q => q.at)
+        check('kb_neighbours_known', !!nbr.prev && !!nbr.next, nbr)
+        check('kb_forward_rows_then_next_control', JSON.stringify(path_(kb.forward)) === JSON.stringify(['trigger', ...kb.enabledIds, nbr.next]) && kb.forward[0].open && !kb.forward.at(-1).open && kb.forward.slice(0, -1).every(q => q.open), kb.forward)
+        check('kb_backward_first_to_trigger_to_prev', kb.backward.b0 === kb.enabledIds[0] && kb.backward.b1.at === 'trigger' && kb.backward.b1.open && kb.backward.b2.at === nbr.prev && !kb.backward.b2.open, kb.backward)
+        check('kb_reordered_uses_rendered_order', JSON.stringify(kb.reorderedRows) === JSON.stringify([...realIds].reverse()) && JSON.stringify(path_(kb.reordered)) === JSON.stringify(['trigger', ...[...realIds].reverse(), nbr.next]) && !kb.reordered.at(-1).open, { rows: kb.reorderedRows, path: kb.reordered })
+        check('kb_all_disabled_leaves_trigger', JSON.stringify(path_(kb.allDisabled)) === JSON.stringify(['trigger', nbr.next]) && kb.allDisabled[0].open && !kb.allDisabled.at(-1).open, kb.allDisabled)
+        check('kb_empty_leaves_trigger', JSON.stringify(path_(kb.empty)) === JSON.stringify(['trigger', nbr.next]) && kb.empty[0].open && !kb.empty.at(-1).open, kb.empty)
+        check('kb_no_reload_range_kept', JSON.stringify(kb.before.time) === JSON.stringify(kb.end.time) && JSON.stringify(kb.before.logical) === JSON.stringify(kb.end.logical) && kb.end.requests === kb.before.requests && kb.end.ws === kb.before.ws, { before: kb.before, end: kb.end })
+        check('kb_fixture_swaps_keep_range', JSON.stringify(kb.before.time) === JSON.stringify(kb.afterFixtures.time) && !(kbm.calls.setVisibleLogicalRange > 0) && kb.afterFixtures.ws === kb.before.ws, { calls: kbm.calls, afterFixtures: kb.afterFixtures })
+
+        // 5. persistence across reload (prefs as left: only realIds[0] on)
+        const expected = (await state()).rows.map(r => [r.id, r.checked])
+        await evaluate(`sessionStorage.setItem('cvd_keep_prefs', '1')`)
+        await call('Page.reload', {})
+        await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
+        await frames(4)
+        const reloaded = await state()
+        check('prefs_survive_reload', JSON.stringify(reloaded.rows.map(r => [r.id, r.checked])) === JSON.stringify(expected) && !reloaded.open && reloaded.label.includes(`Indicators · ${expected.filter(e => e[1]).length}`), { expected, got: reloaded.rows })
+        // Actual series state follows the persisted checkbox state per plugin.
+        const afterReload = Object.fromEntries(await Promise.all(expected.map(async ([id]) => [id, await evaluate(`__cvd.pluginSeries(${JSON.stringify(id)})`)])))
+        check('reload_series_match_prefs', expected.some(e => !e[1]) && expected.every(([id, on]) => on ? afterReload[id].some(s => s.visible && s.points > 0) : afterReload[id].every(s => !s.visible)), { expected, afterReload })
+        await evaluate(`sessionStorage.removeItem('cvd_keep_prefs')`)
+        await evaluate(`__menuTrusted = { n: 0, untrusted: 0 }; for (const t of ['pointerdown', 'click', 'keydown', 'change']) document.addEventListener(t, e => { __menuTrusted.n++; if (!e.isTrusted) __menuTrusted.untrusted++ }, true)`)
+
+        // 6. pending / failed / error / recovered while open, focus preserved
+        await click(S)
+        await click(row(realIds[0])); await click(row(realIds[0])) // focus a real row, state unchanged
+        const real = discovery.indicators
+        control.discovery = { api_version: 1, indicators: [...real,
+            { id: 'synthetic.pending', status: 'starting', descriptor: null, error: null },
+            { id: 'synthetic.failed', status: 'failed', descriptor: null, error: { code: 'incompatible', message: '/srv/private/lib.so' } }] }
+        await evaluate('__cvd.loadIndicators()'); await frames(3)
+        const pend = await state()
+        check('pending_failed_rows_disabled', ['synthetic.pending', 'synthetic.failed'].every(id => pend.rows.find(r => r.id === id)?.disabled) && /starting/.test(pend.rows.find(r => r.id === 'synthetic.pending').meta) && /failed incompatible/.test(pend.rows.find(r => r.id === 'synthetic.failed').meta) && !JSON.stringify(pend.rows).includes('/srv/private'), pend.rows)
+        check('rerender_keeps_open_and_focus', pend.open && pend.active === realIds[0], { open: pend.open, active: pend.active })
+        await shot('pending-failed-open'); x.screenshots.push('pending-failed-open.png')
+        control.discovery = 'error'
+        await evaluate('__cvd.loadIndicators()'); await frames(3)
+        const err = await state()
+        check('error_empty_understandable', err.open && err.rows.length === 0 && /No indicators available/.test(err.empty ?? '') && err.label.includes('Indicators · 0'), err)
+        await shot('discovery-error-open'); x.screenshots.push('discovery-error-open.png')
+        control.discovery = null
+        await evaluate('__cvd.loadIndicators()'); await frames(3)
+        const rec = await state()
+        check('recovered_rows_back_open', rec.open && JSON.stringify(rec.rows.map(r => r.id)) === JSON.stringify(realIds) && rec.empty === null, rec)
+        await key('Escape', 'Escape', 27)
+        const recClosed = await state()
+        check('escape_closes_after_focused_row_removed', !recClosed.open && recClosed.active === 'trigger', recClosed.active)
+
+        // 7. many / long SYNTHETIC rows: bounded + scrollable, per viewport/theme
+        control.discovery = { api_version: 1, indicators: [...real, ...Array.from({ length: 40 }, (_, i) => ({ id: `synthetic.overflow-long-descriptor-label-for-wrap-check-${String(i).padStart(2, '0')}`, status: 'starting', descriptor: null, error: null }))] }
+        await evaluate('__cvd.loadIndicators()'); await frames(3)
+        const views = [['desktop', 1440, 900], ['narrow', 390, 844], ['short', 900, 420]]
+        for (const [vname, w, h] of views) {
+            await call('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false })
+            await frames(4)
+            for (const scheme of ['dark', 'light']) {
+                await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] })
+                await frames(4)
+                await click(S)
+                const st = await state()
+                const geo = await evaluate(`(() => { const p = document.getElementById('plugin-menu'), l = p.querySelector('.plugin-menu-list'), r = p.getBoundingClientRect()
+                    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(r.height - 4, 30))
+                    const lum = c => { const v = c.match(/[\\d.]+/g).slice(0, 3).map(Number).map(n => { n /= 255; return n <= 0.03928 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4 }); return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2] }
+                    const fg = getComputedStyle(p.querySelector('.plugin-menu-name')).color, bg = getComputedStyle(p).backgroundColor
+                    const [a, b] = [lum(fg), lum(bg)].sort((m, n) => n - m)
+                    return { scrollable: l.scrollHeight > l.clientHeight, onTop: p.contains(hit), contrast: (a + 0.05) / (b + 0.05), fg, bg,
+                        barOverflow: getComputedStyle(document.querySelector('.bar')).overflow, barMax: getComputedStyle(document.querySelector('.bar')).maxHeight } })()`)
+                const inView = st.rect.left >= 0 && st.rect.top >= 0 && st.rect.right <= st.vw && st.rect.bottom <= st.vh && st.rect.height > 60
+                // trusted wheel scroll inside the list
+                const lc = await evaluate(`(() => { const r = document.querySelector('#plugin-menu .plugin-menu-list').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 } })()`)
+                for (let i = 0; i < 4; i++) await call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: lc.x, y: lc.y, deltaX: 0, deltaY: 200 })
+                await sleep(150); await frames(3)
+                const scrolled = await evaluate(`document.querySelector('#plugin-menu .plugin-menu-list').scrollTop`)
+                const name = `${vname}-${scheme}`
+                x.details[name] = { rect: st.rect, vw: st.vw, vh: st.vh, ...geo, scrolled, open: st.open }
+                check(`${name}_open_in_viewport`, st.open && inView, x.details[name])
+                check(`${name}_not_clipped_on_top`, geo.onTop, x.details[name])
+                check(`${name}_scrollable_bounded`, geo.scrollable && scrolled > 0, x.details[name])
+                check(`${name}_legible_contrast`, geo.contrast >= 4.5, x.details[name])
+                check(`${name}_toolbar_overflow_kept`, geo.barOverflow === 'auto' && geo.barMax !== 'none', x.details[name])
+                await shot(name); x.screenshots.push(name + '.png')
+                await key('Escape', 'Escape', 27)
+                const closed = await state()
+                check(`${name}_escape_closed`, !closed.open && closed.active === 'trigger', closed.active)
+            }
+        }
+        // short viewport: toolbar scroll repositions the open popup
+        await call('Emulation.setDeviceMetricsOverride', { width: 520, height: 360, deviceScaleFactor: 1, mobile: false })
+        await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }] })
+        await frames(4)
+        await click(S)
+        const pre = await state()
+        const scrollRes = await evaluate(`(() => { const b = document.querySelector('.bar'); const t = ${S}; const before = t.getBoundingClientRect().bottom; b.scrollTop = b.scrollHeight; return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r({ scrollable: b.scrollHeight > b.clientHeight, moved: t.getBoundingClientRect().bottom - before })))) })()`)
+        const post = await state()
+        x.details.toolbar_scroll = { pre: pre.rect, post: post.rect, ...scrollRes }
+        check('toolbar_scroll_reposition_in_viewport', post.open && post.rect.top >= 0 && post.rect.bottom <= post.vh && (scrollRes.moved === 0 || Math.abs(post.rect.top - pre.rect.top) > 0 || Math.abs(post.rect.bottom - pre.rect.bottom) > 0), x.details.toolbar_scroll)
+        await shot('short-toolbar-scrolled'); x.screenshots.push('short-toolbar-scrolled.png')
+        await key('Escape', 'Escape', 27)
+        // Visual viewport (Chromium pinch-zoom via trusted CDP gesture): the
+        // open popup must lie inside the VISIBLE region incl. its offset.
+        // Real browser coverage in headless Chromium only (not Safari/iOS).
+        await call('Emulation.setDeviceMetricsOverride', { width: 1000, height: 700, deviceScaleFactor: 1, mobile: false })
+        control.discovery = null; await evaluate('__cvd.loadIndicators()'); await frames(4)
+        await click(S)
+        const tr0 = await evaluate(`(() => { const r = ${S}.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.bottom + 120 } })()`)
+        // Zoom the visual viewport (page scale) and pan it with trusted wheel
+        // input; headless Chromium ignores synthesized mouse pinch gestures.
+        let pinch = null
+        try { await call('Emulation.setPageScaleFactor', { pageScaleFactor: 2.2 }) } catch (e) { pinch = String(e) }
+        await frames(4)
+        for (let i = 0; i < 3; i++) await call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 300, y: 600, deltaX: 120, deltaY: 120 })
+        await sleep(300); await frames(4)
+        const vvr = await evaluate(`(() => { const v = visualViewport, r = document.getElementById('plugin-menu').getBoundingClientRect(); return { scale: v.scale, ox: v.offsetLeft, oy: v.offsetTop, w: v.width, h: v.height, open: !document.getElementById('plugin-menu').hidden, rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } } })()`)
+        x.details.visual_viewport = { pinchError: pinch, ...vvr }
+        const inVisible = q => q.rect.left >= q.ox - 0.5 && q.rect.top >= q.oy - 0.5 && q.rect.right <= q.ox + q.w + 0.5 && q.rect.bottom <= q.oy + q.h + 0.5
+        check('vv_pinch_zoom_applied', !pinch && vvr.scale > 1.5 && (vvr.ox > 0 || vvr.oy > 0), x.details.visual_viewport)
+        check('vv_popup_inside_visible_region', vvr.open && inVisible(vvr), x.details.visual_viewport)
+        await shot('visual-viewport-zoomed'); x.screenshots.push('visual-viewport-zoomed.png')
+        await key('Escape', 'Escape', 27)
+        await call('Emulation.resetPageScaleFactor', {}).catch(() => {}); await frames(3)
+        await call('Emulation.setDeviceMetricsOverride', { width: VIEW.width, height: VIEW.height, deviceScaleFactor: VIEW.deviceScaleFactor, mobile: false })
+        await call('Emulation.setEmulatedMedia', { features: [] })
+        control.discovery = null
+        const tr = await evaluate('__menuTrusted')
+        check('all_menu_input_trusted', trusted && tr.n > 0 && tr.untrusted === 0, tr)
+        x.failures = failures
+        fs.writeFileSync(path.join(shots, 'indicator-menu-results.json'), JSON.stringify({ label: 'Headless Chromium (not Safari). Rows cvd/flow-style ids come from REAL public cdylibs via the real runner; synthetic.* rows are SYNTHETIC loopback discovery entries.', real_ids: realIds, ...x, toggle_measure: { requests: m.requests.length, calls: m.calls, before: t.before, end: t.end } }, null, 1))
+        if (failures.length) console.log('indicator_menu failures:\n  ' + failures.join('\n  '))
+        return { m, checks: x.checks }
+    },
 }
 
 // ------------------------------------------------------------ stats
@@ -960,7 +1261,7 @@ try {
     })
     await call('Page.enable'); await call('Runtime.enable')
     await call('Emulation.setDeviceMetricsOverride', { width: VIEW.width, height: VIEW.height, deviceScaleFactor: VIEW.deviceScaleFactor, mobile: false })
-    await call('Page.addScriptToEvaluateOnNewDocument', { source: `localStorage.setItem('cvd_prefs_v1', JSON.stringify({ exchange: 'binance', symbol: 'BTC', market: 'spot', tf: '1m', showRd: true, showKd: true, showFd: true, showHd: true, showLevels: true, showAgg: false, flowMode: 'delta' }))` })
+    await call('Page.addScriptToEvaluateOnNewDocument', { source: `if (!sessionStorage.getItem('cvd_keep_prefs')) localStorage.setItem('cvd_prefs_v1', JSON.stringify({ exchange: 'binance', symbol: 'BTC', market: 'spot', tf: '1m', showRd: true, showKd: true, showFd: true, showHd: true, showLevels: true, showAgg: false, flowMode: 'delta' }))` })
     const unknown = [...(ONLY ?? [])].filter(name => !(name in scenarios))
     if (unknown.length) throw new Error(`unknown CVD_SCENARIOS: ${unknown.join(',')}`)
     for (const [name, run] of Object.entries(scenarios)) {

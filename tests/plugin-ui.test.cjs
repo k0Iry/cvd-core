@@ -53,7 +53,8 @@ test('bare host: no indicators -> price pane + host backbone only; no plugin ser
     assert.deepEqual([...new Set(live(h).map(item => item.pane))], [0])
     assert.equal(live(h).length, 2, 'candles + backbone')
     assert.deepEqual(plain(h.run('backboneSeries.data')).map(p => p.time), [60, 120, 180])
-    assert.equal(h.run('pluginControlsEl.children.length'), 0)
+    assert.equal(h.run('__pluginRows().length'), 0, 'no plugin rows')
+    assert.match(h.run('pluginControlsEl.children[0]?.textContent ?? ""'), /Indicators · 0|^$/)
     assert.equal(h.run('paneLabels.children.length'), 1)
 })
 
@@ -85,7 +86,7 @@ test('missing/failed/starting indicators are labelled; starting -> ready registe
     assert.match(h.run('pluginStateEl.title'), /cvd starting/)
     assert.match(h.run('pluginStateEl.title'), /levels failed incompatible/)
     assert.equal(h.run('pluginStateEl.title').includes('/srv/private'), false, 'no raw paths/messages')
-    assert.equal(h.run('pluginControlsEl.children.find(c => c.dataset.plugin === "cvd").children[0].disabled'), true)
+    assert.equal(h.run('__pluginRows().find(c => c.dataset.plugin === "cvd").children[0].disabled'), true)
     assert.equal(h.run('discoveryTimer !== null'), true, 'starting schedules a bounded refresh')
     h.run(`setBars(${JSON.stringify(FIXTURE.history.bars.slice(0, 3))})`); h.flushFrames()
     const ready = { api_version: 1, indicators: [FIXTURE.discovery.indicators.find(e => e.id === 'cvd'), starting.indicators[1]] }
@@ -317,7 +318,7 @@ test('generic non-LEVELS descriptor-only plugin: own panes, toggle and widths wi
     assert.deepEqual(plain(a.data), [{ time: 60 }, { time: 120 }], 'no results yet: whitespace')
     h.run('indicatorStore.applyHistory("example.other", "source", { times: [120], series: { a: { type: "line", values: [0] }, b: { type: "histogram", values: [3] } } }); refreshPluginOutputs(new Set(["example.other"]), false)')
     assert.deepEqual(plain(a.data), [{ time: 60 }, { time: 120, value: 0 }])
-    h.run('(() => { const i = pluginControlsEl.children.find(c => c.dataset.plugin === "example.other").children[0]; i.checked = false; i.onchange() })()')
+    h.run('(() => { const i = __pluginRows().find(c => c.dataset.plugin === "example.other").children[0]; i.checked = false; i.onchange() })()')
     assert.deepEqual(plain(a.data), [])
 })
 

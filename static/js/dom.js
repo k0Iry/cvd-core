@@ -6,6 +6,7 @@ export const elements = {
     accessKeyInput: document.getElementById("access-key"),
     aggToggle: document.getElementById("toggle-agg"),
     pluginControlsEl: document.getElementById("plugin-controls"),
+    pluginMenuEl: document.getElementById("plugin-menu"),
     pluginStateEl: document.getElementById("plugin-state"),
     screenshotBtn: document.getElementById("screenshot-btn"),
     statusEl: document.getElementById("status"),
