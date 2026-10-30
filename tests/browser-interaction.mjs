@@ -71,7 +71,9 @@ function makeBar(i) {
 }
 let dataset = []
 function resetDataset() { dataset = Array.from({ length: TOTAL }, (_, i) => makeBar(i)) }
-const control = { beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0 }
+// assetFault: test-only fault on ONE served static asset (indicator_menu reload
+// controls): { path, delayMs } delays it, { path, status } fails it.
+const control = { beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0, assetFault: null, livePushes: 0 }
 
 // ------------------------------------------------------------ real indicators
 const ORACLE_WASM = (process.env.CVD_LOCAL_WASM || '').split(',').filter(Boolean)
@@ -221,6 +223,7 @@ function wsSend(socket, text) {
     socket.write(Buffer.concat([header, payload]))
 }
 function pushLive(bar) {
+    control.livePushes++ // quiescence witness for indicator_menu reload controls
     const index = dataset.findIndex(b => b.time === bar.time)
     if (index >= 0) dataset[index] = bar
     else dataset.push(bar)
@@ -267,6 +270,11 @@ const server = http.createServer(async (req, res) => {
         noteScope(url.searchParams)
         res.end(JSON.stringify(await historyPage(url.searchParams)))
         return
+    }
+    const fault = control.assetFault
+    if (fault && url.pathname === fault.path) {
+        if (fault.status) { res.writeHead(fault.status); res.end(); return }
+        if (fault.delayMs) await new Promise(r => setTimeout(r, fault.delayMs))
     }
     let data, mime
     if (url.pathname === '/') { data = html; mime = 'text/html' }
@@ -387,6 +395,7 @@ async function openPage() {
     resetDataset()
     control.beforeDelayMs = 0
     control.discovery = null
+    control.assetFault = null
     control.requests.length = 0
     await call('Page.navigate', { url: `http://127.0.0.1:${PORT}/` })
     await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
@@ -1140,14 +1149,54 @@ const scenarios = {
         // 5. persistence across reload (prefs as left: only realIds[0] on)
         const expected = (await state()).rows.map(r => [r.id, r.checked])
         await evaluate(`sessionStorage.setItem('cvd_keep_prefs', '1')`)
-        await call('Page.reload', {})
-        await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
-        await frames(4)
+        // Bars/live do NOT imply the asynchronous local WASM restore (host +
+        // coordinator fetch, IndexedDB records, worker load, recompute) has
+        // published. Wait semantically, BOUNDED, for genuine output of every
+        // persisted-enabled plugin; never re-enable/click (prefs stay as left).
+        const onIds = expected.filter(e => e[1]).map(e => e[0])
+        const RESTORE_BOUND_MS = 20000
+        const seriesNow = async () => Object.fromEntries(await Promise.all(expected.map(async ([id]) => [id, await evaluate(`__cvd.pluginSeries(${JSON.stringify(id)})`)])))
+        const reloadKeepingPrefs = async assetFault => {
+            control.assetFault = assetFault
+            await call('Page.reload', {})
+            await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
+            await frames(4)
+            const early = await seriesNow()
+            const pushes0 = control.livePushes, reqs0 = control.requests.length
+            const t0 = Date.now()
+            let restored = true
+            try { await waitFor(`(() => { const c = __cvd.localCompute(); return !!c && c.idle() && ${JSON.stringify(onIds)}.every(id => __cvd.pluginSeries(id).some(s => s.visible && s.points > 0)) })()`, RESTORE_BOUND_MS) } catch { restored = false }
+            const waitedMs = Date.now() - t0
+            // No new market data (live push / history request) may rescue the fill.
+            const quiet = { livePushes: control.livePushes - pushes0, requests: control.requests.slice(reqs0) }
+            await frames(2)
+            return { early, restored, waitedMs, quiet, noNewMarket: quiet.livePushes === 0 && quiet.requests.length === 0 }
+        }
+        const main = await reloadKeepingPrefs(null)
         const reloaded = await state()
         check('prefs_survive_reload', JSON.stringify(reloaded.rows.map(r => [r.id, r.checked])) === JSON.stringify(expected) && !reloaded.open && reloaded.label.includes(`Indicators · ${expected.filter(e => e[1]).length}`), { expected, got: reloaded.rows })
         // Actual series state follows the persisted checkbox state per plugin.
-        const afterReload = Object.fromEntries(await Promise.all(expected.map(async ([id]) => [id, await evaluate(`__cvd.pluginSeries(${JSON.stringify(id)})`)])))
-        check('reload_series_match_prefs', expected.some(e => !e[1]) && expected.every(([id, on]) => on ? afterReload[id].some(s => s.visible && s.points > 0) : afterReload[id].every(s => !s.visible)), { expected, afterReload })
+        const afterReload = await seriesNow()
+        const seriesMatch = after => expected.every(([id, on]) => on ? after[id].some(s => s.visible && s.points > 0) : after[id].every(s => !s.visible))
+        check('reload_series_match_prefs', main.restored && main.noNewMarket && expected.some(e => !e[1]) && expected.every(([id, on]) => on ? afterReload[id].some(s => s.visible && s.points > 0) : afterReload[id].every(s => !s.visible)), { expected, afterReload, restored: main.restored, waitedMs: main.waitedMs, quiet: main.quiet })
+        // Regression control (CI run 41013584705): a deterministically DELAYED
+        // plugin Worker script (fetched only after bars/live) reproduces the observed live-but-0-points snapshot;
+        // the enabled plugin must then fill on the same page with no input.
+        const WORKER = '/wasm-host/plugin-worker.js'
+        const delayed = await reloadKeepingPrefs({ path: WORKER, delayMs: 2500 })
+        const delayedAfter = await seriesNow()
+        const delayedRows = (await state()).rows.map(r => [r.id, r.checked])
+        check('reload_delayed_restore_fills', onIds.length > 0 && onIds.every(id => delayed.early[id].length > 0 && delayed.early[id].some(s => s.visible) && delayed.early[id].every(s => s.points === 0)) && delayed.restored && delayed.noNewMarket && JSON.stringify(delayedRows) === JSON.stringify(expected) && expected.every(([id, on]) => on ? delayedAfter[id].some(s => s.visible && s.points > 0) : delayedAfter[id].every(s => !s.visible)), { early: delayed.early, after: delayedAfter, restored: delayed.restored, waitedMs: delayed.waitedMs, quiet: delayed.quiet })
+        // Negative control: a permanently failed restore must NOT pass the
+        // bounded wait (no zero-point acceptance, no unbounded hang).
+        const broken = await reloadKeepingPrefs({ path: WORKER, status: 404 })
+        check('reload_failed_restore_bounded_red', !broken.restored && broken.waitedMs >= RESTORE_BOUND_MS && broken.waitedMs < RESTORE_BOUND_MS + 5000, { restored: broken.restored, waitedMs: broken.waitedMs, early: broken.early })
+        // Healthy reload (same persisted prefs) for the steps below.
+        const healed = await reloadKeepingPrefs(null)
+        const healedAfter = await seriesNow()
+        const healedRows = (await state()).rows.map(r => [r.id, r.checked])
+        check('reload_healthy_after_controls', healed.restored && healed.noNewMarket && JSON.stringify(healedRows) === JSON.stringify(expected) && seriesMatch(healedAfter), { waitedMs: healed.waitedMs, rows: healedRows, after: healedAfter, quiet: healed.quiet })
+        x.details.reload = { boundMs: RESTORE_BOUND_MS, main, delayed: { ...delayed, after: delayedAfter }, broken, healed: { ...healed, after: healedAfter } }
         await evaluate(`sessionStorage.removeItem('cvd_keep_prefs')`)
         await evaluate(`__menuTrusted = { n: 0, untrusted: 0 }; for (const t of ['pointerdown', 'click', 'keydown', 'change']) document.addEventListener(t, e => { __menuTrusted.n++; if (!e.isTrusted) __menuTrusted.untrusted++ }, true)`)
 
