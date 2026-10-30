@@ -11,7 +11,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { spawn } from 'node:child_process'
+import { launchChromium } from './chromium-launch.mjs'
 import assert from 'node:assert/strict'
 import { teardown } from './harness-teardown.mjs'
 
@@ -41,16 +41,14 @@ server.on('connection', s => { sockets.add(s); s.on('close', () => sockets.delet
 await new Promise(r => server.listen(0, '127.0.0.1', r))
 const port = server.address().port
 const profile = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 'cvd-wasm-smoke-'))
-const chrome = spawn(process.env.CVD_CHROMIUM || '/usr/bin/chromium', ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-  '--no-first-run', '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] })
+const { child: chrome, promise: started } = launchChromium({ bin: process.env.CVD_CHROMIUM || '/usr/bin/chromium', profile })
 let result, ws
 // Every wait below is bounded so the finally/teardown path is always reachable.
 const bounded = (p, ms, what) => { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms) })]).finally(() => clearTimeout(t)) }
 try {
-  const wsUrl = await new Promise((resolve, reject) => {
-    let buf = ''; const t = setTimeout(() => reject(new Error('chromium did not start')), 20000)
-    chrome.stderr.on('data', d => { buf += d; const m = buf.match(/DevTools listening on (ws:\/\/\S+)/); if (m) { clearTimeout(t); resolve(m[1]) } })
-  })
+  const st = await started
+  console.log(`chromium ready via ${st.via} in ${st.ms}ms (${st.browser})`)
+  const wsUrl = st.wsUrl
   const targets = await bounded(fetch(`http://${new URL(wsUrl).host}/json/list`, { signal: AbortSignal.timeout(10000) }).then(r => r.json()), 10000, 'CDP /json/list')
   ws = new WebSocket(targets.find(t => t.type === 'page').webSocketDebuggerUrl)
   await bounded(new Promise((r, j) => { ws.addEventListener('open', r, { once: true }); ws.addEventListener('error', () => j(new Error('CDP ws error')), { once: true }) }), 10000, 'CDP open')
