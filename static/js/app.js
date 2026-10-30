@@ -1,19 +1,20 @@
-import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=local-wasm-1"
-import { elements } from "./dom.js?v=local-wasm-1"
+import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=local-wasm-2"
+import { elements } from "./dom.js?v=local-wasm-2"
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=local-wasm-1"
-import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=local-wasm-1"
-import { parseIndicatorFrame, seriesValueAt } from "./plugin-wire.mjs?v=local-wasm-1"
-import { openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, sanitizeParams, validRecord, parseParamInput, contextBars } from "./local-plugins.mjs?v=local-wasm-1"
-import { createLocalCompute } from "./local-compute.mjs?v=local-wasm-1"
-import { createCoordinator } from "./coordinator.mjs?v=local-wasm-1"
-import { WasmPluginHost } from "/wasm-host/host-bridge.js?v=local-wasm-1"
-import { createIndicatorStore } from "./plugin-store.mjs?v=local-wasm-1"
-import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=local-wasm-1"
-import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=local-wasm-1"
-import { createOutputRenderer } from "./plugin-render.mjs?v=local-wasm-1"
-import { createIndicatorMenu } from "./indicator-menu.mjs?v=local-wasm-1"
+import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=local-wasm-2"
+import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=local-wasm-2"
+import { parseIndicatorFrame, seriesValueAt } from "./plugin-wire.mjs?v=local-wasm-2"
+import { openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, sanitizeParams, validRecord, parseParamInput, contextBars } from "./local-plugins.mjs?v=local-wasm-2"
+import { createLocalCompute } from "./local-compute.mjs?v=local-wasm-2"
+import { createCoordinator } from "./coordinator.mjs?v=local-wasm-2"
+import { WasmPluginHost } from "/wasm-host/host-bridge.js?v=local-wasm-2"
+import { createIndicatorStore } from "./plugin-store.mjs?v=local-wasm-2"
+import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=local-wasm-2"
+import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=local-wasm-2"
+import { createOutputRenderer } from "./plugin-render.mjs?v=local-wasm-2"
+import { createIndicatorMenu } from "./indicator-menu.mjs?v=local-wasm-2"
+import { createTimeLabelFormatters } from "./time-labels.mjs?v=local-wasm-2"
 
 const {
     exchangeSel,
@@ -234,6 +235,13 @@ function applyTheme(themeName) {
 
 
 chart.timeScale().applyOptions({ rightOffset: 2, minBarSpacing: 0.5 })
+// Bars carry the canonical inclusive bucket-end second; label them by bar
+// open time (display only). labelTf is the tf the chart data was rendered
+// with, falling back to the selector before the first render.
+let labelTf = null
+const timeLabels = createTimeLabelFormatters(() => labelTf ?? tfSel.value)
+chart.applyOptions({ localization: { timeFormatter: timeLabels.timeFormatter } })
+chart.timeScale().applyOptions({ tickMarkFormatter: timeLabels.tickMarkFormatter })
 
 function onMediaQueryChange(mq, handler) {
     if (typeof mq.addEventListener === "function") {
@@ -1494,6 +1502,7 @@ function setBars(bars, keepRange = null, dataKind = null) {
         visibleBars.length !== renderedWindow.bars.length || visibleBars.some((bar, index) => bar !== renderedWindow.bars[index])
     renderedWindow = { start: next.start, bars: visibleBars }
     renderedMode = mode
+    labelTf = tfSel.value
     renderedPreviousBar = previousBar
     if (needsData) {
         priceSeries.setData(pricePointsForBars(visibleBars, previousBar))

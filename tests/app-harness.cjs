@@ -175,7 +175,7 @@ function harness(checked = {}, options = {}) {
     const read = file => fs.readFileSync(path.join(__dirname, '../static/js', file), 'utf8')
     const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export async function', 'async function').replaceAll('export function', 'function')
     const source = read('app.js').replace(/^import .*\n/gm, '').replace(/\ninit\(\)\s*$/, '\n')
-    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs', 'indicator-menu.mjs', 'local-plugins.mjs', 'coordinator.mjs', 'local-compute.mjs'].map(file => strip(read(file))).join('\n')
+    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs', 'indicator-menu.mjs', 'time-labels.mjs', 'local-plugins.mjs', 'coordinator.mjs', 'local-compute.mjs'].map(file => strip(read(file))).join('\n')
     vm.runInContext(modules + '\n' + source + '\nconst realEnsureModeConnections = ensureModeConnections; ensureModeConnections = () => {};\n' + (options.projection === false ? '' : PROJECTION) + TEST_BRIDGE, context)
     if (options.descriptors !== null) vm.runInContext(`applyPluginDescriptors(${JSON.stringify(options.descriptors ?? TEST_DESCRIPTORS)})`, context)
     const run = code => vm.runInContext(code, context)

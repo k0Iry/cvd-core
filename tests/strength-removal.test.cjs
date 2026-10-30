@@ -47,7 +47,7 @@ test('frontend source has no retired indicator renderers, keys or readiness help
 
 test('changed frontend modules share one coherent import version', () => {
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...app.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-1'])
+    assert.deepEqual([...versions], ['local-wasm-2'])
 })
 
 function section(start, end) {

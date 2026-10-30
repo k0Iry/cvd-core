@@ -13,8 +13,8 @@
 //     always calls host.disable, so a Worker still loading is terminated now;
 //   * each plugin progresses independently (own loop), bounded per slice with
 //     a scheduled continuation so quiet feeds never strand latest work.
-import { codeError, contextBars } from "./local-plugins.mjs?v=local-wasm-1"
-import { LIVE_REPLACE_SLACK } from "./coordinator.mjs?v=local-wasm-1"
+import { codeError, contextBars } from "./local-plugins.mjs?v=local-wasm-2"
+import { LIVE_REPLACE_SLACK } from "./coordinator.mjs?v=local-wasm-2"
 
 const RELOAD_CODES = new Set(["superseded", "stale", "replaced", "disabled", "terminated"])
 const NONFATAL_LIVE = new Set(["sequence_gap", "stale_revision", "invalid_input"])
