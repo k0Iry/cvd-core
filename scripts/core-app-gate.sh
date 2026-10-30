@@ -13,6 +13,22 @@
 # CORE_APP_GATE_INJECT=<build|assemble|interaction|inventory|coverage|lwcrender> forces that step
 # to fail (control: omitted required work can never return zero).
 set -euo pipefail
+# One validator for BOTH pinned inventories (default 12 and ctxdemo coverage 2):
+#   check_inventory <label> <interaction-results.json> <comma-sorted-want>
+# Nonzero unless the scenario set equals want exactly, every scenario all_ok,
+# errors empty and cleanup.ok === true. Inputs pass as argv (no interpolation).
+check_inventory() {
+  node -e '
+const [label, file, wantCsv] = process.argv.slice(1)
+const r = JSON.parse(require("fs").readFileSync(file, "utf8"))
+const want = wantCsv.split(",").filter(Boolean); const got = Object.keys(r.scenarios || {}).sort()
+if (!want.length || want.join() !== got.join()) { console.error("FAIL " + label + " inventory want", want, "got", got); process.exit(1) }
+const bad = got.filter(k => r.scenarios[k].all_ok !== true)
+if (bad.length || !Array.isArray(r.errors) || r.errors.length || !r.cleanup || r.cleanup.ok !== true) { console.error("FAIL " + label, bad, r.errors, r.cleanup); process.exit(1) }
+console.log(label.toUpperCase(), "INVENTORY", got.length, "scenarios:", got.join(","))' "$@"
+}
+# Validator-only entry (tests/gate-validators.test.mjs): no build/browser/OUT.
+if [ "${1:-}" = --check-inventory ]; then shift; check_inventory "$@"; exit; fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd); REPS=${2:-1}
 . "$ROOT/scripts/out-guard.sh"
 # Validate canonical OUT against the source tree BEFORE any mkdir/rm below.
@@ -53,13 +69,7 @@ echo "== scenario inventory"
 inject inventory
 # Pinned scenario inventory (12); a skipped or renamed scenario fails.
 want=cached_drag,cached_zoom,crossing_buffer,crossing_newer,hidden_resize_resume,history_prepend_delayed,indicator_menu,long_drag,pane_contract,realtime_while_history,source_reset_new_grid,wide_zoom_return
-node -e "
-const r=JSON.parse(require('fs').readFileSync('$RES/interaction-results.json','utf8'));
-const want='$want'.split(',');const got=Object.keys(r.scenarios).sort();
-if(!want.length||want.join()!==got.join()){console.error('FAIL inventory want',want,'got',got);process.exit(1)}
-const bad=got.filter(k=>{const s=r.scenarios[k];return s.all_ok!==true});
-if(bad.length||(r.errors&&r.errors.length)){console.error('FAIL scenarios',bad,r.errors);process.exit(1)}
-console.log('INVENTORY',got.length,'scenarios:',got.join(','))"
+check_inventory scenario "$RES/interaction-results.json" "$want"
 echo "== warm-up coverage (cvd+flow+ctxdemo; 30m drag + same-fix TF roundtrip)"
 inject coverage
 # Separate run so the 12-scenario inventory keeps its 2-plugin expectations.
@@ -67,13 +77,7 @@ inject coverage
 covwant=tf_roundtrip_pending,warmup_exposed_drag
 CVD_STATIC_ROOT=$ST CVD_LOCAL_WASM=$FX/cvd_indicator_cvd.wasm,$FX/cvd_indicator_flow.wasm,$FX/cvd_indicator_ctxdemo.wasm \
   CVD_SCENARIOS=$covwant CVD_INTERACTION_OUT=$COV CVD_REPS=$REPS timeout 1200 node tests/browser-interaction.mjs
-node -e "
-const r=JSON.parse(require('fs').readFileSync('$COV/interaction-results.json','utf8'));
-const want='$covwant'.split(',');const got=Object.keys(r.scenarios).sort();
-if(want.join()!==got.join()){console.error('FAIL coverage inventory want',want,'got',got);process.exit(1)}
-const bad=got.filter(k=>r.scenarios[k].all_ok!==true);
-if(bad.length||(r.errors&&r.errors.length)||!r.cleanup||r.cleanup.ok!==true){console.error('FAIL coverage',bad,r.errors,r.cleanup);process.exit(1)}
-console.log('COVERAGE INVENTORY',got.length,'scenarios:',got.join(','))"
+check_inventory coverage "$COV/interaction-results.json" "$covwant"
 echo "== real-LWC plugin renderer regression (assembled static tree)"
 inject lwcrender
 # Exactly 4 renderer kinds must PASS; nonzero exit propagates via set -e.

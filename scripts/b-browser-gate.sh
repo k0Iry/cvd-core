@@ -9,6 +9,15 @@ AUD=${1:?audit dir}; REPS=${2:-1}; OUT=${B_GATE_OUT:-$AUD/B-rev2-evidence}
 ROOT=$(cd "$(dirname "$0")/.." && pwd); cd "$ROOT"; mkdir -p "$OUT"; : > "$OUT/exit-codes.txt"
 W=$AUD/build/public/wasm32-unknown-unknown/wasm-release
 STAGES=${B_GATE_STAGES:-coordinator node lwcrender local data p2 toggle interaction}
+# Every resolved token must name a stage branch below; an unknown token or a
+# whitespace-only list fails BEFORE any stage runs (never a vacuous overall=0).
+SUPPORTED="coordinator node lwcrender local data p2 toggle interaction cleanup coreapp served"
+# Dispatch uses the SAME normalized tokens (single-space joined), so tab/newline
+# separated valid names can never validate and then silently skip.
+set -f; N=0; BAD=; NORM=
+for s in $STAGES; do case " $SUPPORTED " in *" $s "*) N=$((N+1)); NORM="$NORM $s";; *) BAD="$BAD $s";; esac; done; set +f
+STAGES=${NORM# }
+[ -z "$BAD" ] && [ "$N" -gt 0 ] || { echo "FAIL B_GATE_STAGES unknown:${BAD:- (none)} resolved=$N supported: $SUPPORTED" >&2; exit 2; }
 # One explicit coordinator target dir for test, build AND copy: an inherited
 # CARGO_TARGET_DIR must never select a stale artifact.
 CT=${B_COORD_TARGET:-$AUD/build/b-coordinator}
