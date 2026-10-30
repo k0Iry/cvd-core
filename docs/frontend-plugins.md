@@ -73,7 +73,7 @@ branch on an indicator/output id (enforced by `tests/plugin-ui.test.cjs`).
 ## Tests
 
 ```sh
-node --test tests/*.test.cjs static/js/*.test.cjs
+bash scripts/node-unit-gate.sh <OUT_DIR>   # builds coordinator wasm from source, runs the full node --test suite
 ```
 
 `tests/browser-interaction.mjs` imports real `.wasm` through the app's file

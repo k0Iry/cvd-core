@@ -96,7 +96,7 @@ connection-local `TEMP bars` table under `search_path = pg_temp`):
 
 Frontend regression tests:
 
-    node --test tests/*.test.cjs static/js/*.test.cjs
+    bash scripts/node-unit-gate.sh <OUT_DIR>   # builds coordinator wasm from source, runs the full node --test suite
 
 The opt-in USDC producer-to-browser gate uses the disposable
 `CVD_RETIREMENT_TEST_URL` above, public CVD/Flow libraries and a pre-created artifact

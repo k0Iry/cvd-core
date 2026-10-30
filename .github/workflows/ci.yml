@@ -36,7 +36,7 @@ jobs:
           fi
           exit "$result"
       - name: Frontend unit contracts
-        run: node --test tests/*.test.cjs tests/*.test.mjs static/js/*.test.cjs
+        run: bash scripts/node-unit-gate.sh "$RUNNER_TEMP/node-unit"
       - name: Owned process-group + output-path cleanup controls
         run: bash tests/owned-group-control.sh && bash tests/out-guard-control.sh
       - name: Self-contained core app interaction (own host/coordinator/TEST-ONLY fixture wasm, real Chromium)

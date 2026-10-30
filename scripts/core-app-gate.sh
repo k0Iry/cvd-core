@@ -27,6 +27,8 @@ T=$OUT/target; FX=$OUT/fixtures; ST=$OUT/static; RES=$OUT/interaction
 rm -rf "$FX" "$ST" "$RES"; mkdir -p "$FX"
 echo "== build trusted host + coordinator wasm from source"
 inject build
+echo "== acquire locked deps of root + standalone workspaces (network; honours CARGO_NET_OFFLINE)"
+for d in . crates/browser-coordinator tests/fixtures/wasm/interaction-plugin; do ( cd "$d" && cargo fetch --locked ); done
 cargo build --offline --locked --target-dir "$T/host" --profile wasm-release --target wasm32-unknown-unknown -p cvd-browser-host
 ( cd crates/browser-coordinator && cargo build --offline --locked --release --target wasm32-unknown-unknown --target-dir "$T/coordinator" )
 HOST=$T/host/wasm32-unknown-unknown/wasm-release/cvd_browser_host.wasm

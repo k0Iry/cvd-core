@@ -10,7 +10,9 @@ import { createLocalCompute } from '../static/js/local-compute.mjs'
 import { createCoordinator } from '../static/js/coordinator.mjs'
 import { INPUT_FIELDS } from '../static/js/local-plugins.mjs'
 
-const COORD = fs.readFileSync(new URL('../static/wasm-host/cvd_browser_coordinator.wasm', import.meta.url))
+// scripts/node-unit-gate.sh injects the coordinator it just built from source
+// (CVD_COORDINATOR_WASM); otherwise the gate-assembled static copy is used.
+const COORD = fs.readFileSync(process.env.CVD_COORDINATOR_WASM || new URL('../static/wasm-host/cvd_browser_coordinator.wasm', import.meta.url))
 const wire = (t, k = 0) => Object.fromEntries([['time', t], ...INPUT_FIELDS.map((f, i) => [f, i + t / 60 + k]), ['trades', 3]])
 const scope = { exchange: 'binance', market: 'spot', symbol: 'BTCUSDT', tf: '1m', mode: 'source' }
 const tick = (n = 4) => new Promise(r => { let i = 0; const f = () => ++i >= n ? r() : setTimeout(f, 0); f() })
