@@ -1,259 +1,255 @@
-# Deploy with Docker Compose (Linux)
+# Deploy and upgrade with Docker Compose (Linux)
 
 [简体中文](deployment.zh-CN.md) · [README](../README.md)
 
-The shortest public setup is **PostgreSQL + core + the public CVD/Flow libraries**.
-No private repository, private key, registry account or CI run is required.
-Builds happen locally on the target Docker host; no published image tag is assumed.
+## What runs where
 
-## Upgrade: browser-local indicators (server runner retired)
+- **Server (`cvd` container):** collects exchange trades, recovers gaps, stores
+  per-source bars in PostgreSQL (SQLite outbox for pending writes), serves
+  price/base flow data, `/meta`, `/health`, HTTP/WS and the static web app,
+  including the two trusted browser runtime modules (`/wasm-host/…`).
+- **Browser:** every indicator (CVD, Flow, custom/private) is a `.wasm` file that
+  the visitor imports in the page. It runs locally in that browser. The server
+  does not load, store, configure or run indicator plugins.
 
-The server no longer runs indicator plugins. It keeps collecting, recovering,
-persisting and serving canonical base data (including authoritative cumulative
-CVD); each visitor imports `.wasm` plugins locally in the browser. No database,
-history, cursor or outbox migration is needed and none is performed.
+The image builds everything it needs (Rust server + trusted runtime WASM) inside
+Docker. The server host needs only Git and Docker Engine with Compose v2; no host
+Rust, Node or Chromium, and no indicator repository on the server.
 
-Operator sequence (existing compose deployment; keeps `postgres-data`,
-`outbox-data`, `.env` and `artifacts/cvd.toml`):
+`/indicators` is retired (404) and is not a readiness check. Old `.so` plugins and
+`[[indicators.library]]` config are **not** converted; they are ignored.
 
-```sh
-cd <deployment checkout>
-docker compose exec -T postgres pg_dump -U cvdadmin -d cvd -Fc > ../cvd-pre-wasm.dump   # safety copy
-git fetch && git checkout <released core tag/SHA>
-docker compose build cvd                     # builds server + trusted host/coordinator wasm
-docker compose up -d --no-deps cvd           # postgres keeps running; outbox volume reused
-docker compose logs --tail=50 cvd            # expect: "config [indicators] is retired and IGNORED"
-curl -fsS http://127.0.0.1:8080/wasm-host/assets.json
-```
+---
 
-- Legacy `[indicators]` in `artifacts/cvd.toml` is accepted, never loaded, and
-  reported once per ignored library at startup. Other unknown keys still stop
-  startup. Market sources are compiled in, so an old config cannot select
-  different sources. Remove the section when convenient (`[server]` only).
-- `compose.yaml` no longer mounts `./artifacts/plugins`; an old local compose
-  override that still mounts it is harmless. Do not delete those files until
-  you no longer want them as offline references.
-- Rollback: check out the previous tag and `docker compose up -d --build cvd`
-  (base schema is unchanged in both directions).
+## A. Upgrade an existing deployment (most common)
 
-User import (each browser): download the public release assets
-(`cvd_indicator_cvd.wasm`, `cvd_indicator_flow.wasm`, … from the public
-indicators repository Releases; verify the published sha256), open the app,
-Indicators → Import, choose the `.wasm`, then tick it to enable. Private
-plugins are downloaded with your own repository access and imported the same
-way; they are stored only in that browser (IndexedDB) and never uploaded.
+Assumptions — adjust if yours differ:
 
-## Legacy (pre-WASM) server-plugin instructions
+- The deployment checkout is a clone of `k0Iry/cvd-core`; the app service is `cvd`.
+- You keep **the same** Compose invocation you already use: the same `-f` files /
+  `COMPOSE_FILE`, the same `-p` / `COMPOSE_PROJECT_NAME`, networks, reverse proxy,
+  `.env` (password) and PostgreSQL service/volume. A different file or project
+  name can select *different, empty* volumes (unless they use fixed/external names).
+- The outbox is on a persistent volume or bind mount (checked in step 2).
 
-The sections below describe the retired server runner and are kept only for
-reference when operating an older release.
-
-## Fresh installation
-
-**This section creates new named database volumes. If you already run CVD, use
-[Upgrade an existing deployment](#upgrade-an-existing-deployment) instead.**
-
-Requirements: Git, Docker Engine with Compose v2+, and a Linux host with kernel
->=5.11. Docker/seccomp must allow `close_range(..., CLOSE_RANGE_CLOEXEC)`.
-The build needs public GitHub/crate registry access; ingestion needs access to
-the configured public exchange endpoints. Run these commands on the target
-server so the host image and native libraries use the same architecture.
-Stop on any command failure; do not continue to startup after a failed build.
-
-### 1. Get source and configuration
+Run every block below in **one Bash session** (they share variables). Define your
+invocation once as a Bash array, exactly as you run Compose today:
 
 ```bash
-git clone https://github.com/k0Iry/cvd-core.git
-git clone https://github.com/k0Iry/cvd-indicators.git
-# This public plugin revision is compatible with the current ABI v1 host.
-git -C cvd-indicators checkout --detach 1e6673ba586bb76f1aaac96c433a68a9a41ecc96
-cd cvd-core
-cp .env.example .env
-chmod 0600 .env
-mkdir -p artifacts/plugins artifacts/public-build
-install -m 0644 config/cvd.public.toml artifacts/cvd.toml
-chmod 0755 artifacts/plugins
+DC=(docker compose)                                            # stock compose.yaml
+# DC=(docker compose -p myproj -f docker-compose.yml -f "my override.yml")  # custom: keep yours
+# If you rely on COMPOSE_FILE / COMPOSE_PROJECT_NAME, keep them exported in this shell.
 ```
 
-Edit `.env` and set **POSTGRES_PASSWORD** to a strong random URL-safe value
-(hexadecimal avoids URI-encoding issues). Do not commit this file. Changing this
-environment variable does **not** rotate the password in an already initialized
-database. Leave LIVE_ACCESS_KEY empty for unrestricted real-time access, or set
-it to require the key for real-time data. This is not general website authentication.
-
-### 2. Build the public plugins locally
-
-From the `cvd-core` directory:
+### 1. Check the checkout — do not discard local changes
 
 ```bash
-docker run --rm \
-  -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
-  -v cvd-public-cargo-cache:/cargo \
-  -v "$PWD/../cvd-indicators:/src:ro" \
-  -v "$PWD/artifacts/public-build:/target" \
-  -w /src rust:1.96-slim-trixie \
-  cargo build --locked --release -p cvd-indicator-cvd -p cvd-indicator-flow
-
-install -m 0644 artifacts/public-build/release/libcvd_indicator_cvd.so artifacts/plugins/
-install -m 0644 artifacts/public-build/release/libcvd_indicator_flow.so artifacts/plugins/
+cd /path/to/your/cvd-core
+git remote -v                  # must point to k0Iry/cvd-core (old k0Iry/cvd is NOT this repo)
+git status --short             # review local edits; do not reset/stash them away blindly
+"${DC[@]}" config --services   # must list your existing services (e.g. postgres, cvd)
 ```
 
-The sources are mounted read-only into a Rust 1.96 / Debian trixie builder,
-matching the core image's toolchain/distribution. Only the two shared libraries
-are installed into `artifacts/plugins`; build files stay outside that directory.
-Do not copy a macOS library or a different-architecture `.so` onto this server.
-The core Docker build excludes `artifacts`, including custom/private libraries.
+If `origin` is the old `k0Iry/cvd` repository, stop: clone `cvd-core` separately
+and port your own Compose/config/mounts deliberately rather than pulling a
+different history into the old folder. Never overwrite your existing `.env` or
+`artifacts/cvd.toml` with the template files.
 
-### 3. Build and start
+### 2. Back up (backup only — nothing is deleted or migrated)
+
+Each run creates a **new** owner-only backup directory and a unique rollback
+image tag, so earlier backups are never overwritten. List **every** Compose file
+you select with `-f`/`COMPOSE_FILE` and your real config path in `cp`.
 
 ```bash
-docker compose config --quiet
-docker compose build cvd
-docker compose up -d --no-build
-docker compose logs --tail=100 cvd
+set -euo pipefail
+umask 077
+BK="$HOME/cvd-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p -- "$HOME/cvd-backups"; mkdir -- "$BK"          # fails if it already exists
+CID="$("${DC[@]}" ps -q cvd)"; test -n "$CID"
+docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$CID" > "$BK/project"
+ROLLBACK_IMAGE="cvd-core:rollback-$(basename "$BK")"
+docker image tag "$(docker inspect -f '{{.Image}}' "$CID")" "$ROLLBACK_IMAGE"
+printf '%s\n' "$ROLLBACK_IMAGE" > "$BK/rollback-image"
+git rev-parse HEAD > "$BK/git-head"
+cp -a -- .env compose.yaml artifacts/cvd.toml "$BK/"     # custom: your -f files + config
+echo "backup: $BK"
 ```
 
-Open **http://127.0.0.1:8080** on the server. For a remote machine, use an SSH
-tunnel (`ssh -L 8080:127.0.0.1:8080 user@server`) or configure a reverse proxy.
-The example binds to localhost rather than exposing an unauthenticated service
-to the public Internet. PostgreSQL has no published host port.
+Back up the database with your usual scheme. For the **stock template only**
+(service `postgres`, user `cvdadmin`, database `cvd`):
+
+```bash
+set -euo pipefail
+"${DC[@]}" exec -T postgres pg_dump -U cvdadmin -d cvd -Fc > "$BK/cvd.dump"
+test -s "$BK/cvd.dump"
+```
+
+Other installations: substitute your own service/user/database names.
+
+Check the outbox is persistent — find its **actual** path, then the mounts:
+
+```bash
+"${DC[@]}" exec -T cvd sh -c 'if [ -n "${CVD_OUTBOX_PATH+x}" ]; then printf "%s\n" "$CVD_OUTBOX_PATH"; else echo UNSET; fi'
+docker inspect -f 'workdir={{.Config.WorkingDir}}' "$CID"
+docker inspect -f '{{range .Mounts}}{{.Destination}} {{.Type}} {{.Name}}{{.Source}}{{"\n"}}{{end}}' "$CID"
+```
+
+If the `exec` command fails, **stop** and fix that first: a failure does not mean
+the variable is unset. Only an explicit `UNSET` means the default
+`data/outbox.sqlite` applies (the stock image sets the variable explicitly).
+Print only that one variable; do not dump the container's full environment
+(it contains credentials). A relative path is relative to the working directory.
+The outbox's directory must be equal to, or below, the destination of a listed
+volume/bind. In the stock template that is `/app/data/outbox.sqlite` under the
+`outbox-data` volume at `/app/data` — an example, not a universal rule. Only if no
+mount covers the real directory does the outbox live in the container's writable
+layer: then follow [Outbox not persistent](#outbox-not-persistent) **before**
+recreating the container.
+
+### 3. Update, build, recreate only `cvd`
+
+```bash
+set -euo pipefail
+git pull --ff-only
+"${DC[@]}" config --quiet
+"${DC[@]}" build cvd
+"${DC[@]}" up -d --no-deps --no-build cvd
+"${DC[@]}" logs --tail=100 cvd
+```
+
+`set -e` stops at the first failing command. `git pull` may update tracked files
+such as `compose.yaml`; your pre-upgrade copies are in `$BK`. PostgreSQL keeps
+running and volumes are reused. Do **not** run `down -v`, remove volumes,
+restart/replace PostgreSQL, or run two collectors against the same data.
+
+The browser-WASM change needs no manual database, history or cursor migration or
+recompute. As on every start, the server still runs its normal schema
+initialization/compatibility statements; an older deployment may receive such
+changes, which is one reason to take the backup first.
+
+If your config still has `[indicators]` blocks, the log shows
+`config [indicators] is retired and IGNORED …`. It is harmless; when convenient,
+reduce the file to the `[server]` section only (see `config/cvd.public.toml`) and
+recreate `cvd` again. Other unknown keys still stop startup. Old `.so` files and
+plugin mounts are unused; keep them as offline references if you like.
 
 ### 4. Verify
 
 ```bash
-curl -fsS http://127.0.0.1:8080/indicators
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8080/meta
+curl -fsS http://127.0.0.1:8080/wasm-host/assets.json
+```
+
+Use your own address/port if you publish differently. Inspect the `/health` JSON
+(warm-up may briefly report `ready: false`; source timestamps should advance).
+Then open the site, **hard-refresh** (Ctrl/Cmd+Shift+R) and import indicators
+(section C). Price and base data should display before any indicator is imported.
+
+### Rollback
+
+Use the saved image, Compose files and config from `$BK`; volumes stay as they
+are (never delete them). Example for the stock layout — for a custom install add
+each saved `-f` file in the original order before the override:
+
+```bash
+set -euo pipefail
+BK="$HOME/cvd-backups/<timestamp>"       # the directory printed in step 2
+printf 'services:\n  cvd:\n    image: %s\n    pull_policy: never\n' \
+  "$(cat "$BK/rollback-image")" > "$BK/rollback.override.yml"
+cp -a -- "$BK/cvd.toml" artifacts/cvd.toml
+docker compose --project-directory "$PWD" --env-file "$BK/.env" -p "$(cat "$BK/project")" \
+  -f "$BK/compose.yaml" -f "$BK/rollback.override.yml" up -d --no-deps --no-build cvd
+```
+
+`--env-file "$BK/.env"` makes Compose use the saved `.env`, not today's. If this
+upgrade added a **new** outbox mount (see "Outbox not persistent"), the saved
+Compose files lack it: add that same volume/bind to `rollback.override.yml` (or
+keep the file that defines it), so rollback never returns the outbox to the
+container's writable layer or abandons the copied directory.
+
+The override does not remove the `build:` key; `--no-build` is what prevents a
+build, so the saved image is used. Restore the database dump only as a deliberate,
+separate decision. Checking out an old commit and rebuilding is not a verified
+rollback.
+
+### Outbox not persistent
+
+Only if step 2 found **no** mount covering the real outbox directory. Set
+`OUTBOX_SRC` to that confirmed directory (stock example: `/app/data`) and
+`OUTBOX_DEST` to a new host directory. The service is stopped first and the
+**whole directory** (including `-wal`/`-shm`) is copied from the **stopped**
+container. Never copy a live SQLite file; never chown PostgreSQL's data.
+
+```bash
+set -euo pipefail
+OUTBOX_SRC=/app/data             # confirmed parent directory of your real outbox
+OUTBOX_DEST=/srv/cvd-outbox      # must NOT exist yet
+test ! -e "$OUTBOX_DEST"
+"${DC[@]}" stop cvd              # stop only; do not rm/down the container
+OLD_CONTAINER="$("${DC[@]}" ps -aq cvd)"
+test "$(docker inspect -f '{{.State.Running}}' "$OLD_CONTAINER")" = false
+sudo mkdir -- "$OUTBOX_DEST"
+sudo docker cp "$OLD_CONTAINER:$OUTBOX_SRC/." "$OUTBOX_DEST/"
+sudo chown -R 10001:10001 "$OUTBOX_DEST"   # container runs as UID/GID 10001
+```
+
+Add `- /srv/cvd-outbox:/app/data` (your `OUTBOX_DEST:OUTBOX_SRC`) to the `cvd`
+service in **your** Compose file, then continue with step 3.
+
+---
+
+## B. Fresh installation (new, empty database)
+
+**Creates new volumes. Do not use for an existing deployment.**
+
+```bash
+set -euo pipefail
+git clone https://github.com/k0Iry/cvd-core.git
+cd cvd-core
+cp .env.example .env && chmod 0600 .env
+# edit .env: POSTGRES_PASSWORD=<output of: openssl rand -hex 24>
+mkdir -p artifacts
+install -m 0644 config/cvd.public.toml artifacts/cvd.toml
+docker compose config --quiet
+docker compose build cvd
+docker compose up -d --no-build
+docker compose logs --tail=100 cvd
 curl -fsS http://127.0.0.1:8080/health
 ```
 
-- `/indicators`: `cvd` and `flow` should be `ready`, with `error: null`.
-- `/health`: inspect the JSON, not just HTTP success. Startup warm-up can report
-  `ready: false`; after recovery, check source timestamps advance and pending bars
-  are being delivered. A temporarily nonzero `pending_bars` is possible during writes.
-- Check that the chart displays price, CVD and Flow and continues receiving data.
-  Plugin readiness alone does not prove exchange ingestion or browser rendering.
+- `LIVE_ACCESS_KEY` in `.env`: empty = unrestricted real-time data; set = key
+  required for real-time data (not site-wide authentication).
+- Changing `POSTGRES_PASSWORD` later does not rotate an initialized database's
+  password.
+- The port is bound to `127.0.0.1:8080`. Remote access: SSH tunnel
+  (`ssh -L 8080:127.0.0.1:8080 user@server`) or your reverse proxy to `cvd:8080`.
+- Persistent data: named volumes `postgres-data` and `outbox-data` under this
+  Compose project. Never use `docker compose down -v` for upgrades.
+- Later upgrades: section A with `DC=(docker compose)`.
 
-## What persists
+---
 
-The example [`compose.yaml`](../compose.yaml) creates two named volumes:
+## C. Indicators in the browser (each user, each browser)
 
-- `postgres-data`: the primary PostgreSQL history.
-- `outbox-data`: a small SQLite queue of bars awaiting confirmed PostgreSQL writes,
-  mounted at `/app/data`. The image initializes that directory for UID/GID 10001.
+1. Download `.wasm` assets from the public
+   [cvd-indicators Releases](https://github.com/k0Iry/cvd-indicators/releases)
+   (e.g. v0.1.0 CVD/Flow) and check the published sha256; or use your own
+   locally built custom/private `.wasm`. No account or API login is needed to
+   import a local file.
+2. Open the site → **Indicators → Import** → choose the `.wasm` → tick its
+   checkbox to enable.
 
-Ordinary container replacement preserves these named volumes. **Do not use
-`docker compose down -v` for an upgrade.** Keep the same Compose project name;
-a different project selects different named volumes. Maintain database backups.
+Install, enable/disable, parameters and uninstall are browser-local: no server
+restart, rebuild or config change. Imported modules are stored in that browser's
+IndexedDB **per origin**; a different browser, a changed domain/port, or cleared
+site data needs re-import. Files are not uploaded to the server. Local storage is
+not encryption and cannot protect a module from a compromised page or device.
 
-## Configure, add or disable an indicator
-
-Edit `artifacts/cvd.toml`, not the tracked example file. Paths are **container**
-paths under `/plugins`. Each id must match the library's descriptor and be unique.
-Use only trusted operator-provided native libraries; process isolation is not a
-sandbox for untrusted code. See the [WASM plugin contract](plugin-wasm-v1.md) and the
+Plugin authoring: [WASM plugin contract](plugin-wasm-v1.md) and the
 [public authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md).
-
-For example, after building the public range example independently in a
-[cvd-indicators](https://github.com/k0Iry/cvd-indicators) checkout
-(`cargo build --release -p cvd-indicator-example-range`, output
-`target/release/libcvd_indicator_example_range.so`) and copying it into the
-plugins directory, add:
-
-```toml
-[[indicators.library]]
-id = "example.range"
-path = "/plugins/libcvd_indicator_example_range.so"
-params = { length = 20 }
-enabled = true
-modes = ["source", "aggregate"]
-```
-
-To disable a configured library, set `enabled = false` **in its existing block**;
-do not append a duplicate id. Re-enable with `true`. Apply configuration changes:
-
-```bash
-docker compose restart cvd
-```
-
-**No core rebuild is needed, but the application must restart.** Directory
-watching, hot add/remove and runtime enable/disable APIs are not implemented.
-The restart briefly interrupts ingestion; PostgreSQL and the outbox volumes remain.
-Do not overwrite/truncate a loaded `.so` while the application is running. Build
-to a staging directory first, stop `cvd`, install the new library, then start it.
-Custom/private source and libraries must stay out of public Git commits and images;
-`artifacts/` is excluded from this repository and the core Docker build context.
-
-## Upgrade an existing deployment
-
-Do not replace a working database service with this fresh-install example.
-Keep your original database image/volume, credentials, Compose project name,
-external networks and reverse-proxy setup. Keep the same user/HOME if existing
-bind mounts use `${HOME}`. Old repository names do not identify the running image's
-features; inspect the deployed version and mounts before deciding what to copy.
-
-1. Back up the existing configuration/database and keep the old image for rollback.
-   Build the replacement core image and libraries **before** stopping the old service.
-2. Reuse the original DATABASE_URL. The plugin split introduces no plugin tables
-   or required historical CVD recomputation. Normal startup compatibility DDL may
-   still run; an older deployed version can differ from the split's source baseline.
-3. Inspect the application's outbox separately from the PostgreSQL volume:
-   - If the running version predates the outbox, create a new persistent application
-     directory and let the new application initialize it.
-   - If an outbox already exists, preserve its actual path and data. A missing file
-     at one guessed path is not proof that no queue exists.
-4. If it lives only in the old container, stop that application and copy the **whole
-   SQLite directory**, including any WAL/SHM files, into a fresh host directory.
-   Mount it at `/app/data`; give UID/GID 10001 write access to that application
-   directory only. Never chown PostgreSQL's data directory to the application UID.
-5. Install staged libraries and update the existing application's config/mounts.
-   Recreate **only** the application using the original Compose project:
-   `docker compose up -d --no-deps --no-build cvd`. Do not run two ingestion writers
-   against the same store. If any step fails, stop and resolve it before proceeding.
-6. Update a container-network reverse proxy to the application service's **8080**
-   port (for example `cvd:8080` on a shared Docker network). `expose: 80` does not
-   translate traffic to 8080. If the proxy runs in another stack, explicitly attach
-   the application to its existing external network; this fresh example does not.
-7. Verify `/indicators`, `/health` and the live chart before removing rollback assets.
-
-For example, **only after confirming** that a stopped old container's outbox
-is in `/app/data`, the copy operation is:
-
-```bash
-# Set OLD_CONTAINER to the confirmed old container and OUTBOX_DEST to a NEW directory.
-(
-  set -eu
-  : "${OLD_CONTAINER:?set the old container}" "${OUTBOX_DEST:?set a fresh destination}"
-  test ! -e "$OUTBOX_DEST" || { printf 'Destination already exists; refusing to overwrite.\n' >&2; exit 1; }
-  test "$(docker inspect -f '{{.State.Running}}' "$OLD_CONTAINER")" = false
-  mkdir -- "$OUTBOX_DEST"
-  docker cp "$OLD_CONTAINER:/app/data/." "$OUTBOX_DEST/"
-  test -f "$OUTBOX_DEST/outbox.sqlite"
-  sudo chown -R 10001:10001 "$OUTBOX_DEST"
-)
-```
-
-Only continue the cutover if this block succeeds. It refuses to overwrite an
-existing directory and requires the old container to be stopped.
-
-A normal restart retains a container's writable layer; deletion/recreation does not.
-Preserve the outbox mount during future updates and rollback. A version without
-outbox support will not consume a newer version's pending queue: drain it with a
-supporting version or retain it for recovery, rather than discarding it.
-Deleting an obsolete Git remote is different from deleting its old deployment
-folder, which may now contain the active Compose/config/plugin mounts.
-
-## Failure boundaries and verification policy
-
-- Runner crashes/timeouts make that indicator unavailable; they do not turn missing
-  output into zero. The runner does not own PostgreSQL persistence or ingestion.
-- Linux >=5.11 and a compatible seccomp policy are required for descriptor isolation.
-  If `close_range` is denied, spawning fails closed. Do not solve this by blindly
-  granting privileged mode or loading unknown libraries.
-- Diagnose config/path/architecture/library errors in application logs. Keep raw
-  private diagnostics private; public API errors are intentionally bounded.
-- Local tests and release builds precede any approved final CI build. The workflow
-  is manually dispatched; these deployment commands do not trigger CI or publish
-  images. Configuration validation, image construction and live acceptance are
-  separate checks, not interchangeable success claims.
+The native C-ABI runner ([plugin-api-v1.md](plugin-api-v1.md)) is historical only.
 
 ## Licenses
 
