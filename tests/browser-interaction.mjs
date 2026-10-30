@@ -72,9 +72,10 @@ function makeBar(i) {
 }
 let dataset = []
 function resetDataset() { dataset = Array.from({ length: TOTAL }, (_, i) => makeBar(i)) }
+globalThis.__dataset = () => dataset
 // assetFault: test-only fault on ONE served static asset (indicator_menu reload
 // controls): { path, delayMs } delays it, { path, status } fails it.
-const control = { beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0, assetFault: null, livePushes: 0 }
+const control = { tfGrid: false, beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0, assetFault: null, livePushes: 0 }
 
 // ------------------------------------------------------------ real indicators
 const ORACLE_WASM = (process.env.CVD_LOCAL_WASM || '').split(',').filter(Boolean)
@@ -117,6 +118,8 @@ async function historyPage(params) {
     const limit = Math.min(5000, Number(params.get('limit') || 1600))
     const before = params.has('before') ? Number(params.get('before')) : null
     const after = params.has('after') ? Number(params.get('after')) : null
+    // Coverage runs serve an aligned per-tf grid (never shared mutable state).
+    const dataset = control.tfGrid ? gridDataset(params.get('tf') || '1m') : globalThis.__dataset()
     let rows, moreBefore, moreAfter
     if (after != null) {
         const start = dataset.findIndex(b => b.time > after)
@@ -134,7 +137,7 @@ async function historyPage(params) {
     const first = rows.length ? dataset.indexOf(rows[0]) : 0
     return { series: 'spot-v1', bars: rows, has_more_before: moreBefore, has_more_after: moreAfter,
         oldest_time: rows[0]?.time ?? null, newest_time: rows.at(-1)?.time ?? null, realtime_enabled: true,
-        indicator_api_version: 1, indicators: rows.length ? await indicatorsFor(first, first + rows.length) : {} }
+        indicator_api_version: 1, indicators: rows.length ? await indicatorsFor(first, first + rows.length, dataset.slice()) : {} }
 }
 
 // ------------------------------------------------------------ test bridge
@@ -263,7 +266,7 @@ const server = http.createServer(async (req, res) => {
         return
     }
     if (url.pathname === '/history') {
-        const entry = { at: Date.now(), before: url.searchParams.get('before'), after: url.searchParams.get('after'), limit: url.searchParams.get('limit') }
+        const entry = { at: Date.now(), before: url.searchParams.get('before'), after: url.searchParams.get('after'), limit: url.searchParams.get('limit'), tf: url.searchParams.get('tf') }
         control.requests.push(entry)
         if (entry.before && control.beforeDelayMs) await new Promise(r => setTimeout(r, control.beforeDelayMs))
         entry.answeredAt = Date.now()
@@ -437,7 +440,176 @@ const setDataCount = m => (m.calls.setData || 0)
 const writeCount = m => ['setData', 'update', 'addSeries', 'addCustomSeries', 'removeSeries'].reduce((n, k) => n + (m.calls[k] || 0), 0)
 
 // ------------------------------------------------------------ scenarios
+// Warm-up coverage witnesses (core-app-gate COVERAGE inventory: run with the
+// PUBLIC context-demanding fixture `ctxdemo` imported next to cvd/flow; never
+// LEVELS). The served dataset is a per-tf grid (control.tfGrid) so 30m and
+// 5m are real, aligned, time-spaced grids. The witness is FIXED by time: the
+// initial page's oldest bar B (from the request log); everything older than B
+// in the cache arrived only as the app's own warm-up pages.
+const HAS_CTX = runners.some(r => r.descriptor.id === 'ctxdemo')
+const COVERAGE = ['warmup_exposed_drag', 'tf_roundtrip_pending']
+const TF_STEP = { '1m': 60, '5m': 300, '30m': 1800 }
+const GRID_T0 = 1_699_999_200 // aligned to 1800 s
+const gridCache = new Map()
+function gridDataset(tf) {
+    if (!gridCache.has(tf)) gridCache.set(tf, Array.from({ length: 12_000 }, (_, i) => ({ ...makeBar(i), time: GRID_T0 + i * TF_STEP[tf] })))
+    return gridCache.get(tf)
+}
+async function openFresh() {
+    resetDataset(); control.beforeDelayMs = 0; control.requests.length = 0; control.tfGrid = true
+    await call('Page.navigate', { url: `http://127.0.0.1:${PORT}/` })
+    await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
+    await ensureLocalPlugins()
+    await quiet()
+    paneBox = await evaluate(`(() => { const r = __cvd.elements.chartEl.getBoundingClientRect(); const h = __cvd.chart.panes()[0].getHeight(); return { x: r.left, y: r.top, width: r.width - 70, height: h } })()`)
+}
+// Bounded semantic settlement: no history in flight, compute idle, cache stable.
+async function quiet(ms = 1500) {
+    let last = -1, stableSince = Date.now()
+    const deadline = Date.now() + 30000
+    while (Date.now() < deadline) {
+        const s = await evaluate(`({ n: __cvd.page.bars.length, busy: __cvd.page.loadingOlder || __cvd.page.loadingNewer || !__cvd.localCompute().idle() })`)
+        if (s.busy || s.n !== last) { last = s.n; stableSince = Date.now() }
+        else if (Date.now() - stableSince > ms) { await evaluate('__cvd.settle()'); return }
+        await sleep(50)
+    }
+    throw new Error('no semantic settlement in 30s')
+}
+async function setTf(tf) {
+    await evaluate(`__cvd.elements.tfSel.value = '${tf}'; __cvd.elements.tfSel.onchange()`)
+    // Exact new-tf stride (a 5m grid also passes a 1m modulo test).
+    await waitFor(`__cvd.page.bars.length > 1 && __cvd.page.bars.every((b, i, a) => b.time % ${TF_STEP[tf]} === 0 && (i === 0 || b.time - a[i - 1].time === ${TF_STEP[tf]}))`, 30000)
+}
+// Semantic pending witness: an older/warm-up request of `tf` is in flight.
+async function waitPending(tf, timeout = 15000) {
+    const end = Date.now() + timeout
+    for (;;) {
+        const r = control.requests.find(q => q.before && q.tf === tf && q.answeredAt === undefined)
+        if (r) return { ...r }
+        if (Date.now() > end) throw new Error(`no pending ${tf} older request`)
+        await sleep(20)
+    }
+}
+// Boundary B: oldest bar of the latest initial (non-`before`) page of this tf.
+function initialBoundary(tf) {
+    const init = control.requests.filter(r => !r.before && !r.after && r.tf === tf).at(-1)
+    if (!init) throw new Error(`no initial ${tf} request`)
+    const ds = gridDataset(tf)
+    return ds[Math.max(0, ds.length - Number(init.limit || 1600))].time
+}
+// Actual plotted points (series.data()) for one output key, by time.
+const plotted = key => evaluate(`Object.fromEntries((__cvd.seriesHandle(${JSON.stringify(key)})?.data() ?? []).filter(p => Number.isFinite(p.value)).map(p => [p.time, p.value]))`)
+const near = (a, b) => typeof a === 'number' && Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(b))
+// Trusted drag exposing warm-up rows left of B; asserts on the RENDERED
+// series, store and DOM readout. Positioning failures throw (never swallowed).
+async function exposeWarmup(tf) {
+    const step = TF_STEP[tf], ds = gridDataset(tf), byTime = new Map(ds.map((b, i) => [b.time, { b, i }]))
+    const B = initialBoundary(tf)
+    const iB = await evaluate(`__cvd.page.bars.findIndex(b => b.time === ${B})`)
+    const cached0 = await evaluate('__cvd.page.bars.length')
+    if (!(iB > 400)) throw new Error(`warm-up not cached before boundary: iB=${iB} cached=${cached0}`)
+    await position(iB + 10, 300)                      // setup: requested rows only, B just offscreen left
+    const newer = await evaluate(`(() => { const out = {}; for (const b of __cvd.page.bars.slice(${iB}, ${iB + 180})) out[b.time] = ['cvd/cvd', 'flow/delta', 'ctxdemo/delta'].map(k => __cvd.value(k, 'source', b.time) ?? null); return out })()`)
+    const reqBefore = control.requests.length
+    await drag(1100, 16)                              // trusted input: expose warm-up rows (>=80 rows)
+    await quiet()
+    const r = await evaluate('__cvd.range()')
+    const bars = await evaluate(`__cvd.page.bars.map(b => b.time)`)
+    const lo = Math.max(0, Math.ceil(r.from)), hi = Math.min(bars.length - 1, Math.floor(r.to))
+    const witness = bars.slice(lo, hi + 1).filter(t => t < B)
+    const plot = { cvd: await plotted('cvd/cvd'), delta: await plotted('flow/delta') }
+    const store = await evaluate(`(() => { const o = {}; for (const t of ${JSON.stringify(witness)}) o[t] = { cvd: __cvd.value('cvd/cvd', 'source', t) ?? null, delta: __cvd.value('flow/delta', 'source', t) ?? null, total: __cvd.value('flow/total', 'source', t) ?? null, buy_sell: __cvd.value('flow/buy_sell', 'source', t) ?? null, ctx: __cvd.value('ctxdemo/delta', 'source', t) ?? null }; return o })()`)
+    const missing = { cvd_plot: [], delta_plot: [], cvd_store: [], delta_store: [], wrong: [] }
+    let fragmented = 0, fragmentedGapOk = true, validTotalOk = true
+    for (const t of witness) {
+        const { b, i } = byTime.get(t)
+        if (!(t in plot.cvd)) missing.cvd_plot.push(t); else if (!near(plot.cvd[t], b.cvd_usdt)) missing.wrong.push(['cvd', t])
+        if (!(t in plot.delta)) missing.delta_plot.push(t); else if (!near(plot.delta[t], b.delta_usdt)) missing.wrong.push(['delta', t])
+        if (store[t].cvd == null) missing.cvd_store.push(t)
+        if (store[t].delta == null) missing.delta_store.push(t)
+        if (i % 80 === 0) { fragmented++; if (store[t].total != null || store[t].buy_sell != null) fragmentedGapOk = false }
+        else if (store[t].delta != null && !near(store[t].total, b.buy_volume_usdt + b.sell_volume_usdt)) validTotalOk = false
+    }
+    const span = l => l.length ? { count: l.length, from: l[0], to: l.at(-1) } : null
+    // DOM readout of a hovered witness bar (actual pane-summary text).
+    let readout = null
+    if (witness.length) {
+        const t = witness[Math.floor(witness.length / 2)], { b } = byTime.get(t)
+        const x = await evaluate(`__cvd.chart.timeScale().timeToCoordinate(${t})`)
+        if (x == null) throw new Error('witness bar has no coordinate')
+        await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: paneBox.x + x, y: paneBox.y + paneBox.height / 2 })
+        await frames(3)
+        readout = await evaluate(`(async () => {
+            const v = new URL(document.querySelector('script[type=module][src*="app.js"]').src).search
+            const { readoutText } = await import('/js/chart.js' + v)
+            const texts = [...document.querySelectorAll('[data-pane-summary]')].map(e => e.textContent)
+            const want = { cvd: readoutText({ kind: 'line', label: 'CVD' }, ${b.cvd_usdt}), delta: readoutText({ kind: 'histogram', label: 'Delta' }, ${b.delta_usdt}),
+                total: ${(witness.length && byTime.get(t).i % 80 !== 0) ? `readoutText({ kind: 'line', label: 'Total' }, ${b.buy_volume_usdt + b.sell_volume_usdt})` : 'null'}, missing: readoutText({ kind: 'line', label: 'CVD' }, undefined) }
+            const all = texts.join(' | ')
+            return { time: ${t}, texts, want, cvd_ok: all.includes(want.cvd), delta_ok: all.includes(want.delta), total_ok: !all.includes('Total') || want.total === null || all.includes(want.total), shows_missing: all.includes(want.missing) }
+        })()`)
+        await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 5, y: 5 })
+    }
+    // Scope / leakage: every stored value is on a cached bar of THIS grid.
+    const leak = await evaluate(`(() => { const ts = new Set(__cvd.page.bars.map(b => b.time)); let foreign = 0, offGrid = 0; for (const [, col] of __cvd.localValues()) for (const t of col.keys()) { if (!ts.has(t)) foreign++; if (t % ${step}) offGrid++ } return { foreign, offGrid } })()`)
+    const newerAfter = await evaluate(`(() => { const out = {}; for (const t of ${JSON.stringify(Object.keys(newer).map(Number))}) out[t] = ['cvd/cvd', 'flow/delta', 'ctxdemo/delta'].map(k => __cvd.value(k, 'source', t) ?? null); return out })()`)
+    const newerUnchanged = Object.keys(newer).length >= 150 && JSON.stringify(newer) === JSON.stringify(newerAfter) && Object.values(newer).every(v => v[0] != null && v[1] != null)
+    // Bounded requests: settle again; offscreen warm-up must not request itself.
+    const reqAfterDrag = control.requests.length
+    await sleep(2500); await quiet()
+    const extraIdle = control.requests.length - reqAfterDrag
+    // Return right: the previously visible requested rows stay rendered.
+    for (let k = 0; k < 2; k++) await drag(-700, 12)
+    await quiet()
+    const back = await evaluate('__cvd.range()')
+    const plotBack = await plotted('cvd/cvd')
+    const backTimes = bars.slice(Math.max(0, Math.ceil(back.from)), Math.min(bars.length, Math.floor(back.to) + 1))
+    const backMissing = backTimes.filter(t => t >= B && !(t in plotBack)).length
+    return { tf, B, iB, cached0, cachedAfter: bars.length, range: r, witnessCount: witness.length, witnessSpan: span(witness),
+        missing: Object.fromEntries(Object.entries(missing).map(([k, v]) => [k, k === 'wrong' ? v.slice(0, 5) : span(v)])), wrongCount: missing.wrong.length,
+        fragmented, fragmentedGapOk, validTotalOk, readout, leak, newerUnchanged, dragRequests: reqAfterDrag - reqBefore, extraIdle, backMissing,
+        ctxPresent: witness.filter(t => store[t].ctx != null).length }
+}
+const coverageChecks = x => ({
+    witness_nonempty: x.witnessCount >= 20,
+    plotted_cvd_complete: x.missing.cvd_plot === null && x.wrongCount === 0,
+    plotted_flow_delta_complete: x.missing.delta_plot === null,
+    store_complete: x.missing.cvd_store === null && x.missing.delta_store === null,
+    readout_cvd_delta: !!x.readout && x.readout.cvd_ok && x.readout.delta_ok && x.readout.total_ok && !x.readout.shows_missing,
+    fragmented_gaps_kept: x.fragmented > 0 && x.fragmentedGapOk,
+    valid_total_correct: x.validTotalOk,
+    no_foreign_or_offgrid: x.leak.foreign === 0 && x.leak.offGrid === 0,
+    newer_values_unchanged: x.newerUnchanged,
+    bounded_requests: x.dragRequests <= 4 && x.extraIdle === 0,
+    return_right_rendered: x.backMissing === 0,
+})
 const scenarios = {
+    ...(HAS_CTX ? {
+    async warmup_exposed_drag() {
+        // User's case: 30m chart, drag left into rows that arrived as warm-up.
+        const m = await measure(async () => { await setTf('30m'); await quiet(); return await exposeWarmup('30m') })
+        return { m, checks: coverageChecks(m.extra) }
+    },
+    async tf_roundtrip_pending() {
+        // Same-fix regression: 30m -> 5m (older/warm-up request held pending)
+        // -> back to 30m, then the same 30m drag witness.
+        const m = await measure(async () => {
+            await setTf('30m'); await quiet()
+            control.beforeDelayMs = 3000
+            await setTf('5m')
+            const pending = await waitPending('5m')       // 5m warm-up witnessed in flight
+            await setTf('30m')
+            const stillPending = control.requests.some(q => q.at === pending.at && q.tf === '5m' && q.answeredAt === undefined)
+            control.beforeDelayMs = 0
+            await quiet()
+            await sleep(3200); await quiet()              // the held 5m answer lands after the switch
+            const lateAnswered = control.requests.some(q => q.at === pending.at && q.tf === '5m' && q.answeredAt !== undefined)
+            return { pending, stillPending, lateAnswered, ...(await exposeWarmup('30m')) }
+        })
+        const x = m.extra
+        return { m, checks: { pending_5m_witnessed: !!x.pending && x.stillPending, stale_answer_landed: x.lateAnswered, ...coverageChecks(x) } }
+    },
+    } : {}),
     async source_reset_new_grid() {
         // Hidden series participate in LWC's unified time axis. Exercise real
         // reloads onto different synthetic grids, not only mock series arrays.
@@ -1359,12 +1531,15 @@ try {
     // tests/local-plugins.test.mjs and tests/local-wasm-browser.mjs.
     const RETIRED = { lifecycle_fences: 'server indicator frame fences', history_coherence: 'server history/live indicator coherence', discovery_states: 'server /indicators discovery states' }
     results.retired = RETIRED
+    // A requested scenario that does not exist (e.g. coverage without the
+    // ctxdemo fixture) is a failure, never a silent skip.
+    for (const name of ONLY ?? []) if (!scenarios[name] && !RETIRED[name]) { failed = true; console.log(`${name}: MISSING (not defined in this run)`) }
     for (const [name, run] of Object.entries(scenarios)) {
         if (ONLY && !ONLY.has(name)) continue
         if (RETIRED[name]) { console.log(`${name}: RETIRED (${RETIRED[name]}; see B-browser.md)`); continue }
         const reps = []
         for (let rep = 0; rep < REPS; rep++) {
-            await openPage()
+            if (COVERAGE.includes(name)) await openFresh(); else { control.tfGrid = false; await openPage() }
             let m, checks
             try {
                 ({ m, checks } = await run())

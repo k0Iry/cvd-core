@@ -95,7 +95,11 @@ export async function runP2Cases(t) {
   // Trusted user left-pan: real mouse drags on the chart canvas (quiet source).
   const box = await evaluate(`(() => { const c = [...document.querySelectorAll('canvas')].sort((a, b) => b.width * b.height - a.width * a.height)[0].getBoundingClientRect(); return { x: c.left, y: c.top, w: c.width, h: c.height } })()`)
   let drags = 0
-  for (; drags < 60 && (await evaluate('__cvd.olderPages().length')) < 1; drags++) {
+  // A user-fetched older page lies wholly before the pre-pan oldest bar. (An
+  // already-cached warm-up page exposed by the pan is promoted into
+  // olderPages too, but it is not the user-fetched page this case needs.)
+  const userPageExpr = `__cvd.olderPages().filter(p => p.to < ${oldest0}).length`
+  for (; drags < 60 && (await evaluate(userPageExpr)) < 1; drags++) {
     const y = box.y + box.h * 0.4, x0 = box.x + box.w * 0.2, x1 = box.x + box.w * 0.9
     await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x0, y })
     await call('Input.dispatchMouseEvent', { type: 'mousePressed', x: x0, y, button: 'left', buttons: 1, clickCount: 1 })
@@ -103,7 +107,7 @@ export async function runP2Cases(t) {
     await call('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x1, y, button: 'left', buttons: 0, clickCount: 1 })
     await sleep(120)
   }
-  await waitFor('__cvd.olderPages().length >= 1', 20000)
+  await waitFor(`${userPageExpr} >= 1`, 20000)
   // Stop panning; the shared warm-up for the older page's missing prefix must
   // complete WITHOUT any live tick (quiet source).
   await waitFor(`['fixture.prefix','cvd','flow'].every(id => __cvd.compute().runtime(id).coverage === 'ready')`, 30000).catch(() => {})
@@ -120,7 +124,7 @@ export async function runP2Cases(t) {
     const times = await evaluate('__cvd.page.bars.map(b => b.time)')
     const pg = pages.at(-1)
     const fi = times.indexOf(pg.from), ti = times.indexOf(pg.to)
-    const warmupPages = beforeReqs.length - pages.length
+    const warmupPages = beforeReqs.length - pages.filter(q => q.to < oldest0).length
     const cov = await evaluate(`['fixture.prefix','cvd','flow'].map(id => __cvd.compute().runtime(id).coverage)`)
     const r = { drags, pages, beforeReqs: beforeReqs.length, warmupPages, partialFirst, last, fi, ti, cov, oldestNow: times[0], oldest0, history: control.history.length - hPan, ws: control.wsUpgrades - wsPan }
     console.log('WITNESS trusted_left_pan_older_page_shared_warmup_quiet', JSON.stringify(r))
@@ -207,7 +211,7 @@ export async function runP2Cases(t) {
     // the WHOLE requested history (tail + older page) is the new generation.
     await sleep(400)
     await evaluate(`(async () => { __cvd.page.loadingOlder = false; await __cvd.loadMoreBefore() })()`)
-    await waitFor('__cvd.olderPages().length >= 1', 20000)
+    await waitFor(`${userPageExpr} >= 1`, 20000)
     await waitFor(`__cvd.compute().runtime('fixture.prefix').coverage === 'ready'`, 30000).catch(() => {}); await quiet()
     const pg2 = await evaluate('__cvd.olderPages()'), rf = await evaluate(`__cvd.compute().runtime('fixture.prefix').lastPlan.range_from_time`)
     const rg = [...pg2.map(p => ({ from: p.from, to: p.to })), { from: rf }]

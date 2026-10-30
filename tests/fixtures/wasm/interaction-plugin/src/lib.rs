@@ -2,8 +2,8 @@
 //! interaction gate. Mirrors the public Apache-2.0 `cvd`/`flow` descriptors
 //! (ids are deliberate aliases) so the real app/Worker/render/interaction path
 //! runs from a clean core checkout. Not a product plugin; never shipped.
-#[cfg(all(feature = "cvd", feature = "flow"))]
-compile_error!("enable exactly one of `cvd` / `flow`");
+#[cfg(any(all(feature = "cvd", feature = "flow"), all(feature = "cvd", feature = "ctxdemo"), all(feature = "flow", feature = "ctxdemo")))]
+compile_error!("enable exactly one of `cvd` / `flow` / `ctxdemo`");
 #[cfg(feature = "cvd")]
 mod cvd {
 //! `cvd` — the public CVD line.
@@ -74,7 +74,7 @@ export_indicator!(Cvd);
 
 
 }
-#[cfg(feature = "flow")]
+#[cfg(any(feature = "flow", feature = "ctxdemo"))]
 mod flow {
 //! `flow` — per-bar taker flow, two alternative views in one `flow` pane.
 //!
@@ -95,7 +95,19 @@ mod flow {
 use cvd_indicator_sdk::*;
 use std::collections::BTreeMap;
 
+#[cfg(feature = "flow")]
 pub const ID: &str = "flow";
+#[cfg(feature = "flow")]
+const NAME: &str = "TEST-ONLY Flow alias fixture";
+#[cfg(feature = "flow")]
+const CONTEXT_BARS: u32 = 0;
+// Coverage variant: same public algorithm, distinct id, declared warm-up.
+#[cfg(feature = "ctxdemo")]
+pub const ID: &str = "ctxdemo";
+#[cfg(feature = "ctxdemo")]
+const NAME: &str = "TEST-ONLY public context-demand fixture";
+#[cfg(feature = "ctxdemo")]
+const CONTEXT_BARS: u32 = 2000;
 pub const DELTA: &str = "delta";
 pub const BUY_SELL: &str = "buy_sell";
 pub const TOTAL: &str = "total";
@@ -134,12 +146,12 @@ impl Indicator for Flow {
         Descriptor {
             id: ID.into(),
             version: "0.0.0-test".into(),
-            name: "TEST-ONLY Flow alias fixture".into(),
+            name: NAME.into(),
             description:
                 "Per-bar Delta, or Buy/Sell nominal taker quote turnover (no FX conversion)".into(),
             abi: abi::ABI_VERSION,
             context: ContextSpec {
-                bars: 0,
+                bars: CONTEXT_BARS,
                 per_tf: Default::default(),
             },
             params: vec![],

@@ -5,8 +5,8 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-6"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-6"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-7"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-7"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -798,6 +798,9 @@ function noteDataChanged(kind = "history") {
     const scopeKey = JSON.stringify(scope)
     // A scope change clears the accepted values in Rust (view.clear via onView).
     localScopeKey = scopeKey
+    publishLocalDemand(scope, scopeKey)
+}
+function publishLocalDemand(scope = scopeNow(), scopeKey = JSON.stringify(scope)) {
     if (!localCompute) return
     localCompute.setDemand({ scope, scopeKey, revision: dataRevision, historyRevision, bars: page.bars,
         invalidTimes: [...invalidPoison.keys()].sort((a, b) => a - b),
@@ -816,6 +819,20 @@ let localRequestedFrom = null
 // right end; previously computed newer pages are never re-anchored.
 let localOlderPages = []
 let warmupPrepending = false
+// Warm-up pages ([from, to] times) fetched as context only. Once the user's
+// view exposes one, it becomes a requested older page with its own producer
+// basis (exactly what a user-driven fetch of it would have been), so valid
+// cached candles never stay blank merely because they arrived as warm-up.
+let localWarmupPages = []
+function promoteExposedWarmup(fromIndex) {
+    if (!localWarmupPages.length || !page.bars.length) return
+    const t = page.bars[Math.max(0, Math.min(page.bars.length - 1, Math.floor(fromIndex)))].time
+    const exposed = localWarmupPages.filter(p => p.to >= t)
+    if (!exposed.length) return
+    localWarmupPages = localWarmupPages.filter(p => p.to < t)
+    localOlderPages.push(...exposed)
+    publishLocalDemand()
+}
 function canonicalRequestedRange(bars) {
     const n = bars.length
     if (!n) return { wantFromIndex: 0, wantToIndex: 0, olderRanges: [] }
@@ -2107,6 +2124,7 @@ async function loadInitial() {
     initialViewportPending = true
     localRequestedFrom = (data.bars || [])[0]?.time ?? null
     localOlderPages = []
+    localWarmupPages = []
     applyHistoryPage({ ...data, bars: mergeHistoryBars(data.bars || []) }, null, data.bars || [])
 }
 
@@ -2175,12 +2193,13 @@ async function loadMoreBefore() {
         // A user-driven older page extends the canonical requested range; a
         // warm-up page only supplies context (old server basis: context rows
         // are not part of the requested page).
-        if (!forWarmup && newBars.length) localOlderPages.push({ from: newBars[0].time, to: newBars.at(-1).time })
+        if (newBars.length) (forWarmup ? localWarmupPages : localOlderPages).push({ from: newBars[0].time, to: newBars.at(-1).time })
 
         // setMergedBars reanchors the current range by timestamp (no pre-shift)
         const reachedEnd = page.reachedEnd
         applyHistoryPage({ ...data, bars: merged }, currentChartRange(), older)
         page.reachedEnd = reachedEnd
+        if (forWarmup) { const r = chart.timeScale().getVisibleLogicalRange(); if (r) promoteExposedWarmup(r.from) }
     } catch (error) { reportHistoryError(error) }
     finally { if (generation === historyGeneration) page.loadingOlder = false }
 }
@@ -2213,6 +2232,7 @@ chart.timeScale().subscribeVisibleLogicalRangeChange(r => {
     if (programmaticRangeChange) return
     if (!r || !page.bars.length) return
     refreshRenderWindow(r)
+    promoteExposedWarmup(r.from)
 
     if (r.from <= CONFIG.EDGE_TRIGGER) loadMoreBefore()
 

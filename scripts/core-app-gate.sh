@@ -10,7 +10,7 @@
 # the assembled static tree, Docker context or any Release.
 # Exit 0 only when every build step ran, the assembled tree carries exactly the
 # two trusted wasm, and every scenario in the inventory completed.
-# CORE_APP_GATE_INJECT=<build|assemble|interaction|inventory|lwcrender> forces that step
+# CORE_APP_GATE_INJECT=<build|assemble|interaction|inventory|coverage|lwcrender> forces that step
 # to fail (control: omitted required work can never return zero).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); REPS=${2:-1}
@@ -23,8 +23,8 @@ for v in $(env | sed -n 's/^\(CVD_[A-Z_]*\)=.*/\1/p'); do
 done
 unset CARGO_TARGET_DIR
 inject() { if [ "${CORE_APP_GATE_INJECT:-}" = "$1" ]; then echo "injected failure: $1" >&2; exit 1; fi; }
-T=$OUT/target; FX=$OUT/fixtures; ST=$OUT/static; RES=$OUT/interaction
-rm -rf "$FX" "$ST" "$RES"; mkdir -p "$FX"
+T=$OUT/target; FX=$OUT/fixtures; ST=$OUT/static; RES=$OUT/interaction; COV=$OUT/coverage
+rm -rf "$FX" "$ST" "$RES" "$COV"; mkdir -p "$FX"
 echo "== build trusted host + coordinator wasm from source"
 inject build
 echo "== acquire locked deps of root + standalone workspaces (network; honours CARGO_NET_OFFLINE)"
@@ -33,8 +33,8 @@ cargo build --offline --locked --target-dir "$T/host" --profile wasm-release --t
 ( cd crates/browser-coordinator && cargo build --offline --locked --release --target wasm32-unknown-unknown --target-dir "$T/coordinator" )
 HOST=$T/host/wasm32-unknown-unknown/wasm-release/cvd_browser_host.wasm
 COORD=$T/coordinator/wasm32-unknown-unknown/release/cvd_browser_coordinator.wasm
-echo "== build TEST-ONLY cvd/flow alias fixtures"
-for f in cvd flow; do
+echo "== build TEST-ONLY cvd/flow alias fixtures + ctxdemo warm-up coverage fixture"
+for f in cvd flow ctxdemo; do
   ( cd tests/fixtures/wasm/interaction-plugin && cargo build --offline --locked --release --target wasm32-unknown-unknown --features "$f" --target-dir "$T/fixture-$f" )
   cp "$T/fixture-$f/wasm32-unknown-unknown/release/interaction_fixture.wasm" "$FX/cvd_indicator_$f.wasm"
 done
@@ -44,7 +44,7 @@ sh scripts/assemble-static.sh static "$HOST" "$COORD" "$ST"
 got=$(cd "$ST" && find . -name '*.wasm' | sort | tr '\n' ' ')
 [ "$got" = "./wasm-host/cvd_browser_coordinator.wasm ./wasm-host/cvd_browser_host.wasm " ] || { echo "FAIL assembled wasm set: $got"; exit 1; }
 test -s "$ST/wasm-host/assets.json"
-sha256sum "$HOST" "$COORD" "$FX"/*.wasm | tee "$OUT/artifact-hashes.txt"
+sha256sum "$HOST" "$COORD" "$FX"/*.wasm "$ST/js/app.js" | tee "$OUT/artifact-hashes.txt"
 echo "== real Chromium app interaction (clean-core fixtures)"
 inject interaction
 CVD_STATIC_ROOT=$ST CVD_LOCAL_WASM=$FX/cvd_indicator_cvd.wasm,$FX/cvd_indicator_flow.wasm \
@@ -60,6 +60,20 @@ if(!want.length||want.join()!==got.join()){console.error('FAIL inventory want',w
 const bad=got.filter(k=>{const s=r.scenarios[k];return s.all_ok!==true});
 if(bad.length||(r.errors&&r.errors.length)){console.error('FAIL scenarios',bad,r.errors);process.exit(1)}
 console.log('INVENTORY',got.length,'scenarios:',got.join(','))"
+echo "== warm-up coverage (cvd+flow+ctxdemo; 30m drag + same-fix TF roundtrip)"
+inject coverage
+# Separate run so the 12-scenario inventory keeps its 2-plugin expectations.
+# Pinned coverage inventory (2); omission/rename/failure is nonzero.
+covwant=tf_roundtrip_pending,warmup_exposed_drag
+CVD_STATIC_ROOT=$ST CVD_LOCAL_WASM=$FX/cvd_indicator_cvd.wasm,$FX/cvd_indicator_flow.wasm,$FX/cvd_indicator_ctxdemo.wasm \
+  CVD_SCENARIOS=$covwant CVD_INTERACTION_OUT=$COV CVD_REPS=$REPS timeout 1200 node tests/browser-interaction.mjs
+node -e "
+const r=JSON.parse(require('fs').readFileSync('$COV/interaction-results.json','utf8'));
+const want='$covwant'.split(',');const got=Object.keys(r.scenarios).sort();
+if(want.join()!==got.join()){console.error('FAIL coverage inventory want',want,'got',got);process.exit(1)}
+const bad=got.filter(k=>r.scenarios[k].all_ok!==true);
+if(bad.length||(r.errors&&r.errors.length)||!r.cleanup||r.cleanup.ok!==true){console.error('FAIL coverage',bad,r.errors,r.cleanup);process.exit(1)}
+console.log('COVERAGE INVENTORY',got.length,'scenarios:',got.join(','))"
 echo "== real-LWC plugin renderer regression (assembled static tree)"
 inject lwcrender
 # Exactly 4 renderer kinds must PASS; nonzero exit propagates via set -e.

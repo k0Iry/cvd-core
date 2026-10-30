@@ -16,6 +16,10 @@ crate-type = ["cdylib", "rlib"]
 # Exactly one must be enabled per build.
 cvd = []
 flow = []
+# PUBLIC context-demanding coverage fixture: the `flow` algorithm under id
+# `ctxdemo` declaring 2000 bars of warm-up context, so the app prepends
+# warm-up pages (core-app-gate warm-up coverage inventory).
+ctxdemo = []
 
 [dependencies]
 cvd-indicator-sdk = { path = "../../../../crates/indicator-sdk" }
