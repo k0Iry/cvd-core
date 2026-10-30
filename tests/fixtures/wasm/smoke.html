@@ -1,0 +1,179 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cvd-wasm host smoke</title>
+<script type="module">
+import { WasmPluginHost } from '/static/wasm-host/host-bridge.js'
+const get = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer())
+const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+const r = { steps: [], live: [] }
+const step = (name, ok, detail) => r.steps.push({ name, ok: !!ok, detail })
+async function expectErr (name, p, code) {
+  try { await p; step(name, false, 'resolved') } catch (e) { step(name, e.code === code, `${e.code}: ${e.message}`) }
+}
+const clean = (h) => { const s = h.stats(); return s.waiters === 0 && s.timers === 0 && s.pending === 0 }
+const KEY = 'binance:spot:BTCUSDT:1m:source'
+try {
+  const hostWasm = await get('/artifacts/cvd_browser_host.wasm')
+  await expectErr('limits.nan_rejected', WasmPluginHost.create(hostWasm, { limits: { compute_ms: NaN } }), 'bad_limits')
+  await expectErr('limits.negative_rejected', WasmPluginHost.create(hostWasm, { limits: { compile_ms: -1 } }), 'bad_limits')
+  const host = await WasmPluginHost.create(hostWasm, { limits: { compute_ms: 1500 } })
+  const request = await (await fetch('/fixtures/request.json')).text()
+  const sample = await get('/artifacts/sample_indicator.wasm')
+
+  // #2 validation runs in a terminable Worker; main thread stays responsive.
+  const rep = await host.validateModule(sample)
+  step('validate.worker_report', rep.max_pages <= 8192 && rep.table && rep.table[1] <= 65536, rep)
+  const big = new Uint8Array(15 << 20); big.set([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 0, 0xf0, 0xff, 0xbf, 0x07], 0) // custom section ~15 MiB
+  let maxGap = 0; let last = performance.now()
+  const iv = setInterval(() => { const t = performance.now(); maxGap = Math.max(maxGap, t - last); last = t }, 5)
+  await expectErr('validate.big_rejected_in_worker', host.validateModule(big), 'malformed_module')
+  clearInterval(iv)
+  step('validate.main_thread_responsive', maxGap < 250, Math.round(maxGap) + ' ms max event-loop gap')
+  step('validate.no_residue', clean(host) && host.instances.size === 0, host.stats())
+
+  const a = await host.load(1, sample, '{"length":14}')
+  step('sample.load', a.descriptor.id === 'sample.channel', a.descriptor.id)
+  r.output = await host.compute(1, KEY, 42, 1, request)
+  step('sample.history', true, r.output.length)
+
+  for (const [name, code] of await (await fetch('/fixtures/hostile/index.json')).json()) {
+    await expectErr('module.' + name, host.load(100, await get(`/fixtures/hostile/${name}.wasm`)), code)
+  }
+  step('module.no_residue', !host.instances.has(100) && clean(host), host.stats())
+  await expectErr('params.cap_host_enforced', host.load(101, sample, '"' + 'x'.repeat(70000) + '"'), 'input_too_large')
+
+  const hostile = await get('/artifacts/hostile_wasm_plugin.wasm')
+  const hreq = JSON.stringify({ scope: { exchange: 'x', market: 'spot', symbol: 's', tf: '1m', mode: 'source' }, revision: 1, output_from: 0, bars: [] })
+  const cases = [['loop', 'deadline'], ['trap', 'trap'], ['badptr', 'invalid_output_region'], ['hugelen', 'invalid_output_region'], ['badout', 'invalid_output']]
+  let i = 200
+  for (const [mode, code] of cases) {
+    const id = i++
+    await host.load(id, hostile, JSON.stringify({ mode }))
+    const t0 = performance.now()
+    await expectErr('hostile.' + mode, host.compute(id, 'k', 1, 1, hreq), code)
+    r.steps[r.steps.length - 1].ms = Math.round(performance.now() - t0)
+    step('hostile.' + mode + '.instance_gone', !host.instances.has(id), host.instances.size)
+  }
+  // #5 copy-before-dealloc: dealloc clobbers the (now expired) result slot.
+  await host.load(300, hostile, '{"mode":"clobber"}')
+  try { const o = await host.compute(300, 'k', 1, 1, hreq); step('abi.copy_before_dealloc', JSON.parse(o).times.length === 0, o) } catch (e) { step('abi.copy_before_dealloc', false, `${e.code}: ${e.message}`) }
+  // #1 low bounded memory-grow control (fixture built with 4 MiB max).
+  await host.load(301, hostile, '{"mode":"grow"}')
+  try { await host.compute(301, 'k', 1, 1, hreq); step('memory.grow_capped_by_declared_max', true, 'grow refused at declared max') } catch (e) { step('memory.grow_capped_by_declared_max', false, `${e.code}: ${e.message}`) }
+
+  const again = await host.compute(1, KEY, 42, 1, request)
+  step('sample.after_faults_identical', again === r.output, again.length)
+
+  // #3 identity/kind: hostile frames injected while a valid compute is pending.
+  const rec1 = host.instances.get(1)
+  const p = host.compute(1, KEY, 42, 1, request)
+  const pid = [...host.waiters.keys()].pop()
+  const d0 = host.stats().dropped
+  const frames = [null, 7, { id: 'x' }, { type: 'result', id: pid, instance: 1, generation: a.generation, revision: 42, output: '{}' },
+    { type: 'result', id: pid, instance: 1, generation: a.generation, scopeKey: null, revision: 42, output: '{}' },
+    { type: 'loaded', id: pid, instance: 1, generation: a.generation, scopeKey: KEY, revision: 42 },
+    { type: 'result', id: pid, instance: 1, generation: a.generation, scopeKey: KEY, revision: 41, output: '{}' },
+    { type: 'result', id: pid, instance: 1, generation: a.generation + 1, scopeKey: KEY, revision: 42, output: '{}' },
+    { type: 'result', id: 999999, instance: 1, generation: a.generation, scopeKey: KEY, revision: 42, output: '{}' }]
+  let threw = false
+  for (const f of frames) { try { host._onMessage(rec1, 1, f) } catch (_) { threw = true } }
+  host._onMessage({ worker: null }, 1, { type: 'result', id: pid, instance: 1, generation: a.generation, scopeKey: KEY, revision: 42, output: '{}' }) // cross-worker
+  step('fence.bad_frames_dropped_no_throw', !threw && host.stats().dropped === d0 + frames.length + 1, host.stats())
+  const pv = await p
+  step('fence.valid_waiter_survives', pv === r.output, pv.length)
+
+  // #4 busy / supersede / incarnation-bound callbacks / disable during load / load failure.
+  const b1 = host.compute(1, KEY, 42, 1, request)
+  await expectErr('lifecycle.overlap_busy', host.compute(1, KEY, 42, 1, request), 'busy')
+  await b1
+  const old = host.compute(1, 'old-scope', 1, 1, request)
+  const n = host.supersede(1, KEY, 43)
+  await expectErr('supersede.rejects_immediately', old, 'superseded')
+  step('supersede.cleared', n === 1 && clean(host), host.stats())
+  step('supersede.inflight_retires_instance', !host.instances.has(1), host.stats())
+  await host.load(1, sample, '{"length":14}') // required reload after in-flight cancellation
+  await sleep(1500 + 400) // beyond the old request's deadline
+  const after = await host.compute(1, KEY, 43, 1, request).catch(e => e)
+  step('supersede.reloaded_work_survives_old_deadline', after === r.output && host.instances.has(1), typeof after === 'string' ? after.length : after.code)
+  await host.load(5, sample, '{"length":14}')
+  const rec5 = host.instances.get(5)
+  await host.load(5, sample, '{"length":14}') // replacement incarnation
+  rec5.worker.onerror({}) // late callback from the old incarnation
+  const r5 = await host.compute(5, KEY, 42, 1, request).catch(e => e)
+  step('incarnation.old_onerror_cannot_kill_replacement', r5 === r.output, typeof r5 === 'string' ? 'ok' : r5.code)
+  const lp = host.load(6, sample, '{"length":14}')
+  host.disable(6)
+  await expectErr('disable.during_load', lp, 'disabled')
+  await expectErr('load.plugin_param_error', host.load(7, sample, '{"length":99999}'), 'plugin_error')
+  step('load.failure_zero_residue', !host.instances.has(7) && !host.instances.has(6), host.stats())
+
+  // #6 REAL op2/op3 live session beyond the retention cap vs native oracle.
+  const script = await (await fetch('/fixtures/live-script.json')).json()
+  await host.load(2, sample, script.params)
+  let liveOk = 0; let liveBad = []
+  for (const [k, s] of script.steps.entries()) {
+    try {
+      const o = await host.compute(2, script.scope_key, script.revision, s.op, s.body)
+      if (s.ok !== undefined && o === s.ok) liveOk++; else liveBad.push(`${k}: unexpected ok`)
+    } catch (e) { if (s.err === e.code) liveOk++; else liveBad.push(`${k}: ${e.code} ${e.message}`) }
+  }
+  step('live.op2_op3_native_identical', liveBad.length === 0 && host.instances.has(2), { steps: script.steps.length, ok: liveOk, bad: liveBad.slice(0, 5) })
+
+  // ITEM 8: stateless fresh History vs persistent Live (mutable-state fixture), interleaved.
+  const ss = await (await fetch('/fixtures/stateful-script.json')).json()
+  const stateful = await get('/artifacts/stateful_indicator.wasm')
+  await host.load(400, stateful, ss.params)
+  const sBad = []
+  for (const [k, s] of ss.steps.entries()) {
+    try { const o = await host.compute(400, ss.scope_key, ss.revision, s.op, s.body); if (o !== s.ok) sBad.push(`${k}/op${s.op}: ${o.slice(0, 80)} != ${s.ok.slice(0, 80)}`) } catch (e) { sBad.push(`${k}: ${e.code} ${e.message}`) }
+  }
+  step('item8.history_fresh_live_persistent_native_identical', sBad.length === 0, { steps: ss.steps.length, bad: sBad.slice(0, 4) })
+  host.disable(400)
+
+  // REV3: supersede of IN-FLIGHT work physically terminates that worker; NO later compute is scheduled.
+  await host.load(401, hostile, '{"mode":"loop"}')
+  const rec401 = host.instances.get(401)
+  try {
+    const lp401 = host.compute(401, 'k', 1, 1, hreq)
+    await sleep(50) // the Worker is now spinning inside cvd_invoke
+    const nsup = host.supersede(401, 'k', 2)
+    await expectErr('cancel.inflight_superseded', lp401, 'superseded')
+    step('cancel.worker_terminated_immediately', nsup === 1 && !host.instances.has(401) && clean(host), host.stats())
+    await sleep(1500 + 500) // beyond the original deadline, with no new work
+    let alive = false; rec401.worker.onmessage = () => { alive = true }
+    try { rec401.worker.postMessage({ type: 'compute', id: -1 }) } catch (_) {}
+    await sleep(200)
+    step('cancel.no_residue_after_deadline', !alive && !host.instances.has(401) && clean(host) && host.stats().live === host.instances.size, host.stats())
+    await expectErr('cancel.requires_reload', host.compute(401, 'k', 2, 1, hreq), 'stale')
+    await host.load(401, sample, '{"length":14}')
+    const ok401 = await host.compute(401, KEY, 42, 1, request)
+    step('cancel.reload_healthy', ok401 === r.output, ok401.length)
+  } finally { host.disable(401) }
+  // Idle supersede (nothing in flight) is harmless: instance kept.
+  await host.load(402, sample, '{"length":14}')
+  step('cancel.idle_supersede_keeps_instance', host.supersede(402, KEY, 44) === 0 && host.instances.has(402), host.stats())
+  host.disable(402)
+
+  // REV3: every load failure after spawn retires exactly its worker.
+  const realFence = host._fence.bind(host)
+  host._fence = (c) => { if (c.cmd === 'issue') throw Object.assign(new Error('quota'), { code: 'too_many_pending' }); return realFence(c) }
+  try { await expectErr('loadfail.admission', host.load(410, sample, '{"length":14}'), 'too_many_pending') } finally { host._fence = realFence }
+  const RW = self.Worker
+  self.Worker = function () { throw new Error('ctor boom') }
+  try { await expectErr('loadfail.worker_ctor', host.load(411, sample, '{"length":14}'), 'worker_failed') } finally { self.Worker = RW }
+  const RP = Worker.prototype.postMessage
+  Worker.prototype.postMessage = function () { throw new Error('post boom') }
+  try { await expectErr('loadfail.post_message', host.load(412, sample, '{"length":14}'), 'post_failed') } finally { Worker.prototype.postMessage = RP }
+  const st = host.stats()
+  step('loadfail.zero_residue', ![410, 411, 412].some(i => host.instances.has(i)) && clean(host) && st.live === host.instances.size, st)
+  const survivor = await host.compute(1, KEY, 43, 1, request).catch(e => e)
+  step('loadfail.others_survive', survivor === r.output && host.instances.has(2), typeof survivor === 'string' ? 'ok' : survivor.code)
+
+  const dp = host.compute(1, KEY, 43, 1, request)
+  host.disable(1)
+  await expectErr('disable.pending_rejected', dp, 'disabled')
+  for (const id of [...host.instances.keys()]) host.disable(id)
+  step('final.zero_residue', host.instances.size === 0 && clean(host), host.stats())
+} catch (e) { step('fatal', false, `${e.code}: ${e.message} ${e.stack}`) }
+window.__smoke = r
+</script>

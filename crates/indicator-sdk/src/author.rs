@@ -81,7 +81,9 @@ pub struct Instance<T: Indicator> {
     live: Option<LiveState>,
 }
 
-fn check_bars(bars: &[InputBar]) -> Result<(), PluginError> {
+/// Canonical bar admission (strictly increasing positive times, finite
+/// values). Public so the browser host applies the identical rule.
+pub fn check_bars(bars: &[InputBar]) -> Result<(), PluginError> {
     if bars.windows(2).any(|w| w[0].time >= w[1].time) {
         return Err(PluginError::invalid_input("bar times must be strictly increasing"));
     }
@@ -347,6 +349,20 @@ pub unsafe extern "C" fn free_buffer(buf: CvdBuffer) {
 /// ```
 #[macro_export]
 macro_rules! export_indicator {
+    ($ty:ty) => {
+        #[cfg(target_arch = "wasm32")]
+        $crate::export_wasm_indicator!($ty);
+        #[cfg(not(target_arch = "wasm32"))]
+        $crate::export_native_indicator!($ty);
+    };
+}
+
+/// Native C ABI v1 entry (`cvd_plugin_entry_v1`): the numerical-oracle path
+/// kept until the server runner is retired. Wasm32 uses
+/// [`crate::export_wasm_indicator!`] instead.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! export_native_indicator {
     ($ty:ty) => {
         #[doc(hidden)]
         static __CVD_PLUGIN_API_V1: $crate::abi::CvdPluginApiV1 = $crate::abi::CvdPluginApiV1 {

@@ -9,3 +9,5 @@
 *.dylib
 *.dll
 /reports/
+/static/wasm-host/*.wasm
+/crates/browser-coordinator/target

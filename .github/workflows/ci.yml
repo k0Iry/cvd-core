@@ -9,19 +9,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Rust toolchain
-        run: rustup show
-      - name: Rust workspace (real runner tests, no external DB/feed)
+        run: rustup show && rustup target add wasm32-unknown-unknown
+      - name: Rust workspace + wasm foundation gate (host-owned public fixtures, real Chromium)
         shell: bash
         run: |
           set +e
-          cargo test --locked --workspace -- --test-threads=1 > "$RUNNER_TEMP/cvd-tests.log" 2>&1
+          CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" bash scripts/wasm-foundation-gate.sh "$RUNNER_TEMP/wasm-gate" > "$RUNNER_TEMP/cvd-tests.log" 2>&1
           result=$?
           cat "$RUNNER_TEMP/cvd-tests.log"
           if [ "$result" -ne 0 ]; then
@@ -36,6 +36,46 @@ jobs:
           fi
           exit "$result"
       - name: Frontend unit contracts
-        run: node --test tests/*.test.cjs static/js/*.test.cjs
+        run: node --test tests/*.test.cjs tests/*.test.mjs static/js/*.test.cjs
+      - name: Owned process-group + output-path cleanup controls
+        run: bash tests/owned-group-control.sh && bash tests/out-guard-control.sh
+      - name: Self-contained core app interaction (own host/coordinator/TEST-ONLY fixture wasm, real Chromium)
+        shell: bash
+        run: |
+          CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" TMPDIR="$RUNNER_TEMP" \
+            bash scripts/core-app-gate.sh "$RUNNER_TEMP/core-app" 1
       - name: Public-only container build
         run: docker build --tag cvd-core:ci .
+      - name: Runnable image smoke (synthetic, no DB credentials, no plugins)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Image contents: two trusted wasm only, no runner/native libs/plugin wasm.
+          docker run --rm --entrypoint sh cvd-core:ci -c '
+            set -e; id -u | grep -qx 10001
+            test ! -e /usr/local/bin/cvd-indicator-runner
+            test -z "$(find / -xdev \( -name "*.so" -path "*/app/*" \) 2>/dev/null)"
+            n=$(find /app/static -name "*.wasm" | sort | tr "\n" " ")
+            test "$n" = "/app/static/wasm-host/cvd_browser_coordinator.wasm /app/static/wasm-host/cvd_browser_host.wasm "
+            cat /app/static/wasm-host/assets.json
+            touch /app/data/.w && rm /app/data/.w'
+          # Start against a disposable postgres with synthetic data only.
+          docker network create cvdsmoke
+          docker run -d --name pg --network cvdsmoke -e POSTGRES_USER=cvdadmin -e POSTGRES_DB=cvd -e POSTGRES_PASSWORD=smoke postgres:16
+          for i in $(seq 60); do docker exec pg pg_isready -U cvdadmin -d cvd && break; sleep 1; done
+          # Legacy [indicators] config must be accepted, ignored and reported.
+          printf '[server]\nhttp_addr="0.0.0.0:8080"\nstatic_dir="/app/static"\n[indicators]\nrunner="/usr/local/bin/cvd-indicator-runner"\n[[indicators.library]]\nid="cvd"\npath="/plugins/libcvd_indicator_cvd.so"\n' > "$RUNNER_TEMP/legacy.toml"
+          docker run -d --name cvd --network cvdsmoke -p 127.0.0.1:18080:8080 \
+            -v "$RUNNER_TEMP/legacy.toml:/app/config.toml:ro" \
+            -e DATABASE_URL=postgres://cvdadmin:smoke@pg:5432/cvd cvd-core:ci
+          for i in $(seq 60); do curl -fsS http://127.0.0.1:18080/meta >/dev/null && break; sleep 1; done
+          docker logs cvd 2>&1 | grep -q "config \[indicators\] is retired and IGNORED"
+          docker logs cvd 2>&1 | grep -q "ignored retired indicator library id=cvd"
+          curl -fsS http://127.0.0.1:18080/ | grep -qi "<html"
+          curl -fsS http://127.0.0.1:18080/meta | python3 -c 'import json,sys; m=json.load(sys.stdin); assert "indicators" not in m and m["instruments"]'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/indicators)" = 404
+          curl -fsS 'http://127.0.0.1:18080/history?exchange=binance&market=spot&symbol=BTC&tf=1m&series=spot-v1&limit=5' | python3 -c 'import json,sys; h=json.load(sys.stdin); assert "indicators" not in h and isinstance(h["invalid_times"], list)'
+          # Served assets: exact manifest, wasm bytes+sha256, JS module MIME.
+          bash scripts/verify-served-assets.sh http://127.0.0.1:18080
+          docker exec cvd test -s /app/data/outbox.sqlite
+          docker rm -f cvd pg; docker network rm cvdsmoke

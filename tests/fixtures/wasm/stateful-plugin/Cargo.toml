@@ -1,0 +1,14 @@
+[package]
+license.workspace = true
+rust-version.workspace = true
+name = "stateful-indicator"
+description = "Safe mutable-state cvd fixture (test only): exposes instance reuse across History/Live"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cvd-indicator-sdk = { path = "../../../../crates/indicator-sdk" }

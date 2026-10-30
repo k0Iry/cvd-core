@@ -1,3 +1,8 @@
+> **RETIRED (server native runner).** The server no longer loads plugins and no
+> `cvd-indicator-runner` ships. The normative contract is
+> [`plugin-wasm-v1.md`](plugin-wasm-v1.md); this file is kept only as historical
+> reference for the SDK's shared data model.
+
 # CVD indicator plugin API v1
 
 Status: **frozen for v1** (ABI_VERSION = 1, PROTOCOL_VERSION = 1). Changes go

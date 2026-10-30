@@ -1,15 +1,19 @@
-import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=indicator-menu-2"
-import { elements } from "./dom.js?v=indicator-menu-2"
+import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=local-wasm-1"
+import { elements } from "./dom.js?v=local-wasm-1"
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=indicator-menu-2"
-import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=indicator-menu-2"
-import { DISCOVERY_PATH, historyResults, parseDiscovery, parseIndicatorFrame } from "./plugin-wire.mjs?v=indicator-menu-2"
-import { createIndicatorStore } from "./plugin-store.mjs?v=indicator-menu-2"
-import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=indicator-menu-2"
-import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=indicator-menu-2"
-import { createOutputRenderer } from "./plugin-render.mjs?v=indicator-menu-2"
-import { createIndicatorMenu } from "./indicator-menu.mjs?v=indicator-menu-2"
+import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=local-wasm-1"
+import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=local-wasm-1"
+import { parseIndicatorFrame, seriesValueAt } from "./plugin-wire.mjs?v=local-wasm-1"
+import { openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, sanitizeParams, validRecord, parseParamInput, contextBars } from "./local-plugins.mjs?v=local-wasm-1"
+import { createLocalCompute } from "./local-compute.mjs?v=local-wasm-1"
+import { createCoordinator } from "./coordinator.mjs?v=local-wasm-1"
+import { WasmPluginHost } from "/wasm-host/host-bridge.js?v=local-wasm-1"
+import { createIndicatorStore } from "./plugin-store.mjs?v=local-wasm-1"
+import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=local-wasm-1"
+import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=local-wasm-1"
+import { createOutputRenderer } from "./plugin-render.mjs?v=local-wasm-1"
+import { createIndicatorMenu } from "./indicator-menu.mjs?v=local-wasm-1"
 
 const {
     exchangeSel,
@@ -283,7 +287,6 @@ const backboneSeries = chart.addSeries(LightweightCharts.LineSeries, {
 // ------------------------------------------------------------ indicator plugins
 let registry = buildRegistry([])
 let renderers = new Map()          // output key -> renderer
-let pluginStatus = {}              // "<id>:<mode>" -> { state: "error", code } from history/live results
 let pluginPrefs = { enabled: {}, modes: {} }
 let discoveryError = ""
 let paneSummaryEls = []
@@ -291,7 +294,12 @@ let pluginLayoutGeneration = 0
 const indicatorStore = createIndicatorStore()
 const currentMode = () => useAggregateMode() ? "aggregate" : "source"
 // Renderers read results by canonical bar time; base bars are never modified.
-const storeValue = (bar, key, aggregate) => bar ? indicatorStore.get(key, aggregate ? "aggregate" : "source", bar.time) : undefined
+// Browser-computed results ONLY (server indicator outputs are ignored):
+// `${outputKey}|${mode}` -> Map(time -> value), replaced atomically per
+// accepted (scope, data revision) compute of that plugin.
+let localValues = new Map()
+let localLive = new Map()   // live (op2/op3) values overlaying stateless History
+const storeValue = (bar, key, aggregate) => bar ? localValues.get(`${key}|${aggregate ? "aggregate" : "source"}`)?.get(bar.time) : undefined
 // Newest live base WS `rev` per bar lives in the store, scoped to the
 // connection epoch and pruned only with the canonical cache (no LRU): a value
 // is current only if its as_of_rev >= that rev, otherwise pending.
@@ -313,13 +321,14 @@ function sanitizePluginPrefs(raw) {
 }
 
 function pluginEnabled(plugin) {
-    return Object.hasOwn(pluginPrefs.enabled, plugin.id) ? pluginPrefs.enabled[plugin.id] : plugin.defaultEnabled
+    return localRecords.get(plugin.id)?.enabled === true
 }
 
 // Latest result status for the current mode (history page or live frame).
 // Any fault clears and labels the outputs; nothing stale stays drawn.
 function pluginFault(plugin) {
-    return pluginStatus[`${plugin.id}:${currentMode()}`] ?? null
+    const fault = localCompute?.fault(plugin.id)
+    return fault ? { state: "fault", code: fault.code } : (localErrors.get(plugin.id) ?? null)
 }
 
 function faultText(fault) {
@@ -372,42 +381,390 @@ function applyPluginDescriptors(entries, error = "") {
     return true
 }
 
-// Discovery: once at startup, then a bounded backoff refresh while any
-// configured indicator is still starting/unavailable, or when a live event
-// names an indicator we do not have ready. Never permanent invisibility.
-const DISCOVERY_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000]
-let discoveryAttempt = 0
-let discoveryTimer = null
-let discoveryInFlight = null
+// ------------------------------------------------- local WASM plugin packages
+// Only locally imported, validated packages (IndexedDB, this browser only)
+// have rows. Nothing is uploaded; there is no server discovery or fallback.
+let localDb = null
+let localHost = null
+let localCompute = null
+const localRecords = new Map()     // id -> persisted record
+const localErrors = new Map()      // id -> { state, code } non-compute errors (storage/load)
+let importNotice = { kind: "", text: "", seq: 0, op: null }
+// Registry operations (import / uninstall / params) are serialized: each runs
+// to completion (storage included) before the next starts, so a late removal
+// can never interleave with, or be mistaken for, a later import.
+let registryQueue = Promise.resolve()
+let registryOpSeq = 0
+let currentOp = null
+function registryOp(op, fn) {
+    const run = registryQueue.then(() => { currentOp = { ...op, seq: ++registryOpSeq }; return fn() }).finally(() => { currentOp = null })
+    registryQueue = run.catch(() => {})
+    return run
+}
+let dataRevision = 0
+let probeInstance = 1 << 30
 
-function scheduleDiscoveryRefresh(reset = false) {
-    if (reset) discoveryAttempt = 0
-    if (discoveryTimer || discoveryAttempt >= DISCOVERY_RETRY_MS.length) return
-    discoveryTimer = setTimeout(() => {
-        discoveryTimer = null
-        loadIndicators().catch(() => {})
-    }, DISCOVERY_RETRY_MS[discoveryAttempt++])
+function scopeNow() {
+    return { exchange: exchangeSel.value, market: marketSel.value, symbol: symbolSel.value, tf: tfSel.value, mode: currentMode() }
+}
+// Shared canonical cache changed (or scope/mode): one demand for all plugins.
+// kind "tail" = ordinary live tick (append/replace of the newest bars, served
+// by LiveUpdate); anything else changes the history basis (load/prepend).
+let historyRevision = 0
+let localScopeKey = ""
+let lastDemandBasis = null
+function noteDataChanged(kind = "history") {
+    // Metadata-only notifications (labels/health relabel, same scope, same
+    // canonical array and exhaustion) are not a data change: no revision bump,
+    // no History recompute, live overlay stays authoritative.
+    const basis = { bars: page.bars, len: page.bars.length, exhausted: !!page.reachedStart, scopeKey: JSON.stringify(scopeNow()) }
+    if (kind === "meta" && lastDemandBasis && lastDemandBasis.bars === basis.bars && lastDemandBasis.len === basis.len &&
+        lastDemandBasis.exhausted === basis.exhausted && lastDemandBasis.scopeKey === basis.scopeKey) return
+    lastDemandBasis = basis
+    dataRevision += 1
+    if (kind !== "tail") historyRevision += 1   // "meta" reaching here = real scope/mode/cache change
+    const scope = scopeNow()
+    const scopeKey = JSON.stringify(scope)
+    if (localScopeKey && scopeKey !== localScopeKey) {
+        // Displayed outputs are bound to the accepted scope: never reuse
+        // another scope's values for matching timestamps.
+        if (localValues.size) { localValues = new Map(); localLive = new Map(); forEachRenderer(r => { r.dirty = true }) }
+    }
+    localScopeKey = scopeKey
+    if (!localCompute) return
+    localCompute.setDemand({ scope, scopeKey, revision: dataRevision, historyRevision, bars: page.bars,
+        invalidTimes: [...invalidPoison.keys()].sort((a, b) => a - b),
+        exhausted: !!page.reachedStart, tailSnap: page.bars.slice(-64), ...canonicalRequestedRange(page.bars) })
+}
+// Canonical requested History range for local plugins (old PUBLIC server
+// page basis): the start is the oldest bar of the pages the app requested for
+// DISPLAY (initial page + user-driven older pages); warm-up pages are context only.
+// It never follows a moving viewport/cache index, so window-origin-sensitive
+// computations keep their origin. The explicit end is the cache end. Context
+// comes from the ACTUAL cached prefix before the start (Rust planner).
+let localRequestedFrom = null
+// User-driven older pages, each its OWN producer request basis: [from, to]
+// times (to = the bar before the newer page it was requested before). A
+// bounded older page is computed with its own origin + actual prefix and
+// right end; previously computed newer pages are never re-anchored.
+let localOlderPages = []
+let warmupPrepending = false
+function lowerBound(bars, time) {
+    let lo = 0, hi = bars.length
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (bars[mid].time < time) lo = mid + 1; else hi = mid }
+    return lo
+}
+function canonicalRequestedRange(bars) {
+    const n = bars.length
+    if (!n) return { wantFromIndex: 0, wantToIndex: 0, olderRanges: [] }
+    if (localRequestedFrom == null) localRequestedFrom = bars[0].time
+    const olderRanges = localOlderPages.map(({ from, to }) => ({ fromIndex: lowerBound(bars, from), toIndex: lowerBound(bars, to + 1), from, to }))
+        .filter(r => r.toIndex > r.fromIndex)
+    return { wantFromIndex: lowerBound(bars, localRequestedFrom), wantToIndex: n, olderRanges }
 }
 
-async function loadIndicators() {
-    if (discoveryInFlight) return discoveryInFlight
-    discoveryInFlight = (async () => {
-        let changed = false
-        try {
-            const response = await fetch(DISCOVERY_PATH, { cache: "no-store" })
-            if (!response.ok) throw new Error(`indicators HTTP ${response.status}`)
-            changed = applyPluginDescriptors(parseDiscovery(await response.json()))
-        } catch (error) {
-            console.warn("indicator discovery failed; price-only chart", error)
-            changed = applyPluginDescriptors([], String(error?.message ?? error))
+
+// Invalidate derived values at bar times whose canonical input is about to
+// change, so the new base is never painted with an old derived value.
+function invalidateLocalAt(times) {
+    for (const col of localValues.values()) for (const t of times) col.delete(t)
+    for (const col of localLive.values()) for (const t of times) col.delete(t)
+    // Fail closed in the interval before the coordinator re-plans. Context is
+    // WARM-UP, not a finite influence bound (an output may carry state from
+    // the window's first input, and per_tf overrides may exceed the default),
+    // so conservatively withhold EVERY admitted output of an enabled plugin at
+    // or after the earliest invalidated bucket. Outputs strictly before it
+    // cannot have consumed it. The Rust coordinator then re-plans only windows
+    // that do not span the bucket (substantive window policy stays in Rust).
+    if (!times.length) return
+    const from = Math.min(...times)
+    for (const [id, record] of localRecords) {
+        if (!record?.enabled) continue
+        for (const map of [localValues, localLive]) for (const [key, col] of map) {
+            if (!key.startsWith(`${id}/`)) continue
+            for (const tm of [...col.keys()]) if (tm >= from) col.delete(tm)
         }
-        if (registry.pending.some(p => p.status === "starting" || p.status === "unavailable") || discoveryError) scheduleDiscoveryRefresh()
-        else discoveryAttempt = 0
-        // Newly ready indicators need results for the cached page.
-        if (changed && page.bars.length && modeConnectionsReady) resyncIndicators()
-        return changed
-    })()
-    try { return await discoveryInFlight } finally { discoveryInFlight = null }
+    }
+}
+
+function syncLocalCompute() {
+    if (!localCompute) return
+    localCompute.setPlugins([...localRecords.values()].filter(r => r.enabled).map(r => ({
+        id: r.id, bytes: r.bytes, params: r.params, loadKey: `${r.sha256}|${JSON.stringify(r.params)}`,
+    })))
+}
+
+const localCoverage = new Map()
+function dropLocalValues(id) {
+    localCoverage.delete(id)
+    for (const key of [...localLive.keys()]) if (key.startsWith(`${id}/`)) localLive.delete(key)
+    for (const key of [...localValues.keys()]) if (key.startsWith(`${id}/`)) localValues.delete(key)
+}
+
+const sameValue = (a, b) => a === b || (a !== null && b !== null && typeof a === "object" && typeof b === "object" && JSON.stringify(a) === JSON.stringify(b))
+
+// Earliest bar time whose canonical input differs between an older demand's
+// bars and the current cache (tail replacements/appends); Infinity if equal.
+const barKey = b => b && JSON.stringify(b)
+function changedFromTime(oldBars, bars) {
+    if (!oldBars) return -Infinity   // unknown basis: present nothing
+    let i = oldBars.length - 1, j = bars.length - 1, from = Infinity
+    while (i >= 0 && j >= 0) {
+        const a = oldBars[i], b = bars[j]
+        if (a.time > b.time) { from = Math.min(from, a.time); i--; continue }
+        if (b.time > a.time) { from = Math.min(from, b.time); j--; continue }
+        if (a !== b && barKey(a) !== barKey(b)) from = a.time
+        i--; j--
+    }
+    return from
+}
+
+function onLocalResult(id, mode, output, want, meta = {}) {
+    if (!localRecords.get(id)?.enabled) return
+    if (want && want.scopeKey !== localScopeKey) return
+    // Data-basis fence: output computed on an older history basis (before a
+    // prepend/load/correction) must never refill invalidated values.
+    if (want && want.historyRevision !== undefined && want.historyRevision !== historyRevision) return
+    // Data-revision presentation fence: a successful compute on an older
+    // data revision (same history basis, later tail replace) still advances
+    // the plugin's session, but its values at times whose canonical input has
+    // since changed are never painted (no stale intermediate paint).
+    const staleFrom = want && want.revision !== undefined && want.revision !== dataRevision ? changedFromTime(want.tailSnap, page.bars) : Infinity
+    const fresh = time => time < staleFrom
+    if (meta.coverage) localCoverage.set(id, { coverage: meta.coverage, needBefore: meta.needBefore ?? 0 })
+    const live = meta.kind === "live"
+    const next = live ? new Map(localValues) : new Map([...localValues].filter(([key]) => !(key.startsWith(`${id}/`) && key.endsWith(`|${mode}`))))
+    // Changed times vs the previously accepted result: unchanged recomputes
+    // (the common live-tick case) cost no chart writes; tail-only changes use
+    // the incremental per-bar path; anything else re-renders the outputs.
+    const changed = new Set()
+    let shapeChanged = false
+    for (const [key, series] of Object.entries(output.series || {})) {
+        const k = `${id}/${key}|${mode}`
+        const prev = localValues.get(k)
+        let overlay = localLive.get(k)
+        // The live overlay is only authoritative on the basis it was built on;
+        // a newer corrected History supersedes an overlay from an older basis.
+        if (overlay && overlay.basis !== historyRevision) { localLive.delete(k); overlay = undefined }
+        if (live && !overlay) { localLive.set(k, overlay = new Map()); overlay.basis = historyRevision }
+        if (live && prev) {
+            // Bounded delta: mutate only the touched times of the live column.
+            output.times.forEach((time, i) => {
+                if (!fresh(time)) return
+                const v = seriesValueAt(series, i)
+                if (!(prev.has(time) && sameValue(prev.get(time), v))) changed.add(time)
+                if (v === undefined) { prev.delete(time); overlay.delete(time) } else { prev.set(time, v); overlay.set(time, v) }
+            })
+            while (overlay.size > 1024) overlay.delete(overlay.keys().next().value)
+            next.set(k, prev)
+            continue
+        }
+        const column = new Map()
+        output.times.forEach((time, i) => {
+            if (!fresh(time)) return
+            const v = seriesValueAt(series, i)
+            if (live) { if (v !== undefined) { column.set(time, v); overlay.set(time, v) } }
+            else if (v !== undefined) column.set(time, v)
+        })
+        // Partial-range merge: valid cached values outside the newly computed
+        // canonical range are preserved (never blanked by a bounded recompute).
+        if (!live && prev && meta.rangeFrom != null) for (const [t, v] of prev) if ((t < meta.rangeFrom || t > meta.rangeTo) && !column.has(t)) column.set(t, v)
+        // Stateless History never overwrites the persistent live session's values.
+        if (!live && overlay) for (const [t, v] of overlay) column.set(t, v)
+        if (!prev) shapeChanged = true
+        else {
+            for (const [t, v] of column) if (!prev.has(t) || !sameValue(prev.get(t), v)) changed.add(t)
+            for (const t of prev.keys()) if (!column.has(t)) changed.add(t)
+        }
+        next.set(k, column)
+    }
+    if (!live) for (const key of localValues.keys()) if (key.startsWith(`${id}/`) && key.endsWith(`|${mode}`) && !next.has(key)) shapeChanged = true
+    localValues = next
+    localErrors.delete(id)
+    if (shapeChanged) {
+        forEachRenderer(renderer => { if (renderer.output.pluginId === id) renderer.dirty = true })
+        refreshPluginOutputs(new Set([id]), true)
+    } else {
+        // Only changes inside the rendered window need chart writes; values
+        // outside it are read by the next window render (prepend/warm-up
+        // recomputes then cost nothing while the user drags/zooms).
+        const lo = renderedWindow.bars[0]?.time, hi = renderedWindow.bars.at(-1)?.time
+        const visible = visualWorkSuspended() || lo === undefined ? [...changed] : [...changed].filter(t => t >= lo && t <= hi)
+        if (visible.length) refreshPluginOutputs(new Set([id]), false, visible)
+        else updateFlowReadout()
+    }
+    maybeWarmup()
+}
+
+function onLocalStatus(id, st) {
+    if (st.state === "fault") { dropLocalValues(id); refreshPluginOutputs(new Set([id]), true) }
+    else { renderPluginState(); renderIndicatorMenu() }
+    if (typeof document !== "undefined" && document.body) document.body.dataset.localPlugins = JSON.stringify(localCompute?.running() ?? [])
+}
+
+// Warm-up beyond the visible page: when an enabled plugin declares more
+// context than the cache holds before the oldest bar, prepend older history
+// through the ONE shared history path (never a per-plugin feed).
+let warmupTimer = null
+function maybeWarmup() {
+    if (page.reachedStart || !page.bars.length) return
+    let need = 0
+    for (const [id, c] of localCoverage) if (localRecords.get(id)?.enabled && c.coverage !== "ready") need = Math.max(need, c.needBefore || 1)
+    if (need <= 0) return
+    if (page.loadingOlder || Date.now() - lastBeforeFetchAt < CONFIG.FETCH_COOLDOWN) {
+        // Bounded continuation: a quiet feed must not strand warm-up.
+        if (!warmupTimer) warmupTimer = setTimeout(() => { warmupTimer = null; maybeWarmup() }, CONFIG.FETCH_COOLDOWN + 50)
+        return
+    }
+    warmupPrepending = true
+    loadMoreBefore()
+}
+
+function registryFromRecords() {
+    applyPluginDescriptors([...localRecords.values()].map(r => ({ id: r.id, status: "ready", descriptor: r.descriptor, error: null })), localUnavailable)
+}
+
+async function persistRecord(record) {
+    try { await localDb.put(record) } catch (error) {
+        setImportNotice("error", `${record.name}: settings could not be saved (${importMessage(error).text})`)
+    }
+}
+
+function setImportNotice(kind, text) {
+    importNotice = { kind, text, seq: importNotice.seq + 1, op: currentOp }
+    renderIndicatorMenu()
+}
+
+let localInit = null
+let localUnavailable = ""   // sticky: host/storage start failure (actionable, no server fallback)
+function loadIndicators() { return localInit ??= initLocalPlugins() }
+async function initLocalPlugins() {
+    try {
+        const hostBytes = await (await fetch("/wasm-host/cvd_browser_host.wasm", { cache: "no-cache" })).arrayBuffer()
+        localHost = await WasmPluginHost.create(hostBytes, { workerUrl: new URL("/wasm-host/plugin-worker.js", location.origin) })
+        const coordBytes = await (await fetch("/wasm-host/cvd_browser_coordinator.wasm", { cache: "no-cache" })).arrayBuffer()
+        const coord = await createCoordinator(coordBytes)
+        localCompute = createLocalCompute({ host: localHost, coord, onResult: onLocalResult, onStatus: onLocalStatus, onInvalid: onLocalInvalid, log: (...a) => console.warn(...a) })
+    } catch (error) {
+        console.warn("local plugin host unavailable", error)
+        localUnavailable = "local plugin host unavailable (unsupported or failed to load)"
+    }
+    try {
+        localDb = await openPluginDb()
+        let invalidRestored = 0
+        for (const r of await localDb.all()) {
+            if (!validRecord(r)) { invalidRestored++; continue }
+            r.params = sanitizeParams(r.descriptor, r.params)
+            localRecords.set(r.id, r)
+            committedEnabled.set(r.id, r.enabled === true)
+        }
+        if (invalidRestored) setImportNotice("error", `${invalidRestored} stored plugin record(s) were invalid and skipped`)
+    } catch (error) {
+        localUnavailable ||= `local plugins unavailable: ${importMessage(error).text}`
+    }
+    window.__cvdLocal = { compute: () => localCompute, host: () => localHost, values: () => localValues, records: () => localRecords, revision: () => dataRevision }
+    registryFromRecords()
+    syncLocalCompute()
+    // Seed demand from an already-loaded page (quiet feed after late init).
+    if (page.bars.length) noteDataChanged()
+}
+
+// Import pipeline: name/size -> bytes -> hash -> bounded Worker load (Rust
+// policy check BEFORE compile, compile/instantiate/describe/create under the
+// deadline) -> displayable descriptor -> duplicate/version decision -> store.
+function importLocalFile(file) { return registryOp({ type: "import", file: String(file?.name ?? "") }, () => importLocalFileNow(file)) }
+async function importLocalFileNow(file) {
+    if (!localHost || !localDb) { setImportNotice("error", `Import unavailable: ${localUnavailable || "local plugin host or storage failed to start"} — price data still works; reload the page to retry (this browser may not support WebAssembly Workers or IndexedDB)`); return }
+    setImportNotice("busy", `Checking ${file?.name ?? "file"}…`)
+    const probe = probeInstance++
+    try {
+        checkImportFile(file)
+        const bytes = await file.arrayBuffer()
+        const sha256 = await sha256Hex(bytes)
+        const { descriptor } = await localHost.load(probe, bytes, "{}")
+        localHost.disable(probe)
+        const desc = typeof descriptor === "string" ? JSON.parse(descriptor) : descriptor
+        const check = buildRegistry([{ id: desc?.id, status: "ready", descriptor: desc }])
+        if (!check.plugins.length) throw Object.assign(new Error(check.rejected[0]?.message ?? "invalid"), { code: "invalid_descriptor" })
+        const decision = classifyImport([...localRecords.values()], { id: desc.id, sha256 })
+        if (decision.action === "same" && sameBytes(decision.previous.bytes, bytes)) { setImportNotice("info", `${desc.name || desc.id} ${desc.version} is already imported`); return }
+        const previous = decision.previous
+        // Replacement: validate the ACTUAL migrated params against the new
+        // package (plugin create) BEFORE the durable swap; on rejection the
+        // previous package stays installed and running unchanged.
+        const migrated = sanitizeParams(desc, previous?.params)
+        if (previous) {
+            const check2 = probeInstance++
+            try { await localHost.load(check2, bytes, JSON.stringify(migrated)) }
+            catch (error) { throw Object.assign(new Error("replacement rejects current parameters"), { code: error?.code === "plugin_error" || error?.code === "invalid_params" ? "replace_params" : error?.code }) }
+            finally { try { localHost.disable(check2) } catch (_) {} }
+        }
+        const record = {
+            id: desc.id, version: String(desc.version), name: String(desc.name || desc.id), sha256, size: bytes.byteLength,
+            fileName: file.name.slice(0, 120), bytes, descriptor: desc,
+            params: migrated, enabled: previous ? previous.enabled : false, importedAt: previous?.importedAt ?? Date.now(),
+        }
+        const writtenEnabled = record.enabled === true
+        await localDb.put(record)
+        // A toggle issued while this put was in flight changed the OLD
+        // record's in-memory intent; carry it over (its own queued toggle op
+        // persists it next). Durable state is what was just written.
+        committedEnabled.set(record.id, writtenEnabled)
+        const live = localRecords.get(record.id)
+        if (previous && live) record.enabled = live.enabled
+        if (!previous || !live) { incarnations.delete(record.id); incarnationOf(record.id) }
+        // Replace atomically: old instance stopped/released before the new
+        // package becomes visible; old results can never paint.
+        dropLocalValues(record.id)
+        localCompute?.clearFault(record.id)
+        localErrors.delete(record.id)
+        localRecords.set(record.id, record)
+        registryFromRecords()
+        syncLocalCompute()
+        setImportNotice("ok", previous ? `Replaced ${record.name} ${previous.version} → ${record.version}` : `Imported ${record.name} ${record.version} (disabled — tick to enable)`)
+    } catch (error) {
+        try { localHost.disable(probe) } catch (_) {}
+        const msg = importMessage(error)
+        setImportNotice("error", `${file?.name ?? "file"}: ${msg.text}`)
+    }
+}
+
+function uninstallLocalPlugin(id) { return registryOp({ type: "uninstall", id }, () => uninstallLocalPluginNow(id)) }
+async function uninstallLocalPluginNow(id) {
+    const record = localRecords.get(id)
+    if (!record) return
+    // Durable delete first: on storage failure the row stays (truthful state).
+    try { await localDb.delete(id) } catch (error) { setImportNotice("error", `${record.name}: removal not saved (${importMessage(error).text})`); return }
+    localRecords.delete(id)
+    incarnations.delete(id); latestToggle.delete(id); committedEnabled.delete(id)
+    dropLocalValues(id)
+    syncLocalCompute()
+    registryFromRecords()
+    setImportNotice("ok", `Removed ${record.name}`)
+}
+
+function setLocalParams(id, values) { return registryOp({ type: "params", id }, () => setLocalParamsNow(id, values)) }
+async function setLocalParamsNow(id, values) {
+    const record = localRecords.get(id)
+    if (!record) return
+    const params = sanitizeParams(record.descriptor, values)
+    // Durable write FIRST: on storage failure the running generation, its
+    // values and the stored params stay as they were (no false success).
+    // Immutable write snapshot: a toggle may mutate `record` while this put is
+    // pending; the durable cache must reflect what was actually written.
+    const payload = { ...record, params }
+    const writtenEnabled = payload.enabled === true
+    try { await localDb.put(payload) } catch (error) {
+        setImportNotice("error", `${record.name}: parameters not saved (${importMessage(error).text}) — previous parameters kept`)
+        return
+    }
+    record.params = params
+    committedEnabled.set(id, writtenEnabled)
+    dropLocalValues(id)
+    localCompute?.clearFault(id)
+    syncLocalCompute()
+    refreshPluginOutputs(new Set([id]), true)
+    setImportNotice("ok", `${record.name}: parameters saved`)
 }
 
 function pluginStateSummary() {
@@ -442,18 +799,22 @@ function renderPluginControls() {
 
 function renderIndicatorMenu() {
     if (!pluginControlsEl || !pluginMenuEl || typeof document.createElement !== "function") return
-    indicatorMenu ??= createIndicatorMenu({ container: pluginControlsEl, popup: pluginMenuEl, onToggle: setPluginEnabled })
+    indicatorMenu ??= createIndicatorMenu({ container: pluginControlsEl, popup: pluginMenuEl, onToggle: setPluginEnabled,
+        onImport: file => importLocalFile(file), onUninstall: id => uninstallLocalPlugin(id), onParams: (id, values) => setLocalParams(id, values),
+        parseParam: parseParamInput })
     const items = [
         ...registry.plugins.map(plugin => {
             const fault = pluginFault(plugin)
-            return { id: plugin.id, name: plugin.label, meta: fault ? `${plugin.version} · ${faultText(fault)}` : plugin.version,
-                title: `${plugin.label} ${plugin.version}${plugin.description ? " — " + plugin.description : ""}${fault ? ` (${faultText(fault)})` : ""}`,
-                checked: pluginEnabled(plugin), disabled: false }
+            const record = localRecords.get(plugin.id)
+            const state = localCompute?.runtime(plugin.id)?.state
+            const live = pluginEnabled(plugin) && !fault && state === "starting" ? " · starting" : ""
+            return { id: plugin.id, name: plugin.label, meta: fault ? `${plugin.version} · ${faultText(fault)}` : `${plugin.version}${live}`,
+                title: `${plugin.label} ${plugin.version}${plugin.description ? " — " + plugin.description : ""} · local file ${record?.fileName ?? ""}${fault ? ` (${faultText(fault)})` : ""}`,
+                checked: pluginEnabled(plugin), disabled: false, fault: !!fault,
+                params: (record?.descriptor?.params ?? []).map(spec => ({ ...spec, value: record.params?.[spec.key] })) }
         }),
-        ...registry.pending.map(item => ({ id: item.id, name: item.id, meta: `${item.status}${item.error?.code ? " " + item.error.code : ""}`,
-            title: `${item.id}: ${item.status}${item.error?.code ? " " + item.error.code : ""}`, checked: false, disabled: true })),
     ]
-    indicatorMenu.render(items, registry.plugins.filter(pluginEnabled).length)
+    indicatorMenu.render(items, registry.plugins.filter(pluginEnabled).length, importNotice)
 }
 
 // Pane labels: one per pane; exclusive groups get a generic <select>.
@@ -494,8 +855,64 @@ function renderPaneLabels() {
     updateFlowReadout()
 }
 
+// Toggle applies immediately (stop/release on disable is never delayed by
+// storage) and the durable write is serialized through the registry queue.
+// Each toggle is an explicit operation {seq, id, incarnation, requested}: the
+// write persists THAT operation's requested value onto the CURRENT record of
+// the same incarnation (so a replacement swapped in meanwhile keeps the
+// user's latest intent and an uninstalled/reimported plugin is never
+// resurrected). On storage failure the toggle is reverted only if it is still
+// the latest intent for that incarnation (generation fence, not boolean
+// equality); a superseded failure never overrides newer intent. Every op ends
+// in a receipt: pending -> committed (IDB transaction complete) | failed |
+// superseded | dropped. The UI never claims durable success before commit.
+const toggleReceipts = []
+const latestToggle = new Map()     // id -> seq of latest toggle intent
+const committedEnabled = new Map() // id -> last durably stored enabled
+const incarnations = new Map()     // id -> token (kept by replacement, new on import/uninstall)
+let incarnationSeq = 0
+function incarnationOf(id) { if (!incarnations.has(id)) incarnations.set(id, ++incarnationSeq); return incarnations.get(id) }
+let toggleSeq = 0
 function setPluginEnabled(pluginId, enabled) {
-    pluginPrefs.enabled[pluginId] = enabled
+    const record = localRecords.get(pluginId)
+    if (!record || record.enabled === enabled) return
+    const receipt = { seq: ++toggleSeq, id: pluginId, inc: incarnationOf(pluginId), requested: enabled, state: "pending" }
+    toggleReceipts.push(receipt)
+    if (toggleReceipts.length > 200) toggleReceipts.splice(0, toggleReceipts.length - 200)
+    latestToggle.set(pluginId, receipt.seq)
+    applyEnabled(record, enabled)
+    return registryOp({ type: "toggle", id: pluginId, seq: receipt.seq }, async () => {
+        const current = () => incarnations.get(pluginId) === receipt.inc ? localRecords.get(pluginId) : undefined
+        let target = current()
+        if (!localDb || !target) { receipt.state = "dropped"; return }
+        try {
+            await localDb.put({ ...target, enabled })
+            committedEnabled.set(pluginId, enabled)
+            receipt.state = "committed"
+            // Same-plugin stale toggle failure no longer describes the current
+            // outcome once a later toggle commits; other receipts untouched.
+            if (importNotice.kind === "error" && importNotice.op?.type === "toggle" && importNotice.op.id === pluginId && latestToggle.get(pluginId) === receipt.seq)
+                setImportNotice("ok", `${record.name}: ${enabled ? "enabled" : "disabled"} (saved)`)
+        } catch (error) {
+            target = current()
+            if (latestToggle.get(pluginId) === receipt.seq && target) {
+                receipt.state = "failed"
+                const stored = committedEnabled.get(pluginId) ?? !enabled
+                if (target.enabled !== stored) applyEnabled(target, stored)
+                setImportNotice("error", `${record.name}: ${enabled ? "enable" : "disable"} not saved (${importMessage(error).text}) — reverted`)
+            } else {
+                receipt.state = "superseded"
+            }
+        }
+    })
+}
+function applyEnabled(record, enabled) {
+    record.enabled = enabled
+    // Disable = stop compute and release the Worker/instance now; row, file
+    // and params stay. Re-enable after a fault is the explicit user retry.
+    localCompute?.clearFault(record.id)
+    if (!enabled) dropLocalValues(record.id)
+    syncLocalCompute()
     applyPluginVisibility()
 }
 
@@ -558,14 +975,6 @@ function updatePluginPoint(bar) {
     })
 }
 
-function setPluginFault(id, mode, fault) {
-    const key = `${id}:${mode}`
-    const before = pluginStatus[key]
-    if (fault) pluginStatus = { ...pluginStatus, [key]: { state: fault.state ?? "unavailable", code: fault.code ?? "" } }
-    else if (before) { pluginStatus = { ...pluginStatus }; delete pluginStatus[key] }
-    return JSON.stringify(before ?? null) !== JSON.stringify(pluginStatus[key] ?? null)
-}
-
 // Chart follow-up after indicator results/status changed for `ids`.
 function refreshPluginOutputs(ids, statusChanged, touched = null) {
     if (statusChanged) renderPluginControls()
@@ -588,88 +997,6 @@ function refreshPluginOutputs(ids, statusChanged, touched = null) {
         for (const bar of window) if (bar.time >= firstTouched) renderer.update(bar, aggregate)
     })
     syncPluginSeries(window, false)
-}
-
-// History page (generation-checked by fetchHistory): store columnar results
-// and per-mode status. Pages are stateless snapshots of their bar range.
-function applyHistoryIndicators(payload) {
-    const ids = new Set()
-    let statusChanged = false
-    const newest = page.newestTime
-    // Base bars and derived results are ONE admission decision: a history bar
-    // whose canonical tuple differs from the displayed one will replace it in
-    // mergeHistoryBars, so prior live proof for that time is invalidated and
-    // this response's results become authoritative for it. Unchanged tuples
-    // keep their verified live results.
-    const changed = historyChangedTimes(payload?.bars || [])
-    for (const time of changed) indicatorStore.supersedeBase(time)
-    for (const result of historyResults(payload)) {
-        ids.add(result.id)
-        if (result.ok) {
-            indicatorStore.applyHistory(result.id, result.mode, result.output, newest, changed)
-            statusChanged = setPluginFault(result.id, result.mode, null) || statusChanged
-        } else {
-            indicatorStore.dropStream(result.id, result.mode)
-            statusChanged = setPluginFault(result.id, result.mode, { state: "unavailable", code: result.error.code }) || statusChanged
-        }
-    }
-    if (ids.size) refreshPluginOutputs(ids, statusChanged)
-}
-
-function historyChangedTimes(bars) {
-    const changed = new Set()
-    for (const bar of bars) {
-        const index = barIndexByTime(page.bars, bar.time)
-        if (index < 0) continue
-        const existing = page.bars[index]
-        if (!equalBarData(existing, mergeHistoryQuality(existing, bar))) changed.add(bar.time)
-    }
-    return changed
-}
-
-// Live typed frames from the current socket only (caller fences connection).
-function handleIndicatorEvent(event) {
-    if (event.type === "reset") {
-        // Hub resynchronised or this viewer lagged: drop live state older than
-        // the new generation and refetch results for the cached page.
-        indicatorStore.reset(event.generation)
-        forEachRenderer(renderer => { renderer.dirty = true })
-        resyncIndicators()
-        return
-    }
-    const known = registry.plugins.some(p => p.id === event.id)
-    if (!known) { scheduleDiscoveryRefresh(true); return }
-    if (event.type === "status") {
-        if (!indicatorStore.applyStatus(event)) return
-        const changed = setPluginFault(event.id, event.mode, event.ok ? null : { state: "unavailable", code: event.error.code })
-        refreshPluginOutputs(new Set([event.id]), changed)
-        return
-    }
-    const result = indicatorStore.applyFrame(event, page.newestTime)
-    if (!result.accepted) return
-    const changed = setPluginFault(event.id, event.mode, null)
-    refreshPluginOutputs(new Set([event.id]), changed, result.touched)
-    if (result.gap) resyncIndicators()
-}
-
-// Refetch the newest page (with indicators) to rebuild results after a reset,
-// sequence gap or newly ready indicator. Bounded: one in flight.
-let indicatorResync = null
-function resyncIndicators() {
-    if (indicatorResync || !modeConnectionsReady) return indicatorResync
-    const generation = historyGeneration
-    indicatorResync = (async () => {
-        try {
-            const data = await fetchHistory(historyPageSize())
-            if (generation !== historyGeneration) return
-            const merged = mergeHistoryBars(data.bars || [])
-            const reachedStart = page.reachedStart
-            applyHistoryPage({ ...data, bars: merged }, currentChartRange(), data.bars || [])
-            page.reachedStart = reachedStart
-        } catch (error) { reportHistoryError(error) }
-        finally { indicatorResync = null }
-    })()
-    return indicatorResync
 }
 
 let segmentedRefreshTimer = null
@@ -1088,6 +1415,7 @@ function scheduleSegmentedRefresh() {
 function refreshModeData(keepRange = null) {
     // Indicator health is per mode (source/aggregate): relabel on mode change.
     renderPluginControls()
+    noteDataChanged("meta")   // data basis bumps only if scope/mode/cache actually changed
     if (!page.bars.length) return
     const currentRange = keepRange ?? currentChartRange()
     setBars(page.bars, currentRange)
@@ -1129,12 +1457,15 @@ function downloadChartScreenshot() {
     link.click()
 }
 
-function setBars(bars, keepRange = null) {
+function setBars(bars, keepRange = null, dataKind = null) {
     keepRange = keepRange ?? pendingChartRange ?? (initialViewportPending ? null : currentChartRange())
+    // Re-render of the SAME canonical array (mode relabel/layout) is metadata-only.
+    const sameArray = bars === page.bars
     page.bars = bars
     page.oldestTime = page.bars[0]?.time ?? null
     indicatorStore.pruneBefore(page.oldestTime)
     page.newestTime = page.bars[page.bars.length - 1]?.time ?? null
+    noteDataChanged(dataKind ?? (sameArray ? "meta" : "history"))
     updateDocumentTitle()
     updateFlowReadout()
     if (visualWorkSuspended()) {
@@ -1214,8 +1545,170 @@ async function fetchHistory(limit, before = null, after = null) {
     const data = await r.json()
     if (signal.aborted || generation !== historyGeneration) throw new DOMException("Stale history", "AbortError")
     assertSourceSeries(data, requestedMarket, requestedExchange, requestedSymbol)
-    applyHistoryIndicators(data)
+    absorbHistoryValidity(data)
+    if (data.foreign_epoch) {
+        // Rejected whole BEFORE any merge: rows, exhaustion flags and cursors
+        // of another producer incarnation are not authority for this cache.
+        const error = new DOMException("Foreign producer epoch", "AbortError")
+        error.foreignEpoch = true
+        throw error
+    }
+    // Server-computed `indicators` blocks (legacy backend, removed in lane E)
+    // are deliberately ignored: only browser WASM outputs are displayed.
     return data
+}
+
+// ---- Canonical validity (producer -> browser boundary) ----
+// Authority is the producer's data revision, never request order or wall
+// time. `rev` is comparable only inside one producer epoch (process).
+// invalidPoison: time -> { rev, epoch } of the newest known invalidation
+//   (`/history.validity` mark, WS `invalidate`, or rev 0 for a DB-only
+//   invalid row). Poisoned buckets are removed from the shared cache (never
+//   zero-filled) and passed to the Rust coordinator, which refuses History/
+//   live windows spanning them.
+// validAuth: time -> { rev, epoch } of the newest proven valid REPAIR, so an
+//   older invalid observation (slow HTTP page, buffered frame) cannot
+//   re-poison after the poison entry itself was deleted. Bounded.
+//   Recorded for EVERY proven (rev > 0) valid observation of the current
+//   epoch, not only repairs, so a delayed invalid rev10 cannot follow a
+//   valid rev12 even when no poison existed.
+// A valid observation clears poison only if it is a strictly newer revision
+// of the same epoch, or a revision-bound (rev > 0) observation of a newer
+// epoch. An unmarked DB row (rev 0) never clears poison: the DB/outbox can lag
+// live invalidation. After a producer restart a poison from the old epoch is
+// kept (fail closed) until a new-epoch revision repairs it or the page reloads.
+// Epoch authority: the epoch is an opaque process identity (NOT sortable).
+// The established incarnation changes only when a NEW WebSocket connection
+// (a newer wsGeneration) delivers a different epoch, or on the first
+// observation after resetValidity. Any other observation carrying a different
+// epoch (delayed HTTP page, buffered frame) is FOREIGN: its rows are filtered
+// fail-closed but it never mutates poison/validAuth or the incarnation.
+let invalidPoison = new Map()
+let validAuth = new Map()
+let producerEpoch = null
+let epochGeneration = null
+const VALID_AUTH_CAP = 8192
+function resetValidity() { invalidPoison = new Map(); validAuth = new Map(); producerEpoch = null; epochGeneration = null }
+// Called by the CURRENT socket's onmessage only (generation already checked).
+function adoptConnectionEpoch(payload, generation) {
+    if (!Number.isSafeInteger(payload?.epoch)) return
+    if (payload.epoch === producerEpoch) { epochGeneration = generation; return }
+    if (producerEpoch == null || epochGeneration !== generation) { producerEpoch = payload.epoch; epochGeneration = generation }
+}
+// Authority epoch of an observation, or undefined when it is foreign.
+function frameEpoch(payload) {
+    if (!Number.isSafeInteger(payload?.epoch)) return producerEpoch
+    if (producerEpoch == null) producerEpoch = payload.epoch
+    return payload.epoch === producerEpoch ? producerEpoch : undefined
+}
+function noteValidAuth(t, rev, epoch) {
+    if (!(rev > 0)) return
+    const va = validAuth.get(t)
+    if (va && va.epoch === epoch && va.rev >= rev) return
+    validAuth.delete(t)
+    validAuth.set(t, { rev, epoch })
+    if (validAuth.size > VALID_AUTH_CAP) validAuth.delete(validAuth.keys().next().value)
+}
+// true when the invalid observation (rev, epoch) is authoritative now.
+function acceptInvalid(t, rev, epoch) {
+    if (epoch === undefined) return false                   // foreign: never poisons
+    const va = validAuth.get(t)
+    if (va && va.epoch === epoch && va.rev >= rev) return false
+    if (va && va.epoch === epoch && rev === 0) return false  // same-epoch DB-only fact older than a live repair
+    const p = invalidPoison.get(t)
+    if (p && p.epoch === epoch && p.rev >= rev) return false
+    invalidPoison.set(t, { rev, epoch })
+    validAuth.delete(t)
+    return true
+}
+// true when the valid observation (rev, epoch) repairs/keeps bucket t.
+// Admission verdict, decided BEFORE any cache/value/series mutation: a
+// rejected observation never overwrites, deletes, clears or un-poisons.
+function acceptValid(t, rev, epoch) {
+    if (epoch === undefined) return false                   // foreign: never mutates current rows
+    const va = validAuth.get(t)
+    if (va && va.epoch === epoch && rev < va.rev) return false   // older than the newest proven row
+    const p = invalidPoison.get(t)
+    if (p) {
+        if (p.epoch === epoch ? rev <= p.rev : !(rev > 0)) return false
+        invalidPoison.delete(t)
+    }
+    noteValidAuth(t, rev, epoch)
+    return true
+}
+function removeCacheTimes(times) {
+    const drop = new Set(times)
+    invalidateLocalAt(times)
+    const previous = page.bars
+    const kept = previous.filter(b => !drop.has(b.time))
+    if (kept.length !== previous.length) setBars(kept, reanchorRange(previous, kept, currentChartRange()), "history")
+    else noteDataChanged("history")
+}
+// Applied to every /history response before any merge.
+function absorbHistoryValidity(data) {
+    const epoch = frameEpoch(data)
+    let changed = false
+    const drop = []
+    const marks = new Map()
+    for (const m of data.validity ?? []) if (Number.isInteger(m?.time) && Number.isSafeInteger(m?.rev)) marks.set(m.time, m)
+    for (const [t, m] of marks) {
+        if (m.valid) { const was = invalidPoison.has(t); if (acceptValid(t, m.rev, epoch) && was) changed = true }
+        else if (acceptInvalid(t, m.rev, epoch)) { drop.push(t); changed = true }
+    }
+    const pageInvalid = new Set()
+    for (const t of data.invalid_times ?? []) {
+        if (!Number.isInteger(t)) continue
+        pageInvalid.add(t)
+        if (marks.has(t)) continue
+        if (acceptInvalid(t, 0, epoch)) { drop.push(t); changed = true }
+    }
+    // A row is kept only if its bucket is not poisoned (an unmarked row cannot
+    // repair a known invalidation; a marked valid repair was accepted above).
+    // A foreign-epoch page additionally never contributes rows it reports
+    // invalid nor rows for currently poisoned buckets.
+    // Row admission: a foreign-epoch page contributes NO rows (it can neither
+    // overwrite nor fill current data) and its exhaustion flags are not
+    // authority (no false exhaustion; the truthful coverage cursor is kept).
+    // A current-epoch row is admitted only if its bucket is not poisoned and
+    // it is not older than the newest proven row authority of this epoch (an
+    // unmarked DB row is rev 0 and cannot overwrite a proven cached live row).
+    if (epoch === undefined) {
+        data.bars = []
+        data.has_more_before = true
+        data.has_more_after = true
+        data.foreign_epoch = true
+    } else {
+        data.bars = (data.bars || []).filter(b => {
+            if (invalidPoison.has(b.time)) return false
+            const va = validAuth.get(b.time)
+            if (!va || va.epoch !== epoch) return true
+            const m = marks.get(b.time)
+            return (m?.valid ? m.rev : 0) >= va.rev || barIndexByTime(page.bars, b.time) < 0
+        })
+    }
+    if (drop.some(t => barIndexByTime(page.bars, t) >= 0)) removeCacheTimes(drop)
+    else if (changed) noteDataChanged("history")
+}
+function applyRealtimeInvalidation(payload) {
+    const t = payload.invalid_time
+    if (!Number.isInteger(t) || t <= 0) throw new Error("invalid invalidate frame")
+    const epoch = frameEpoch(payload)
+    // Foreign-epoch invalidation is rejected: it records nothing and never
+    // deletes a current row (a rejected observation cannot mutate).
+    if (epoch === undefined) return
+    if (!acceptInvalid(t, payload.rev ?? 0, epoch)) return
+    removeCacheTimes([t])
+}
+// Withdraw a plugin's values on a window the coordinator refused.
+function onLocalInvalid(id, mode, want, range) {
+    if (!localRecords.get(id)?.enabled) return
+    if (want && (want.scopeKey !== localScopeKey || want.historyRevision !== historyRevision)) return
+    const inRange = t => t >= range.from && t <= range.to
+    for (const map of [localValues, localLive]) for (const [key, col] of map) {
+        if (!key.startsWith(`${id}/`) || !key.endsWith(`|${mode}`)) continue
+        for (const t of [...col.keys()]) if (inRange(t)) col.delete(t)
+    }
+    refreshPluginOutputs(new Set([id]), true)
 }
 
 function reportHistoryError(error) {
@@ -1309,10 +1802,12 @@ function setMergedBars(bars, keepRange = null) {
 }
 
 function applyHistoryPage(data, keepRange = null, confirmedBars = data.bars || []) {
-    setMergedBars(data.bars || [], keepRange)
-    recordConfirmedHistory(confirmedBars)
+    // Exhaustion flags first: the local-plugin demand published by the merge
+    // must carry the page's truthful `exhausted` state (terminal coverage).
     page.reachedStart = !data.has_more_before
     page.reachedEnd = !data.has_more_after
+    setMergedBars(data.bars || [], keepRange)
+    recordConfirmedHistory(confirmedBars)
     realtimeEnabled = !!data.realtime_enabled
     statusEl.textContent = !page.bars.length && ["spot_usdc", "usdm_usdc"].includes(marketSel.value)
         ? "no stored history yet" : realtimeEnabled ? "live" : "delay 1h"
@@ -1320,6 +1815,7 @@ function applyHistoryPage(data, keepRange = null, confirmedBars = data.bars || [
 }
 
 function applyRealtimePayload(payload) {
+    if (payload?.action === "invalidate") { assertSourceSeries(payload, marketSel.value); applyRealtimeInvalidation(payload); return }
     scopeRepaintPending = false
     applyRealtimeBase(payload)
     // Observation bound advanced: pending results for ANY bar in the scope
@@ -1341,6 +1837,23 @@ function applyRealtimeBase(payload) {
     // A live base frame predating an accepted historical replacement of this
     // bar is stale: displaying it would detach the bar from its results.
     if (indicatorStore.baseSuperseded(b.time, payload?.rev)) return
+    // Validity: a frame older than an invalidation of this bucket is stale;
+    // a newer one is the validated repair (re-inserted, History recomputed).
+    const epoch = frameEpoch(payload)
+    const wasPoisoned = invalidPoison.has(b.time)
+    if (!acceptValid(b.time, payload.rev ?? 0, epoch)) return
+    if (wasPoisoned) {
+        const lastTime = page.bars.at(-1)?.time
+        if (lastTime != null && b.time < lastTime) {
+            noteBaseRev(payload)
+            setBars(mergeHistoryBars([b]), currentChartRange(), "history")
+            return
+        }
+        noteBaseRev(payload)
+        applyTailBars([b])
+        noteDataChanged("history")
+        return
+    }
     // Revision of the base frame now shown for this bar (as_of_rev fence).
     const authorityChanged = noteBaseRev(payload)
     if (authorityChanged === "scope") scopeRepaintPending = true
@@ -1362,7 +1875,8 @@ function applyRealtimeBase(payload) {
         const index = barIndexByTime(page.bars, b.time)
         if (index >= 0 && !equalBarData(page.bars[index], b)) {
             page.bars[index] = b
-            setBars(page.bars, currentChartRange())
+            // In-place correction of an older canonical bar: a real data change.
+            setBars(page.bars, currentChartRange(), "history")
         }
         return
     }
@@ -1373,6 +1887,7 @@ function applyRealtimeBase(payload) {
 function applyTailBars(bars, keepRange = null) {
     const suspended = visualWorkSuspended() || chartNeedsRender
     const paintsTail = renderedWindow.start + renderedWindow.bars.length === page.bars.length
+    invalidateLocalAt(bars.filter(b => page.bars.at(-1)?.time === b.time).map(b => b.time))
     for (const b of bars) {
         if (page.bars.at(-1)?.time === b.time) page.bars[page.bars.length - 1] = b
         else page.bars.push(b)
@@ -1388,6 +1903,7 @@ function applyTailBars(bars, keepRange = null) {
     page.newestTime = page.bars[page.bars.length - 1]?.time ?? null
     page.oldestTime = page.bars[0]?.time ?? null
     indicatorStore.pruneBefore(page.oldestTime)
+    noteDataChanged("tail")
     updateDocumentTitle()
     updateFlowReadout()
     if (suspended) {
@@ -1406,6 +1922,8 @@ async function loadInitial() {
     page.reachedEnd = false
     const data = await fetchHistory(historyPageSize())
     initialViewportPending = true
+    localRequestedFrom = (data.bars || [])[0]?.time ?? null
+    localOlderPages = []
     applyHistoryPage({ ...data, bars: mergeHistoryBars(data.bars || []) }, null, data.bars || [])
 }
 
@@ -1428,7 +1946,36 @@ function shiftRange(range, delta) {
     return { from: range.from + delta, to: range.to + delta }
 }
 
+// Fetch a history page, stepping over ALL-INVALID pages by the producer's
+// truthful raw scan coverage (coverage_from / coverage_to). Returns the first
+// page with renderable rows, the exhausted page, or (bounded) a page marked
+// `stalled` that must NOT be read as exhaustion. The persistent page cursor
+// stays at the cached bar edge, so a later repair of a skipped invalid bucket
+// is still fetched (its validity mark lies inside the next coverage).
+const HISTORY_SKIP_PAGES = 64
+async function fetchHistorySkippingInvalid(limit, before, after) {
+    const older = after == null
+    let cursor = older ? before : after
+    for (let i = 0; ; i++) {
+        const data = await fetchHistory(limit, older ? cursor : null, older ? null : cursor)
+        if ((data.bars || []).length) return data
+        if (!(older ? data.has_more_before : data.has_more_after)) return data
+        const next = older ? data.coverage_from : data.coverage_to
+        if (!Number.isInteger(next) || (cursor != null && (older ? next >= cursor : next <= cursor)))
+            throw new Error("History cursor did not advance")
+        if (i + 1 >= HISTORY_SKIP_PAGES) return { ...data, stalled: true }
+        cursor = older ? next : next
+    }
+}
+let olderRetryTimer = null
+function retryOlderSoon(forWarmup) {
+    if (olderRetryTimer) return
+    olderRetryTimer = setTimeout(() => { olderRetryTimer = null; if (forWarmup) warmupPrepending = true; loadMoreBefore() }, CONFIG.FETCH_COOLDOWN + 50)
+}
+
 async function loadMoreBefore() {
+    const forWarmup = warmupPrepending
+    warmupPrepending = false
     if (page.loadingOlder || page.reachedStart) return
     if (!page.oldestTime) return
     const now = Date.now()
@@ -1438,12 +1985,19 @@ async function loadMoreBefore() {
     page.loadingOlder = true
     const generation = historyGeneration
     try {
-        const data = await fetchHistory(historyPageSize(), page.oldestTime, null)
+        const data = await fetchHistorySkippingInvalid(historyPageSize(), page.oldestTime, null)
         const older = data.bars || []
-        if (!older.length) { page.reachedStart = true; return }
+        // A bounded run of all-invalid pages is NOT exhaustion: continue soon.
+        if (data.stalled) { retryOlderSoon(forWarmup); return }
+        // Quiet exhaustion: publish the terminal demand now (no later tick needed).
+        if (!older.length) { page.reachedStart = true; noteDataChanged(); return }
 
         const newBars = older.filter(b => b.time < page.oldestTime)
         const merged = [...newBars, ...page.bars]
+        // A user-driven older page extends the canonical requested range; a
+        // warm-up page only supplies context (old server basis: context rows
+        // are not part of the requested page).
+        if (!forWarmup && newBars.length) localOlderPages.push({ from: newBars[0].time, to: newBars.at(-1).time })
 
         // setMergedBars reanchors the current range by timestamp (no pre-shift)
         const reachedEnd = page.reachedEnd
@@ -1463,8 +2017,9 @@ async function loadMoreAfter() {
     page.loadingNewer = true
     const generation = historyGeneration
     try {
-        const data = await fetchHistory(historyPageSize(), null, page.confirmedTime ?? page.newestTime)
+        const data = await fetchHistorySkippingInvalid(historyPageSize(), null, page.confirmedTime ?? page.newestTime)
         const newer = data.bars || []
+        if (data.stalled) return                    // not exhaustion; next edge/tick continues
         if (!newer.length) { page.reachedEnd = true; return }
         const merged = mergeHistoryBars(newer)
 
@@ -1524,10 +2079,10 @@ async function pollDelayedUpdates() {
     page.loadingNewer = true
     const generation = historyGeneration
     try {
-        const data = await fetchHistory(historyPageSize(), null, page.newestTime)
+        const data = await fetchHistorySkippingInvalid(historyPageSize(), null, page.newestTime)
         const newer = data.bars || []
         if (!newer.length) {
-            page.reachedEnd = !data.has_more_after
+            page.reachedEnd = !data.has_more_after && !data.stalled
             return
         }
 
@@ -1555,12 +2110,19 @@ async function catchUpHistory(generation, buffered) {
             closedThrough = Math.max(closedThrough, bars[bars.length - 1].time)
         }
         if (!data.has_more_after) break
-        const next = bars[bars.length - 1]?.time
+        // An all-invalid page still advances by its truthful scan coverage.
+        // (browser-side poison filtering can empty a page the producer filled).
+        const next = Number.isInteger(data.coverage_to) ? Math.max(data.coverage_to, bars.at(-1)?.time ?? -Infinity) : bars.at(-1)?.time
         if (next == null || (after != null && next <= after)) throw new Error("History cursor did not advance")
         after = next
     }
-    for (const payload of [...buffered.values()].sort((left, right) => left.bar.time - right.bar.time)) {
-        if (payload.bar.time > closedThrough) applyRealtimePayload(payload)
+    const frameTime = p => p.action === "invalidate" ? p.invalid_time : p.bar.time
+    for (const payload of [...buffered.values()].sort((left, right) => frameTime(left) - frameTime(right))) {
+        // Invalidations always apply (the catch-up page may predate them).
+        // A valid frame at/below the cursor is applied only when it is a
+        // candidate repair of a poisoned bucket; applyRealtimeBase then
+        // accepts it only if its revision is newer than the invalidation.
+        if (payload.action === "invalidate" || frameTime(payload) > closedThrough || invalidPoison.has(frameTime(payload))) applyRealtimePayload(payload)
     }
     page.reachedEnd = true
     return true
@@ -1620,6 +2182,16 @@ function connectWs() {
                 ? "no stored history yet" : "live"
         } catch (error) {
             if (generation !== wsGeneration) return
+            // A foreign-epoch page (producer restarted; this connection has not
+            // yet proven the new epoch with a frame) is rejected whole. Stay in
+            // the truthful "resyncing" state: frames keep buffering and the
+            // first one adopts the new epoch; retry catch-up on a bounded timer
+            // tied to this connection instead of recycling the socket.
+            if (error?.foreignEpoch) {
+                statusEl.textContent = "resyncing"
+                setTimeout(() => { if (generation === wsGeneration && syncing) syncHistory() }, 1000)
+                return
+            }
             reportHistoryError(error)
             socket.close()
         }
@@ -1643,19 +2215,18 @@ function connectWs() {
         if (generation !== wsGeneration) return
         try {
             const payload = JSON.parse(ev.data)
-            // Typed indicator frames are independent of base bar frames: a
-            // bad/unknown indicator frame never blocks or closes base data.
+            // Legacy server indicator frames are ignored (browser computes).
             let event = null
-            try { event = parseIndicatorFrame(payload) } catch (error) {
-                console.warn("invalid indicator frame", error)
-                resyncIndicators()
-                return
-            }
-            if (event) { handleIndicatorEvent(event); return }
+            try { event = parseIndicatorFrame(payload) } catch (_) { return }
+            if (event) return
             assertSourceSeries(payload, requestedMarket, requestedExchange, requestedSymbol)
-            if (!payload?.bar?.time) return
+            const frameTime = payload?.action === "invalidate" ? payload.invalid_time : payload?.bar?.time
+            if (!frameTime) return
+            adoptConnectionEpoch(payload, generation)
             if (syncing) {
-                buffered.set(payload.bar.time, payload)
+                // Keep the newest revision per bucket (an older frame never displaces it).
+                const held = buffered.get(frameTime)
+                if (!held || (payload.rev ?? 0) >= (held.rev ?? 0)) buffered.set(frameTime, payload)
                 if (buffered.size > 10000) socket.close()
             } else applyRealtimePayload(payload)
         } catch (error) {
@@ -1686,7 +2257,7 @@ async function reload() {
     hoveredFlowTime = null
     // Plugin status/results belong to the old source/timeframe.
     indicatorStore.reset()
-    if (Object.keys(pluginStatus).length) { pluginStatus = {}; renderPluginControls() }
+    resetValidity()
     modeConnectionsReady = false
     historyController.abort()
     historyController = new AbortController()

@@ -1,0 +1,27 @@
+[package]
+name = "interaction-fixture"
+version = "0.0.0-test"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "TEST-ONLY host-owned PUBLIC protocol fixture: `cvd`/`flow` id aliases so the clean-core app interaction gate needs no sibling repo or Release asset. Never shipped (static assembler/Docker exclude all *.wasm; not a distributed plugin)."
+
+# Standalone: never a member of the root workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Exactly one must be enabled per build.
+cvd = []
+flow = []
+
+[dependencies]
+cvd-indicator-sdk = { path = "../../../../crates/indicator-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1

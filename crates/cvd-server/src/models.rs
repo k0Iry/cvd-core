@@ -133,9 +133,27 @@ pub struct HistoryPayload {
     pub oldest_time: Option<i64>,
     pub newest_time: Option<i64>,
     pub realtime_enabled: bool,
-    pub indicator_api_version: u32,
-    /// Versioned per-indicator outputs aligned to `bars` (no per-bar expansion).
-    pub indicators: std::collections::BTreeMap<String, crate::indicators::IndicatorHistory>,
+    /// Canonical bucket times inside this page's range that were dropped as
+    /// non-renderable. Consumers must not treat a window spanning them as
+    /// contiguous valid input (successor of the retired server-side guard).
+    pub invalid_times: Vec<i64>,
+    /// Inclusive scan coverage of this page (null = unbounded on that side).
+    /// `invalid_times` lists every non-renderable bucket in it, including
+    /// leading/trailing rows at page seams; also the cursor of an all-invalid page.
+    pub coverage_from: Option<i64>,
+    pub coverage_to: Option<i64>,
+    /// Producer process epoch; `rev` values compare only within one epoch.
+    pub epoch: u64,
+    /// Live revision-bound validity marks inside the coverage, overlaid on the
+    /// possibly lagging DB snapshot; the browser orders these against WS frames.
+    pub validity: Vec<ValidityMark>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ValidityMark {
+    pub time: i64,
+    pub rev: u64,
+    pub valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -143,6 +161,11 @@ pub struct HistoryPayload {
 pub enum WsAction {
     Append,
     ReplaceLast,
+    /// The canonical bucket at `invalid_time` became non-renderable (e.g. a
+    /// same-time correction). Any earlier value for that bucket is no longer
+    /// authoritative; consumers must drop it and refuse windows spanning it
+    /// until a later-`rev` valid Append/ReplaceLast of the same time repairs it.
+    Invalidate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,7 +177,23 @@ pub struct WsPayload {
     pub rev: u64,
     pub series: &'static str,
     pub action: WsAction,
-    pub bar: Bar,
+    /// Present for Append/ReplaceLast; absent for Invalidate (no fabricated OHLC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar: Option<Bar>,
+    /// Present only for Invalidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_time: Option<i64>,
+    /// Producer process epoch (see HistoryPayload::epoch).
+    pub epoch: u64,
+}
+
+impl WsPayload {
+    pub fn bar(rev: u64, series: &'static str, action: WsAction, bar: Bar) -> Self {
+        Self { rev, series, action, bar: Some(bar), invalid_time: None, epoch: crate::producer_epoch() }
+    }
+    pub fn invalidate(rev: u64, series: &'static str, time: i64) -> Self {
+        Self { rev, series, action: WsAction::Invalidate, bar: None, invalid_time: Some(time), epoch: crate::producer_epoch() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

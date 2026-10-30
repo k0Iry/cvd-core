@@ -100,10 +100,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bad-abi-indicator"
-version = "0.1.0"
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -278,23 +274,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "cvd-indicator-host"
+name = "cvd-browser-host"
 version = "0.1.0"
 dependencies = [
  "cvd-indicator-sdk",
- "libc",
+ "sample-indicator",
  "serde",
  "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "cvd-indicator-runner"
-version = "0.1.0"
-dependencies = [
- "cvd-indicator-sdk",
- "libc",
- "serde_json",
+ "stateful-indicator",
 ]
 
 [[package]]
@@ -312,8 +299,6 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "cvd-indicator-host",
- "cvd-indicator-sdk",
  "futures",
  "rand 0.8.5",
  "reqwest",
@@ -425,13 +410,6 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-
-[[package]]
-name = "fault-indicator"
-version = "0.1.0"
-dependencies = [
- "cvd-indicator-sdk",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -676,6 +654,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hostile-wasm-plugin"
+version = "0.1.0"
+dependencies = [
+ "cvd-indicator-sdk",
 ]
 
 [[package]]
@@ -1416,15 +1401,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raw-abi-indicator"
-version = "0.1.0"
-dependencies = [
- "cvd-indicator-sdk",
- "libc",
- "serde_json",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1697,15 +1673,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "signal-hook-registry"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e9e0b4211b72e7b8b6e85c807d36c212bdb33ea8587f7569562a84df5465b1"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1956,6 +1923,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stateful-indicator"
+version = "0.1.0"
+dependencies = [
+ "cvd-indicator-sdk",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2082,7 +2056,6 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -2760,13 +2733,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
-]
-
-[[package]]
-name = "zero-context-indicator"
-version = "0.1.0"
-dependencies = [
- "cvd-indicator-sdk",
 ]
 
 [[package]]

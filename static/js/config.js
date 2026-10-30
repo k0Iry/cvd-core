@@ -1,9 +1,9 @@
 export const CONFIG = {
     RENDER_WINDOW_SIZE: 3200,
     RENDER_WINDOW_BUFFER: 512,
-    // Display page size only. Indicator warm-up/context is declared by each
-    // plugin and satisfied server-side by the host; the browser never computes
-    // indicator values and needs no algorithm-specific left context.
+    // Display page size only. Indicator warm-up is declared by each local
+    // plugin (descriptor context) and satisfied by the browser from the shared
+    // canonical cache, prepending older pages when needed (local-compute.mjs).
     HISTORY_PAGE_SIZE: 1600,
     // Rebuilding every segmented-lines output touches a lot of chart state.
     // Keep realtime candles/line/histogram outputs instant, but throttle full

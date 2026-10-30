@@ -115,7 +115,7 @@ async fn actual_websocket_route_serializes_delivery_quality() {
     .unwrap();
     primary
         .tx_1m
-        .send(models::WsPayload { rev: 0, series: SPOT_SERIES, action: models::WsAction::Append, bar: current })
+        .send(models::WsPayload::bar(0, SPOT_SERIES, models::WsAction::Append, current))
         .unwrap();
     let message = tokio::time::Duration::from_secs(2);
     let response = tokio::time::timeout(message, socket.next()).await.unwrap().unwrap().unwrap();

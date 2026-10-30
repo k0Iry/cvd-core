@@ -11,6 +11,8 @@ pub mod abi;
 pub mod author;
 pub mod model;
 pub mod protocol;
+/// Standalone browser WASM ABI (`cvd-wasm` v1) glue.
+pub mod wasm;
 
 pub use author::{ComputeContext, ComputePhase, Indicator, SeriesSet};
 pub use model::*;

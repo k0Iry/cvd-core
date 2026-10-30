@@ -1,11 +1,6 @@
-# Non-root container defaults. Mount an operator-owned replacement read-only
-# and list independently built trusted libraries under [indicators].
+# Non-root container defaults. Mount an operator-owned replacement read-only.
+# Indicators run in the visitor's browser (local .wasm import); there is no
+# server-side indicator configuration.
 [server]
 http_addr = "0.0.0.0:8080"
 static_dir = "/app/static"
-
-[indicators]
-runner = "/usr/local/bin/cvd-indicator-runner"
-history_timeout_ms = 10000
-live_timeout_ms = 2000
-queue_depth = 64

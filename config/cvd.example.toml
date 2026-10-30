@@ -1,23 +1,8 @@
 # Example operator configuration. Point CVD_CONFIG at a copy of this file.
-# Without CVD_CONFIG the host runs with defaults and no indicator libraries
-# (price, source quality and base bars still work).
+# Without CVD_CONFIG the host runs with defaults.
+# Indicators are imported locally in the browser as .wasm (docs/plugin-wasm-v1.md);
+# a legacy [indicators] section is accepted, ignored and reported at startup.
 
 [server]
 http_addr = "0.0.0.0:80"
 static_dir = "static"
-
-[indicators]
-# Absolute path of the isolated runner binary (built from crates/indicator-runner).
-runner = "/usr/local/bin/cvd-indicator-runner"
-history_timeout_ms = 10000
-live_timeout_ms = 2000
-queue_depth = 64
-
-# Libraries are loaded only from operator-owned absolute paths listed here.
-# [[indicators.library]]
-# Public example built independently in github.com/k0Iry/cvd-indicators
-# (cargo build --release -p cvd-indicator-example-range).
-# id = "example.range"                                    # must equal descriptor id
-# path = "/opt/cvd/indicators/libcvd_indicator_example_range.so"
-# params = { length = 20 }
-# modes = ["source", "aggregate"]

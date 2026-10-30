@@ -6,8 +6,10 @@
 // keep the popup open and focus where it is. Knows nothing about specific
 // plugin ids; callers pass generic row items.
 //
-// items: [{ id, name, meta, title, checked, disabled }]
-export function createIndicatorMenu({ container, popup, onToggle, label = "Indicators" }) {
+// items: [{ id, name, meta, title, checked, disabled, fault?, params? }]
+// Local packages: an always-present "Import .wasm…" control (trusted native
+// file input, nothing uploaded), a status notice, and per-row Params/Remove.
+export function createIndicatorMenu({ container, popup, onToggle, onImport = null, onUninstall = null, onParams = null, parseParam = null, label = "Indicators" }) {
     const doc = globalThis.document
     const win = globalThis.window ?? {}
     const make = (tag, className) => { const el = doc.createElement(tag); if (className) el.className = className; return el }
@@ -34,9 +36,29 @@ export function createIndicatorMenu({ container, popup, onToggle, label = "Indic
     list.setAttribute("aria-labelledby", heading.id)
     const empty = make("p", "plugin-menu-empty")
     empty.dataset.empty = ""
-    empty.textContent = "No indicators available"
+    empty.textContent = onImport ? "No local indicators imported" : "No indicators available"
     popup.hidden = true
-    popup.replaceChildren(heading, list)
+    const footer = make("div", "plugin-menu-footer")
+    const notice = make("p", "plugin-menu-notice")
+    notice.setAttribute("role", "status")
+    notice.setAttribute("aria-live", "polite")
+    let fileInput = null
+    if (onImport) {
+        fileInput = make("input")
+        fileInput.type = "file"
+        fileInput.accept = ".wasm,application/wasm"
+        fileInput.className = "plugin-import-input"
+        fileInput.setAttribute("aria-label", "Import local .wasm indicator")
+        fileInput.onchange = () => { const f = fileInput.files?.[0]; fileInput.value = ""; if (f) onImport(f) }
+        const importBtn = make("button", "toolbar-btn plugin-import-btn")
+        importBtn.type = "button"
+        importBtn.textContent = "Import .wasm…"
+        importBtn.title = "Import a cvd-wasm v1 indicator from this computer. It stays in this browser; nothing is uploaded."
+        importBtn.onclick = () => fileInput.click()
+        footer.append(importBtn, fileInput)
+    }
+    footer.append(notice)
+    popup.replaceChildren(heading, list, footer)
 
     const rows = new Map()
     let order = []
@@ -54,8 +76,27 @@ export function createIndicatorMenu({ container, popup, onToggle, label = "Indic
             el.append(input, name, meta)
             r = { el, input, name, meta }
             input.onchange = () => r.onchange?.(input.checked)
+            if (onUninstall) {
+                const actions = make("span", "plugin-menu-actions")
+                const paramsBtn = make("button", "plugin-menu-action")
+                paramsBtn.type = "button"; paramsBtn.textContent = "Params"; paramsBtn.dataset.action = "params"
+                const removeBtn = make("button", "plugin-menu-action")
+                removeBtn.type = "button"; removeBtn.textContent = "Remove"; removeBtn.dataset.action = "remove"
+                const panel = make("span", "plugin-menu-params")
+                panel.hidden = true
+                paramsBtn.onclick = ev => { ev.preventDefault?.(); panel.hidden = !panel.hidden; if (!panel.hidden) fillParams(r) }
+                removeBtn.onclick = ev => { ev.preventDefault?.(); onUninstall(r.id) }
+                actions.append(paramsBtn, removeBtn)
+                el.append(actions, panel)
+                Object.assign(r, { paramsBtn, removeBtn, panel })
+            }
             rows.set(item.id, r)
         }
+        r.id = item.id
+        r.item = item
+        if (r.paramsBtn) r.paramsBtn.hidden = !(item.params?.length)
+        if (r.removeBtn) r.removeBtn.setAttribute("aria-label", `Remove ${item.name} from this browser`)
+        if (r.el.dataset.fault !== String(!!item.fault)) r.el.dataset.fault = String(!!item.fault)
         // Write only on change: avoids churn and keeps focus stable.
         if (r.el.title !== item.title) r.el.title = item.title
         if (r.name.textContent !== item.name) r.name.textContent = item.name
@@ -67,7 +108,42 @@ export function createIndicatorMenu({ container, popup, onToggle, label = "Indic
         return r.el
     }
 
-    function render(items, selected) {
+    // Generic parameter form from descriptor ParamSpec (int/float/bool/choice).
+    function fillParams(r) {
+        const specs = r.item?.params ?? []
+        const fields = specs.map(spec => {
+            const wrap = make("label", "plugin-param")
+            const caption = make("span"); caption.textContent = spec.label || spec.key
+            let input
+            if (spec.type === "choice") {
+                input = make("select")
+                for (const option of spec.options ?? []) { const o = make("option"); o.value = option; o.textContent = option; input.append(o) }
+                input.value = spec.value
+            } else {
+                input = make("input")
+                if (spec.type === "bool") { input.type = "checkbox"; input.checked = spec.value === true }
+                else { input.type = "number"; input.min = spec.min; input.max = spec.max; input.step = spec.type === "int" ? "1" : "any"; input.value = String(spec.value) }
+            }
+            input.dataset.param = spec.key
+            wrap.append(caption, input)
+            return { spec, input, wrap }
+        })
+        const apply = make("button", "plugin-menu-action"); apply.type = "button"; apply.textContent = "Apply"; apply.dataset.action = "apply"
+        const err = make("span", "plugin-param-error"); err.setAttribute("role", "alert")
+        apply.onclick = ev => {
+            ev.preventDefault?.()
+            const values = {}
+            try {
+                for (const { spec, input } of fields) values[spec.key] = parseParam(spec, spec.type === "bool" ? input.checked : input.value)
+            } catch (e) { err.textContent = String(e?.message ?? e); return }
+            err.textContent = ""
+            onParams?.(r.id, values)
+        }
+        r.panel.replaceChildren(...fields.map(f => f.wrap), apply, err)
+    }
+
+    function render(items, selected, status = null) {
+        if (status && notice.textContent !== (status.text ?? "")) { notice.textContent = status.text ?? ""; notice.dataset.kind = status.kind ?? "" }
         const ids = items.map(item => item.id)
         const els = items.map(row)
         for (const id of [...rows.keys()]) if (!ids.includes(id)) rows.delete(id)
@@ -121,6 +197,12 @@ export function createIndicatorMenu({ container, popup, onToggle, label = "Indic
         if (event.key !== "Tab") return
         // First/last come from the CURRENT rendered order (not Map order).
         const enabled = order.map(rowInput).filter(input => input && !input.disabled)
+        // With local-package controls, every visible focusable control in the
+        // popup participates (rows, Params/Remove, Import).
+        if (onImport && typeof popup.querySelectorAll === "function") {
+            enabled.splice(0, enabled.length, ...[...popup.querySelectorAll("input:not([type=file]), button, select")]
+                .filter(el => !el.disabled && !el.hidden && !el.closest?.("[hidden]")))
+        }
         const first = enabled[0], last = enabled.at(-1)
         if (event.target === trigger) {
             // The popup sits after the toolbar in the DOM: Tab from the

@@ -139,14 +139,14 @@ function harness() {
         statusEl: {}, currentAccessKey: () => '', historyPageSize: () => 2,
         chart: { timeScale: () => ({ getVisibleLogicalRange: () => null }) },
         updateDocumentTitle: noop, resetViewport: noop, syncPaneLayout: noop,
-        clearScheduledSegmentedRefresh: noop, scheduleSegmentedRefresh: noop, applyHistoryIndicators: noop,
+        clearScheduledSegmentedRefresh: noop, scheduleSegmentedRefresh: noop, applyHistoryIndicators: noop, noteDataChanged: noop, invalidateLocalAt: noop,
         indicatorStore: { reset: noop, resetFences: noop, pruneBefore: noop, noteBaseRev: noop, baseSuperseded: () => false }, noteBaseRev: noop, parseIndicatorFrame: () => null, handleIndicatorEvent: noop, resyncIndicators: noop,
         pluginStatus: {}, renderPluginControls: noop,
         // Stands in for the two default public plugin outputs (CVD line + selected Flow).
         updatePluginPoint: bar => { series.update(bar); series.update(bar) },
         priceSeries: series, backboneSeries: series,
         pricePointForBar: bar => bar, updateFlowReadout: () => context.readoutWrites++, useAggregateMode: () => false,
-        CONFIG: { FETCH_COOLDOWN: 0, DELAY_POLL_MS: 1000 },
+        CONFIG: { FETCH_COOLDOWN: 0, DELAY_POLL_MS: 1000 }, warmupPrepending: false, localOlderPages: [],
     })
     vm.runInContext(fs.readFileSync(require('node:path').join(__dirname, '../static/js/quality-display.mjs'), 'utf8').replaceAll('export function', 'function'), context)
     const config = fs.readFileSync(require('node:path').join(__dirname,'../static/js/config.js'),'utf8').replaceAll('export const','const').replaceAll('export function','function');
@@ -501,4 +501,260 @@ test('producer-derived instruments fixture matches frontend descriptors exactly 
     assert.ok(!produced.some(i => i.exchange === 'bybit' || (i.exchange === 'coinbase' && i.market === 'usdm')))
     for (const field of ['quote_asset', 'native_symbol', 'category'])
         assert.ok(!validInstrument({ ...produced.find(i => i.market === 'usdm_usdc'), [field]: 'USDT' }), field)
+})
+
+// ---- V2 validity: producer invalid buckets at the browser boundary (harness: real app.js sections, mocked chart) ----
+const times = run => JSON.parse(run('JSON.stringify(page.bars.map(b => b.time))'))
+const poison = run => JSON.parse(run('JSON.stringify([...invalidPoison.keys()].sort((a,b)=>a-b))'))
+
+test('validity: HTTP invalid_times poisons and removes the cached bucket; neither a stale NOR a later-started unmarked page resurrects it; only a revision-bound valid mark repairs', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60,v:1},{time:120,v:2},{time:180,v:3}])')
+    const older = run('fetchHistory(2, null, 0)')          // request A starts BEFORE the invalidation
+    const p = run('fetchHistory(2, null, 59)')             // request B reports 120 invalid
+    respond(requests[1], [{ time: 180, v: 3 }], { invalid_times: [120] })
+    await p
+    assert.deepEqual(times(run), [60, 180], 'invalid bucket removed, not zero-filled')
+    assert.deepEqual(poison(run), [120])
+    respond(requests[0], [{ time: 120, v: 'stale' }, { time: 180, v: 3 }])
+    const a = await older
+    assert.deepEqual(a.bars.map(b => b.time), [180], 'stale earlier-started page row for 120 dropped')
+    assert.deepEqual(poison(run), [120])
+    // NEGATIVE control (retired request-order semantics): a page that merely
+    // STARTED later carries no revision proof; the DB/outbox may lag.
+    const newer = run('fetchHistory(2, null, 59)')
+    respond(requests[2], [{ time: 120, v: 'unmarked' }])
+    const c = await newer
+    assert.deepEqual(c.bars.map(b => b.time), [], 'unmarked later-started row cannot repair')
+    assert.deepEqual(poison(run), [120])
+    // POSITIVE: a revision-bound valid mark (producer overlay) repairs.
+    const marked = run('fetchHistory(2, null, 59)')
+    respond(requests[3], [{ time: 120, v: 'fixed' }], { epoch: 7, validity: [{ time: 120, rev: 4, valid: true }] })
+    const d = await marked
+    assert.deepEqual(d.bars.map(b => b.v), ['fixed'])
+    assert.deepEqual(poison(run), [], 'revision-bound valid mark repairs')
+    // No resurrection: the stale invalid observation (rev 0 DB fact) replayed after the repair stays fenced.
+    const replay = run('fetchHistory(2, null, 59)')
+    respond(requests[4], [], { epoch: 7, invalid_times: [120] })
+    await replay
+    assert.deepEqual(poison(run), [], 'DB-only invalid fact older than the proven repair is fenced')
+})
+
+test('validity: WS invalidate removes the bucket, older-rev frames stay fenced, newer-rev valid repair re-inserts (interior + tail)', () => {
+    const { run } = harness()
+    run('setBars([{time:60,v:1},{time:120,v:2},{time:180,v:3}])')
+    run('applyRealtimePayload({rev:10, action:"invalidate", invalid_time:120})')
+    assert.deepEqual(times(run), [60, 180])
+    assert.deepEqual(poison(run), [120])
+    run('applyRealtimePayload({rev:9, action:"replace_last", bar:{time:120,v:"old"}})')
+    assert.deepEqual(times(run), [60, 180], 'stale pre-invalidation frame cannot resurrect')
+    run('applyRealtimePayload({rev:10, action:"invalidate", invalid_time:120})')
+    assert.deepEqual(poison(run), [120], 'duplicate invalidation idempotent')
+    run('applyRealtimePayload({rev:11, action:"append", bar:{time:120,v:"fixed"}})')
+    assert.deepEqual(times(run), [60, 120, 180])
+    assert.equal(run('page.bars[1].v'), 'fixed')
+    assert.deepEqual(poison(run), [])
+    // tail bucket invalidated then repaired
+    run('applyRealtimePayload({rev:12, action:"invalidate", invalid_time:180})')
+    assert.deepEqual(times(run), [60, 120])
+    run('applyRealtimePayload({rev:13, action:"replace_last", bar:{time:180,v:"tail"}})')
+    assert.deepEqual(times(run), [60, 120, 180])
+    assert.equal(run('page.bars[2].v'), 'tail')
+    assert.throws(() => run('applyRealtimePayload({rev:14, action:"invalidate", invalid_time:"x"})'))
+})
+
+test('validity: reconnect alone (wsGeneration) is NOT a producer restart; only a new connection delivering a new epoch may repair an old-counter poison', () => {
+    const { run } = harness()
+    run('setBars([{time:60},{time:120}])')
+    run('adoptConnectionEpoch({epoch:11}, 1); applyRealtimePayload({epoch:11, rev:500, action:"invalidate", invalid_time:120})')
+    // NEGATIVE: same producer, reconnected; a rev-3 frame is OLDER than rev 500.
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:11}, 2)')
+    run('applyRealtimePayload({epoch:11, rev:3, action:"append", bar:{time:120,v:"stale"}})')
+    assert.deepEqual(times(run), [60], 'reconnect without new epoch cannot repair')
+    assert.deepEqual(poison(run), [120])
+    // POSITIVE: a newer connection delivers a new producer epoch; its rev>0 repairs.
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:22}, 3)')
+    assert.equal(run('producerEpoch'), 22)
+    run('applyRealtimePayload({epoch:22, rev:3, action:"append", bar:{time:120,v:"after-restart"}})')
+    assert.deepEqual(times(run), [60, 120])
+    assert.deepEqual(poison(run), [])
+})
+
+test('validity H1: a delayed OLD-epoch observation neither rolls back the incarnation nor poisons/repairs (HTTP and WS)', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60},{time:120},{time:180}])')
+    run('adoptConnectionEpoch({epoch:11}, 1)')
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:22}, 2)')          // producer restarted
+    run('applyRealtimePayload({epoch:22, rev:5, action:"invalidate", invalid_time:180})')
+    // delayed old-epoch HTTP page: invalid mark with a numerically larger rev, and a valid "repair" of 180
+    const old = run('fetchHistory(2, null, 59)')
+    respond(requests[0], [{ time: 120, v: 'x' }, { time: 180, v: 'old-epoch' }], { epoch: 11, validity: [{ time: 120, rev: 999, valid: false }, { time: 180, rev: 999, valid: true }], invalid_times: [120] })
+    const a = await old.catch(e => e)
+    assert.equal(run('producerEpoch'), 22, 'incarnation not rolled back')
+    assert.deepEqual(poison(run), [180], 'old-epoch invalid does not poison; old-epoch valid does not repair')
+    assert.equal(a.foreignEpoch, true, "foreign page is rejected whole before any merge (no rows, flags or cursors)")
+    // delayed old-epoch WS-shaped frame (e.g. buffered) also cannot repair
+    run('applyRealtimePayload({epoch:11, rev:999, action:"append", bar:{time:180,v:"old"}})')
+    assert.deepEqual(poison(run), [180])
+    run('applyRealtimePayload({epoch:11, rev:999, action:"invalidate", invalid_time:60})')
+    assert.deepEqual(poison(run), [180], 'foreign invalidation records nothing')
+    run('applyRealtimePayload({epoch:22, rev:6, action:"replace_last", bar:{time:180,v:"repair"}})')
+    assert.deepEqual(poison(run), [], 'current-epoch newer rev repairs')
+})
+
+test('validity H1: every proven valid observation fences older invalid observations (same epoch, with and without prior poison; previous epoch)', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60},{time:120},{time:180}])')
+    run('adoptConnectionEpoch({epoch:7}, 1)')
+    // no poison ever: valid rev12 observed live
+    run('applyRealtimePayload({epoch:7, rev:12, action:"replace_last", bar:{time:120,v:"r12"}})')
+    let p = run('fetchHistory(2, null, 59)')
+    respond(requests[0], [], { epoch: 7, validity: [{ time: 120, rev: 10, valid: false }] })
+    await p
+    assert.deepEqual(poison(run), [], 'delayed invalid rev10 after valid rev12 is fenced without prior poison')
+    assert.ok(times(run).includes(120))
+    // after poison deletion: poison rev5, repair rev12, then delayed invalid rev10
+    run('applyRealtimePayload({epoch:7, rev:5, action:"invalidate", invalid_time:180})')
+    p = run('fetchHistory(2, null, 59)')
+    respond(requests[1], [{ time: 180, v: 'r12' }], { epoch: 7, validity: [{ time: 180, rev: 12, valid: true }] })
+    await p
+    assert.deepEqual(poison(run), [])
+    run('applyRealtimePayload({epoch:7, rev:10, action:"invalidate", invalid_time:180})')
+    assert.deepEqual(poison(run), [], 'repair proof survives poison deletion')
+    // previous-epoch delayed invalid after restart does not poison either
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:8}, 2)')
+    run('applyRealtimePayload({epoch:7, rev:50, action:"invalidate", invalid_time:120})')
+    assert.deepEqual(poison(run), [])
+    // a genuinely newer invalidation still applies
+    run('applyRealtimePayload({epoch:8, rev:1, action:"invalidate", invalid_time:120})')
+    assert.deepEqual(poison(run), [120])
+})
+
+const vOf = (run, t) => run(`page.bars.find(b => b.time === ${t})?.v ?? null`)
+test('admission A1: a held OLD-epoch VALID page row never overwrites a current-epoch row, nor fakes exhaustion', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60,v:"a"},{time:120,v:"cur-120"}])')
+    run('adoptConnectionEpoch({epoch:11}, 1)')
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:22}, 2)')
+    run('applyRealtimePayload({epoch:22, rev:3, action:"replace_last", bar:{time:120,v:"new-120"}})')
+    const p = run('fetchHistory(2, null, 59)')
+    respond(requests[0], [{ time: 60, v: 'old-60' }, { time: 120, v: 'old-120' }], { epoch: 11, has_more_before: false, has_more_after: false })
+    const data = await p.catch(e => e)
+    assert.equal(data.foreignEpoch, true, "foreign page rejected whole")
+    assert.equal(data.name, "AbortError", "never surfaced as a page: no rows and no exhaustion flags applied")
+    assert.equal(run('page.reachedStart'), false, 'no false exhaustion after applying the foreign page')
+    assert.equal(vOf(run, 120), 'new-120')
+    assert.equal(vOf(run, 60), 'a')
+})
+
+test('admission A2: a delayed OLDER same-epoch valid row (WS rev or unmarked DB row) cannot overwrite a newer proven row', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60,v:"a"},{time:120,v:"seed"}])')
+    run('adoptConnectionEpoch({epoch:7}, 1)')
+    run('applyRealtimePayload({epoch:7, rev:12, action:"replace_last", bar:{time:120,v:"r12"}})')
+    run('applyRealtimePayload({epoch:7, rev:10, action:"replace_last", bar:{time:120,v:"r10"}})')
+    assert.equal(vOf(run, 120), 'r12', 'older live rev rejected')
+    const p = run('fetchHistory(2, null, 59)')
+    respond(requests[0], [{ time: 120, v: 'db-lag' }, { time: 60, v: 'a2' }], { epoch: 7 })
+    const data = await p
+    assert.deepEqual(data.bars.map(b => [b.time, b.v]), [[60, 'a2']], 'unmarked lagging DB row cannot overwrite proven r12')
+    run('applyRealtimePayload({epoch:7, rev:13, action:"replace_last", bar:{time:120,v:"r13"}})')
+    assert.equal(vOf(run, 120), 'r13', 'genuinely newer row still admitted')
+})
+
+test('admission A3: a foreign-epoch invalidation neither deletes a current valid row nor poisons', () => {
+    const { run } = harness()
+    run('setBars([{time:60,v:"a"},{time:120,v:"cur"}])')
+    run('adoptConnectionEpoch({epoch:11}, 1)')
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:22}, 2)')
+    run('applyRealtimePayload({epoch:22, rev:4, action:"replace_last", bar:{time:120,v:"r4"}})')
+    run('applyRealtimePayload({epoch:11, rev:99, action:"invalidate", invalid_time:120})')
+    assert.deepEqual(times(run), [60, 120], 'rejected frame cannot delete')
+    assert.equal(vOf(run, 120), 'r4')
+    assert.deepEqual(poison(run), [])
+})
+
+test('admission A4: OLD-epoch validAuth does not suppress a CURRENT-epoch DB invalid fact', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60,v:"a"},{time:120,v:"b"}])')
+    run('adoptConnectionEpoch({epoch:11}, 1)')
+    run('applyRealtimePayload({epoch:11, rev:40, action:"replace_last", bar:{time:120,v:"r40"}})')
+    run('wsGeneration += 1; adoptConnectionEpoch({epoch:22}, 2)')
+    const p = run('fetchHistory(2, null, 59)')
+    respond(requests[0], [], { epoch: 22, invalid_times: [120] })
+    await p
+    assert.deepEqual(poison(run), [120], 'current-epoch DB invalid applies')
+    assert.deepEqual(times(run), [60])
+})
+
+test('withdrawal B1: invalidation withholds every enabled-plugin output at/after the bucket (context is warm-up, not an influence bound), keeps earlier ones', () => {
+    const ctx = vm.createContext({ Map, Math, page: { bars: Array.from({ length: 200 }, (_, i) => ({ time: (i + 1) * 60 })) },
+        localValues: new Map(), localLive: new Map(), localRecords: new Map() })
+    vm.runInContext(section('function invalidateLocalAt', 'function syncLocalCompute'), ctx)
+    const run = code => vm.runInContext(code, ctx)
+    run('localRecords.set("p", {id:"p", enabled:true, descriptor:{context:{bars:50, per_tf:{"1m":120}}}})')
+    run('localValues.set("p/sum|history", new Map(page.bars.map(b => [b.time, b.time])))')
+    run('localValues.set("q/sum|history", new Map(page.bars.map(b => [b.time, b.time])))')
+    run('invalidateLocalAt([60*20])')
+    const kept = JSON.parse(run('JSON.stringify([...localValues.get("p/sum|history").keys()])'))
+    assert.equal(kept.length, 19, 'outputs before the bucket kept')
+    assert.ok(kept.every(t => t < 1200))
+    assert.equal(run('localValues.get("q/sum|history").size'), 199, 'unregistered plugin loses only the invalid bucket itself')
+})
+
+const flush = () => new Promise(resolve => setImmediate(resolve))
+test('validity P1 cursors: all-invalid pages advance by truthful coverage in loadMoreBefore/loadMoreAfter/pollDelayedUpdates without false exhaustion', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:600},{time:660}]); page.confirmedTime = 660')
+    // older: all-invalid page [480,540] with more before -> next request before=480 -> valid row 420
+    let pending = run('loadMoreBefore()')
+    respond(requests[0], [], { has_more_before: true, invalid_times: [540, 480], coverage_from: 480, coverage_to: 599 })
+    await flush()
+    assert.match(String(requests[1].url), /before=480/, 'cursor advanced by coverage_from, valid look-ahead not skipped')
+    respond(requests[1], [{ time: 420 }], { has_more_before: false, coverage_to: 479 })
+    await pending
+    assert.deepEqual(times(run), [420, 600, 660])
+    assert.equal(run('page.reachedStart'), true)
+    // non-advancing coverage is an error, not a loop or exhaustion
+    run('page.reachedStart = false')
+    pending = run('loadMoreBefore()')
+    respond(requests[2], [], { has_more_before: true, coverage_from: 420 })
+    await pending
+    assert.equal(run('page.reachedStart'), false, 'no false exhaustion')
+    assert.equal(requests.length, 3, 'no infinite request loop')
+    // newer: loadMoreAfter steps over [720,780] then gets 840
+    pending = run('loadMoreAfter()')
+    respond(requests[3], [], { has_more_after: true, invalid_times: [720, 780], coverage_from: 661, coverage_to: 780 })
+    await flush()
+    assert.match(String(requests[4].url), /after=780/)
+    respond(requests[4], [{ time: 840 }], { has_more_after: false })
+    await pending
+    assert.ok(times(run).includes(840))
+    // delayed poll: all-invalid tail with has_more_after -> continues; persistent cursor stays at the bar edge
+    pending = run('pollDelayedUpdates()')
+    assert.match(String(requests[5].url), /after=840/)
+    respond(requests[5], [], { has_more_after: true, invalid_times: [900], coverage_to: 900 })
+    await flush()
+    assert.match(String(requests[6].url), /after=900/)
+    respond(requests[6], [], { has_more_after: false })
+    await pending
+    assert.equal(run('page.newestTime'), 840, 'cursor not persisted past invalid buckets (later repair still fetched)')
+})
+
+test('validity: buffered invalidation during catch-up applies even at or below the closed cursor', async () => {
+    const { run, requests } = harness()
+    run('setBars([{time:60},{time:120}]); page.confirmedTime = 120')
+    const pending = run('catchUpHistory(wsGeneration, new Map([[120, {rev:7, action:"invalidate", invalid_time:120}]]))')
+    respond(requests[0], [{ time: 120, v: 'page-predates-invalidation' }])
+    assert.equal(await pending, true)
+    assert.deepEqual(times(run), [60])
+    assert.deepEqual(poison(run), [120])
+})
+
+test('validity: reload resets poison state (scope-bound)', () => {
+    const { run } = harness()
+    run('setBars([{time:60},{time:120}])')
+    run('applyRealtimePayload({rev:2, action:"invalidate", invalid_time:120})')
+    run('resetValidity()')
+    assert.deepEqual(poison(run), [])
 })

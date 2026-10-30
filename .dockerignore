@@ -20,3 +20,9 @@ logs
 *.tar
 *.tar.gz
 /reports/
+# Generated trusted runtime wasm is built in the image, never taken from context.
+**/*.wasm
+**/*.wasm.map
+**/*.so.*
+# No plugin/private module may enter the build context; the two trusted
+# runtime modules are compiled from source inside the builder.

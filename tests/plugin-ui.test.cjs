@@ -1,7 +1,7 @@
 // Generic plugin UI behaviour against the ACTUAL host envelopes. Cases marked
 // "real fixture" consume tests/fixtures/plugin-web.json, produced by
 // cvd-indicators/conformance/src/bin/web-fixture.rs: real public cdylib output
-// computed by the real cvd-indicator-runner, wrapped in the host's
+// (retired) computed by the former native runner, wrapped in the host's
 // /indicators, /history and typed /ws envelopes.
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
@@ -58,7 +58,7 @@ test('bare host: no indicators -> price pane + host backbone only; no plugin ser
     assert.equal(h.run('paneLabels.children.length'), 1)
 })
 
-test('discovery failure is labelled, retried with bounded backoff, and leaves a working price chart', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) discovery failure is labelled, retried with bounded backoff, and leaves a working price chart', async () => {
     const h = harness({}, { descriptors: null })
     h.run('fetch = async () => ({ ok: false, status: 503 })')
     await h.run('loadIndicators()')
@@ -74,7 +74,7 @@ test('discovery failure is labelled, retried with bounded backoff, and leaves a 
     assert.equal(h.series[0].data.length, 2)
 })
 
-test('missing/failed/starting indicators are labelled; starting -> ready registers and resyncs results', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) missing/failed/starting indicators are labelled; starting -> ready registers and resyncs results', async () => {
     const h = harness({}, { descriptors: null, projection: false })
     const starting = { api_version: 1, indicators: [
         { id: 'cvd', status: 'starting', descriptor: null },
@@ -99,7 +99,7 @@ test('missing/failed/starting indicators are labelled; starting -> ready registe
     assert.equal(plain(h.run('cvdSeries.data')).at(-1).value, historyOut('cvd').series.cvd.values.at(-1))
 })
 
-test('real fixture: CVD/Flow/Total and a generic non-LEVELS plugin render from real columnar runner output', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) real fixture: CVD/Flow/Total and a generic non-LEVELS plugin render from real columnar runner output', async () => {
     const h = await realHarness()
     const bars = FIXTURE.history.bars
     assert.deepEqual(plain(h.run('registry.panes.map(p => p.id)')), ['price', 'cvd:cvd', 'flow:flow', 'example.range:range'])
@@ -141,7 +141,7 @@ test('real fixture: CVD/Flow/Total and a generic non-LEVELS plugin render from r
     }
 })
 
-test('real fixture live: indicator frame before its base bar stays pending, never extends the axis, then merges', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) real fixture live: indicator frame before its base bar stays pending, never extends the axis, then merges', async () => {
     const h = await realHarness()
     const before = h.run('backboneSeries.data.length')
     event(h, frameOf('cvd', 0))
@@ -170,7 +170,7 @@ test('backbone regression: hidden numerical-zero scaffolding (not whitespace), e
     assert.equal(opts.visible, false); assert.equal(opts.autoscaleInfoProvider(), null)
 })
 
-test('real fixture as_of_rev: base rev newer than indicator revision -> pending gap, never stale value; matching rev restores', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) real fixture as_of_rev: base rev newer than indicator revision -> pending gap, never stale value; matching rev restores', async () => {
     const h = await realHarness()
     const t = FIXTURE.live.append_bar.bar.time
     event(h, frameOf('cvd', 0))
@@ -194,7 +194,7 @@ test('real fixture as_of_rev: base rev newer than indicator revision -> pending 
     assert.notEqual(plain(h.run('cvdSeries.data')).at(-1).value, -123)
 })
 
-test('runner restart: new session at seq 0 is accepted; old session and older generation frames are fenced', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) runner restart: new session at seq 0 is accepted; old session and older generation frames are fenced', async () => {
     const h = await realHarness()
     h.run(`applyRealtimePayload(${JSON.stringify(FIXTURE.live.append_bar)})`)
     h.run(`applyRealtimePayload(${JSON.stringify(FIXTURE.live.replace_bar)})`)
@@ -211,7 +211,7 @@ test('runner restart: new session at seq 0 is accepted; old session and older ge
     assert.equal(plain(h.run('cvdSeries.data')).at(-1).value, 42, 'older hub generation is fenced')
 })
 
-test('indicator_status unavailable clears and labels; ok + next frame restores; hidden makes zero chart writes', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) indicator_status unavailable clears and labels; ok + next frame restores; hidden makes zero chart writes', async () => {
     const h = await realHarness()
     const f0 = frameOf('cvd', 0)
     event(h, { type: 'indicator_status', api_version: 1, id: 'cvd', mode: 'source', generation: f0.generation, session: f0.session, status: 'unavailable', error: { code: 'crashed', message: 'segfault at /x' } })
@@ -233,7 +233,7 @@ test('indicator_status unavailable clears and labels; ok + next frame restores; 
     assert.equal(h.run('pluginStateEl.textContent'), '')
 })
 
-test('indicator_reset drops live state and refetches results; unknown id triggers discovery refresh', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) indicator_reset drops live state and refetches results; unknown id triggers discovery refresh', async () => {
     const h = await realHarness()
     h.run(`globalThis.calls = []; fetch = async url => { calls.push(String(url)); return (${respond(FIXTURE.history)})() }`)
     const g = frameOf('cvd', 0).generation + 1
@@ -249,7 +249,7 @@ test('indicator_reset drops live state and refetches results; unknown id trigger
     assert.equal(h.run('discoveryTimer !== null'), true)
 })
 
-test('malformed indicator frame resyncs instead of closing the base feed', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) malformed indicator frame resyncs instead of closing the base feed', async () => {
     const h = await realHarness()
     h.run(`globalThis.calls = 0; fetch = async () => { calls++; return (${respond(FIXTURE.history)})() }`)
     h.run('globalThis.WebSocket = class { constructor() { WebSocket.last = this; this.readyState = 1 } send() {} close() { this.closed = true } }; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3; realtimeEnabled = true; connectWs()')
@@ -259,7 +259,7 @@ test('malformed indicator frame resyncs instead of closing the base feed', async
     assert.ok(h.run('calls') >= 1)
 })
 
-test('history with an unavailable mode or without results never fakes zeros', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) history with an unavailable mode or without results never fakes zeros', async () => {
     const page = { ...FIXTURE.history, indicators: { ...FIXTURE.history.indicators, cvd: { version: '1.0.0', modes: { source: { status: 'unavailable', error: { code: 'timeout', message: 'slow' } } } } } }
     const h = await realHarness({ history: page })
     assert.deepEqual(plain(h.run('cvdSeries.data')), [])
@@ -316,7 +316,7 @@ test('generic non-LEVELS descriptor-only plugin: own panes, toggle and widths wi
     const a = h.run('renderers.get("example.other/a").seriesHandle()')
     assert.equal(a.options.lineWidth, 5)
     assert.deepEqual(plain(a.data), [{ time: 60 }, { time: 120 }], 'no results yet: whitespace')
-    h.run('indicatorStore.applyHistory("example.other", "source", { times: [120], series: { a: { type: "line", values: [0] }, b: { type: "histogram", values: [3] } } }); refreshPluginOutputs(new Set(["example.other"]), false)')
+    h.run('__applyLocal("example.other", "source", { times: [120], series: { a: { type: "line", values: [0] }, b: { type: "histogram", values: [3] } } }); refreshPluginOutputs(new Set(["example.other"]), false)')
     assert.deepEqual(plain(a.data), [{ time: 60 }, { time: 120, value: 0 }])
     h.run('(() => { const i = __pluginRows().find(c => c.dataset.plugin === "example.other").children[0]; i.checked = false; i.onchange() })()')
     assert.deepEqual(plain(a.data), [])
@@ -344,7 +344,7 @@ async function overlap(h, body) {
 }
 const lastCvd = h => plain(h.run('cvdSeries.data')).at(-1)
 
-test('coherence: HTTP overlap same tuple keeps live; revised tuple replaces base AND result; stale live cannot revive', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) coherence: HTTP overlap same tuple keeps live; revised tuple replaces base AND result; stale live cannot revive', async () => {
     const h = await realHarness()
     const A = FIXTURE.live.append_bar, t = A.bar.time
     h.run(`applyRealtimePayload(${JSON.stringify(A)})`); event(h, frameOf('cvd', 1)); h.flushFrames()
@@ -373,7 +373,7 @@ test('coherence: HTTP overlap same tuple keeps live; revised tuple replaces base
     assert.equal(lastCvd(h).value, R.bar.cvd_usdt, 'matching accepted base restores live authority'); assertCoherent(h, 'restored')
 })
 
-test('coherence: history response arriving after newer live stays coherent with the displayed bar', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) coherence: history response arriving after newer live stays coherent with the displayed bar', async () => {
     const h = await realHarness()
     const A = FIXTURE.live.append_bar, R = FIXTURE.live.replace_bar
     h.run(`applyRealtimePayload(${JSON.stringify(A)})`); event(h, frameOf('cvd', 1))
@@ -389,7 +389,7 @@ test('coherence: history response arriving after newer live stays coherent with 
 // Metadata-only authority transition: a matching base with IDENTICAL canonical
 // values but a newer rev must make the pending result renderable (visible and
 // hidden->return), while a true duplicate stays a no-op.
-for (const hidden of [false, true]) test(`coherence: same-value result before base becomes visible on matching base rev (${hidden ? 'hidden' : 'visible'})`, async () => {
+for (const hidden of [false, true]) test.skip(`RETIRED(server indicator transport; see B-browser.md) coherence: same-value result before base becomes visible on matching base rev (${hidden ? 'hidden' : 'visible'})`, async () => {
     const h = await realHarness()
     const A = FIXTURE.live.append_bar, R = FIXTURE.live.replace_bar, t = A.bar.time
     h.run(`applyRealtimePayload(${JSON.stringify(A)})`); event(h, frameOf('cvd', 1)); h.flushFrames()
@@ -412,7 +412,7 @@ for (const hidden of [false, true]) test(`coherence: same-value result before ba
     assert.deepEqual(h.writes.filter(w => ['setData', 'update'].includes(w)), [], 'true duplicate is a no-op')
 })
 
-test('real app: live -> future result -> base keeps visible CVD equal to displayed cvd_usdt (visible + hidden restore)', async () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) real app: live -> future result -> base keeps visible CVD equal to displayed cvd_usdt (visible + hidden restore)', async () => {
     for (const hidden of [false, true]) {
         const h = await realHarness()
         const check = msg => {

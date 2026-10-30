@@ -7,6 +7,17 @@
 
 > 以下是**全新安装**。已有数据库的部署不要直接套用新数据卷；见文末升级说明。
 
+## 升级：浏览器本地指标（服务端 runner 已退役）
+
+服务端不再运行指标插件，只负责采集/恢复/持久化并提供标准基础数据（含权威累计 CVD）。
+不需要也不会做数据库、历史、游标或 outbox 迁移。完整命令见英文版 docs/deployment.md
+“Upgrade: browser-local indicators”：pg_dump 备份 → checkout 发布版本 → `docker compose build cvd`
+→ `docker compose up -d --no-deps cvd` → 日志应出现 “config [indicators] is retired and IGNORED”。
+旧 `[indicators]` 配置会被接受但不加载，并逐个库打印警告；其他未知键仍会拒绝启动。
+用户在浏览器 Indicators → Import 导入从 Release 下载并核对 sha256 的 `.wasm`，仅保存在本浏览器。
+以下为旧版说明，仅供参考。
+
+
 ## 1. 获取源码和配置
 
 要求：Git、Docker Engine、Compose v2+、Linux >=5.11，Docker/seccomp 允许

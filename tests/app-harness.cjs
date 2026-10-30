@@ -39,9 +39,9 @@ function __project(bars) {
         const times = bars.map(b => b.time)
         const col = f => bars.map(b => { const v = f(b); return Number.isFinite(v) ? v : null })
         const keep = bars.filter(b => !(b._omit || []).includes('cvd'))
-        if (keep.length) indicatorStore.applyHistory('cvd', mode, { times: keep.map(b => b.time), series: { cvd: { type: 'line', values: keep.map(b => { const v = agg ? b.ac : b.cvd_usdt; return Number.isFinite(v) ? v : null }) } } })
+        if (keep.length) __applyLocal('cvd', mode, { times: keep.map(b => b.time), series: { cvd: { type: 'line', values: keep.map(b => { const v = agg ? b.ac : b.cvd_usdt; return Number.isFinite(v) ? v : null }) } } })
         const flows = bars.map(b => agg ? __flow(b.agb, b.ags, b.ad) : __flow(b.buy_volume_usdt, b.sell_volume_usdt, b.delta_usdt))
-        indicatorStore.applyHistory('flow', mode, { times, series: {
+        __applyLocal('flow', mode, { times, series: {
             delta: { type: 'histogram', values: col(b => agg ? b.ad : b.delta_usdt) },
             buy_sell: { type: 'dual_range', upper: flows.map(f => f[0]), lower: flows.map(f => f[1]) },
             total: { type: 'line', values: flows.map(f => f[2]) } } })
@@ -51,7 +51,7 @@ function __project(bars) {
                 const v = (agg ? (k % 2 ? b.alb : b.alt) : (k % 2 ? b.lb : b.lt))[1 + (k >> 1)]
                 return Number.isFinite(v) ? v : null
             }))
-            indicatorStore.applyHistory('bands', mode, { times: withBands.map(b => b.time), series: { bands: { type: 'segmented_lines', layers } } })
+            __applyLocal('bands', mode, { times: withBands.map(b => b.time), series: { bands: { type: 'segmented_lines', layers } } })
         }
     }
 }
@@ -60,6 +60,20 @@ function __project(bars) {
 `
 // Names the original assertions used, mapped onto the generic plugin UI.
 const TEST_BRIDGE = `
+// Local-package bridge for unit tests: descriptors applied directly become
+// enabled local records; projected outputs land in the browser result map
+// exactly as accepted WASM computes do (real WASM runs in the Chromium gates).
+function __applyLocal(id, mode, output) {
+    for (const [key, s] of Object.entries(output.series)) {
+        const k = id + '/' + key + '|' + mode
+        const col = localValues.get(k) ?? new Map()
+        output.times.forEach((t, i) => { const v = seriesValueAt(s, i); if (v !== undefined) col.set(t, v) })
+        localValues.set(k, col)
+    }
+}
+{ const real = applyPluginDescriptors; applyPluginDescriptors = (entries, ...rest) => {
+    for (const e of entries || []) if (e && e.descriptor && !localRecords.has(e.id)) localRecords.set(e.id, { id: e.id, name: e.id, enabled: true, descriptor: e.descriptor, params: {} })
+    return real(entries, ...rest) } }
 // Rows live in the popup (outside the toolbar); collect them at any depth.
 function __pluginRows(node = pluginMenuEl, found = []) { for (const c of node.children ?? []) { if (c.dataset?.plugin) found.push(c); else __pluginRows(c, found) } return found }
 const __menuEmpty = () => { const walk = n => n.dataset?.empty !== undefined ? n : (n.children ?? []).map(walk).find(Boolean); return walk(pluginMenuEl) }
@@ -159,9 +173,9 @@ function harness(checked = {}, options = {}) {
         clearInterval: id => timers.delete(id),
     })
     const read = file => fs.readFileSync(path.join(__dirname, '../static/js', file), 'utf8')
-    const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function')
+    const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export async function', 'async function').replaceAll('export function', 'function')
     const source = read('app.js').replace(/^import .*\n/gm, '').replace(/\ninit\(\)\s*$/, '\n')
-    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs', 'indicator-menu.mjs'].map(file => strip(read(file))).join('\n')
+    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs', 'indicator-menu.mjs', 'local-plugins.mjs', 'coordinator.mjs', 'local-compute.mjs'].map(file => strip(read(file))).join('\n')
     vm.runInContext(modules + '\n' + source + '\nconst realEnsureModeConnections = ensureModeConnections; ensureModeConnections = () => {};\n' + (options.projection === false ? '' : PROJECTION) + TEST_BRIDGE, context)
     if (options.descriptors !== null) vm.runInContext(`applyPluginDescriptors(${JSON.stringify(options.descriptors ?? TEST_DESCRIPTORS)})`, context)
     const run = code => vm.runInContext(code, context)

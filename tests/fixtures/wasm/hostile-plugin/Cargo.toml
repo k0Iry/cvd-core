@@ -1,0 +1,14 @@
+[package]
+license.workspace = true
+rust-version.workspace = true
+name = "hostile-wasm-plugin"
+description = "Synthetic hostile cvd-wasm v1 module (test fixture only; never distributed)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cvd-indicator-sdk = { path = "../../../../crates/indicator-sdk" }

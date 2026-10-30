@@ -41,7 +41,7 @@ test('open, toggle several (stays open), count + visibility update, prefs persis
     assert.deepEqual(rows(h).map(r => r.children[0]), before, 'rows reconciled in place, not rebuilt')
     assert.match(trigger(h).label, /Indicators · 1/)
     assert.equal(h.run('cvdSeries.options.visible'), false)
-    assert.equal(h.run('pluginPrefs.enabled.cvd'), false)
+    assert.equal(h.run('localRecords.get("cvd").enabled'), false)
     assert.equal(h.run('__fetches'), 0, 'no data reload from toggling')
     assert.equal(h.writes.includes('range'), false, 'viewport untouched')
     h.run('renderPluginControls()')
@@ -63,7 +63,7 @@ test('Escape closes and returns focus; outside pointer closes; inside pointer do
     assert.equal(h.run('pluginMenuEl.hidden'), true)
 })
 
-test('empty, pending and failed entries are understandable and disabled', () => {
+test.skip('RETIRED(server indicator transport; browser computes locally, see B-browser.md) empty, pending and failed entries are understandable and disabled', () => {
     const empty = harness({}, { descriptors: [] })
     assert.match(trigger(empty).label, /Indicators · 0/)
     assert.match(empty.run('__menuEmpty().textContent'), /No indicators available/)

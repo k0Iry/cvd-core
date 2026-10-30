@@ -2,14 +2,11 @@
 resolver = "2"
 members = [
     "crates/indicator-sdk",
-    "crates/indicator-runner",
-    "crates/indicator-host",
     "crates/cvd-server",
+    "crates/browser-host",
+    "tests/fixtures/wasm/hostile-plugin",
+    "tests/fixtures/wasm/stateful-plugin",
     "tests/fixtures/plugins/sample-indicator",
-    "tests/fixtures/plugins/fault-indicator",
-    "tests/fixtures/plugins/bad-abi-indicator",
-    "tests/fixtures/plugins/zero-context-indicator",
-    "tests/fixtures/plugins/raw-abi-indicator",
 ]
 
 [workspace.package]
@@ -21,3 +18,12 @@ rust-version = "1.96"
 
 [profile.release]
 panic = "unwind"
+
+# Browser WASM plugin/host builds: panic aborts (trap) on wasm32 only; native
+# server/native test builds keep `release` (panic = "unwind").
+[profile.wasm-release]
+inherits = "release"
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1

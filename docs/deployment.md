@@ -6,6 +6,48 @@ The shortest public setup is **PostgreSQL + core + the public CVD/Flow libraries
 No private repository, private key, registry account or CI run is required.
 Builds happen locally on the target Docker host; no published image tag is assumed.
 
+## Upgrade: browser-local indicators (server runner retired)
+
+The server no longer runs indicator plugins. It keeps collecting, recovering,
+persisting and serving canonical base data (including authoritative cumulative
+CVD); each visitor imports `.wasm` plugins locally in the browser. No database,
+history, cursor or outbox migration is needed and none is performed.
+
+Operator sequence (existing compose deployment; keeps `postgres-data`,
+`outbox-data`, `.env` and `artifacts/cvd.toml`):
+
+```sh
+cd <deployment checkout>
+docker compose exec -T postgres pg_dump -U cvdadmin -d cvd -Fc > ../cvd-pre-wasm.dump   # safety copy
+git fetch && git checkout <released core tag/SHA>
+docker compose build cvd                     # builds server + trusted host/coordinator wasm
+docker compose up -d --no-deps cvd           # postgres keeps running; outbox volume reused
+docker compose logs --tail=50 cvd            # expect: "config [indicators] is retired and IGNORED"
+curl -fsS http://127.0.0.1:8080/wasm-host/assets.json
+```
+
+- Legacy `[indicators]` in `artifacts/cvd.toml` is accepted, never loaded, and
+  reported once per ignored library at startup. Other unknown keys still stop
+  startup. Market sources are compiled in, so an old config cannot select
+  different sources. Remove the section when convenient (`[server]` only).
+- `compose.yaml` no longer mounts `./artifacts/plugins`; an old local compose
+  override that still mounts it is harmless. Do not delete those files until
+  you no longer want them as offline references.
+- Rollback: check out the previous tag and `docker compose up -d --build cvd`
+  (base schema is unchanged in both directions).
+
+User import (each browser): download the public release assets
+(`cvd_indicator_cvd.wasm`, `cvd_indicator_flow.wasm`, … from the public
+indicators repository Releases; verify the published sha256), open the app,
+Indicators → Import, choose the `.wasm`, then tick it to enable. Private
+plugins are downloaded with your own repository access and imported the same
+way; they are stored only in that browser (IndexedDB) and never uploaded.
+
+## Legacy (pre-WASM) server-plugin instructions
+
+The sections below describe the retired server runner and are kept only for
+reference when operating an older release.
+
 ## Fresh installation
 
 **This section creates new named database volumes. If you already run CVD, use
@@ -107,7 +149,7 @@ a different project selects different named volumes. Maintain database backups.
 Edit `artifacts/cvd.toml`, not the tracked example file. Paths are **container**
 paths under `/plugins`. Each id must match the library's descriptor and be unique.
 Use only trusted operator-provided native libraries; process isolation is not a
-sandbox for untrusted code. See the [SDK contract](plugin-api-v1.md) and the
+sandbox for untrusted code. See the [WASM plugin contract](plugin-wasm-v1.md) and the
 [public authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md).
 
 For example, after building the public range example independently in a

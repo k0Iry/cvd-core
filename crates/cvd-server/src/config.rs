@@ -1,26 +1,21 @@
 //! Operator configuration (TOML). Loaded from the path in `CVD_CONFIG`; when
-//! unset the host runs with built-in defaults and **no** indicator libraries.
-//!
-//! Indicator libraries are discovered only from this file. Clients can select
-//! installed indicator ids but can never supply a path or URL.
+//! unset the host runs with built-in defaults.
 //!
 //! ```toml
 //! [server]
 //! http_addr = "0.0.0.0:80"
 //! static_dir = "static"
-//!
-//! [indicators]
-//! runner = "/usr/local/bin/cvd-indicator-runner"
-//! history_timeout_ms = 10000
-//! live_timeout_ms = 2000
-//! queue_depth = 64
-//!
-//! [[indicators.library]]
-//! id = "sample.channel"            # must equal the library descriptor id
-//! path = "/opt/cvd/indicators/libsample_indicator.so"
-//! params = { length = 20 }         # operator-fixed parameters (JSON object)
-//! modes = ["source", "aggregate"]  # which views to compute
 //! ```
+//!
+//! Indicators are no longer executed by the server: visitors import `.wasm`
+//! plugins locally in their browser (docs/plugin-wasm-v1.md). A legacy
+//! `[indicators]` section (runner path, libraries, timeouts) from an older
+//! deployment is still ACCEPTED so an existing container keeps ingesting after
+//! an image update, but it is never loaded: startup prints an explicit warning
+//! for the section and for every ignored library. Any other unknown key is
+//! still rejected (startup fails). Market sources are compiled in
+//! (`types::INSTRUMENTS`) and cannot be selected by this file, so a legacy
+//! config can never make the server start with different sources.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -30,8 +25,9 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     #[serde(default)]
     pub server: ServerSection,
-    #[serde(default)]
-    pub indicators: IndicatorSection,
+    /// Retired server-side indicator configuration; kept only to report it.
+    #[serde(default, rename = "indicators")]
+    legacy_indicators: Option<toml::Table>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,85 +52,16 @@ fn default_static() -> PathBuf {
     "static".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndicatorSection {
-    #[serde(default)]
-    pub runner: Option<PathBuf>,
-    #[serde(default = "default_history_timeout")]
-    pub history_timeout_ms: u64,
-    #[serde(default = "default_live_timeout")]
-    pub live_timeout_ms: u64,
-    #[serde(default = "default_queue")]
-    pub queue_depth: usize,
-    #[serde(default)]
-    pub library: Vec<LibraryConfig>,
-}
-
-impl Default for IndicatorSection {
-    fn default() -> Self {
-        Self {
-            runner: None,
-            history_timeout_ms: default_history_timeout(),
-            live_timeout_ms: default_live_timeout(),
-            queue_depth: default_queue(),
-            library: Vec::new(),
-        }
-    }
-}
-
-fn default_history_timeout() -> u64 {
-    10_000
-}
-fn default_live_timeout() -> u64 {
-    2_000
-}
-fn default_queue() -> usize {
-    64
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LibraryConfig {
-    pub id: String,
-    pub path: PathBuf,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub params: Option<toml::Table>,
-    #[serde(default = "default_modes")]
-    pub modes: Vec<String>,
-}
-
-fn default_enabled() -> bool {
-    true
-}
-fn default_modes() -> Vec<String> {
-    vec!["source".into(), "aggregate".into()]
-}
-
-impl LibraryConfig {
-    /// Canonical JSON for the operator parameters (encoded once, reused).
-    pub fn params_json(&self) -> Vec<u8> {
-        match &self.params {
-            None => b"{}".to_vec(),
-            Some(t) => serde_json::to_vec(t).unwrap_or_else(|_| b"{}".to_vec()),
-        }
-    }
-}
-
 impl Config {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let cfg: Config = toml::from_str(text)?;
-        cfg.validate()?;
-        Ok(cfg)
+        Ok(toml::from_str(text)?)
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
-    /// `CVD_CONFIG` → file; unset → defaults (no indicators).
+    /// `CVD_CONFIG` → file; unset → defaults.
     pub fn from_env() -> anyhow::Result<Self> {
         match std::env::var_os("CVD_CONFIG") {
             Some(p) => Self::load(Path::new(&p)),
@@ -142,21 +69,21 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
-        let mut ids = std::collections::BTreeSet::new();
-        for l in &self.indicators.library {
-            anyhow::ensure!(ids.insert(l.id.as_str()), "duplicate indicator id {}", l.id);
-            anyhow::ensure!(l.path.is_absolute(), "indicator {} path must be absolute", l.id);
-            for m in &l.modes {
-                anyhow::ensure!(m == "source" || m == "aggregate", "indicator {} has invalid mode {m}", l.id);
+    /// Explicit warnings for retired settings that are present but ignored.
+    pub fn legacy_warnings(&self) -> Vec<String> {
+        let Some(t) = &self.legacy_indicators else { return Vec::new() };
+        let mut out = vec!["config [indicators] is retired and IGNORED: the server no longer runs indicator plugins; \
+             users import .wasm plugins in their browser (docs/deployment.md). Remove the section and any /plugins \
+             mount when convenient; base data, PostgreSQL and outbox are unaffected."
+            .to_string()];
+        if let Some(libs) = t.get("library").and_then(|v| v.as_array()) {
+            for l in libs {
+                let id = l.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let path = l.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                out.push(format!("ignored retired indicator library id={id} path={path} (not loaded)"));
             }
         }
-        if self.indicators.library.iter().any(|l| l.enabled) {
-            let r = self.indicators.runner.as_ref();
-            anyhow::ensure!(r.is_some_and(|r| r.is_absolute()), "indicators.runner must be an absolute path");
-        }
-        anyhow::ensure!(self.indicators.queue_depth > 0, "queue_depth must be > 0");
-        Ok(())
+        out
     }
 }
 
@@ -165,34 +92,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_have_no_indicators() {
+    fn defaults() {
         let c = Config::parse("").unwrap();
-        assert!(c.indicators.library.is_empty());
         assert_eq!(c.server.http_addr, "0.0.0.0:80");
+        assert!(c.legacy_warnings().is_empty());
     }
 
     #[test]
-    fn library_config_parses_and_validates() {
+    fn legacy_indicator_config_is_accepted_ignored_and_reported() {
         let c = Config::parse(
             r#"
+            [server]
+            http_addr = "0.0.0.0:8080"
             [indicators]
-            runner = "/usr/bin/cvd-indicator-runner"
+            runner = "/usr/local/bin/cvd-indicator-runner"
+            history_timeout_ms = 10000
             [[indicators.library]]
             id = "sample.channel"
-            path = "/opt/lib.so"
+            path = "/plugins/lib.so"
             params = { length = 7 }
             "#,
         )
         .unwrap();
-        assert_eq!(c.indicators.library[0].params_json(), br#"{"length":7}"#);
-        assert_eq!(c.indicators.library[0].modes, ["source", "aggregate"]);
-        for bad in [
-            "[indicators]\nrunner='/r'\n[[indicators.library]]\nid='a'\npath='rel.so'",
-            "[[indicators.library]]\nid='a'\npath='/a.so'",
-            "[indicators]\nrunner='/r'\n[[indicators.library]]\nid='a'\npath='/a.so'\n[[indicators.library]]\nid='a'\npath='/b.so'",
-            "[indicators]\nrunner='/r'\n[[indicators.library]]\nid='a'\npath='/a.so'\nmodes=['x']",
-            "[indicators]\nunknown=1",
-        ] {
+        assert_eq!(c.server.http_addr, "0.0.0.0:8080");
+        let w = c.legacy_warnings();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("IGNORED"));
+        assert!(w[1].contains("sample.channel") && w[1].contains("/plugins/lib.so"));
+    }
+
+    #[test]
+    fn shipped_legacy_public_config_still_parses() {
+        // The pre-retirement artifacts/cvd.toml template (config/cvd.public.toml at base).
+        let legacy = "[server]\nhttp_addr='0.0.0.0:8080'\nstatic_dir='/app/static'\n[indicators]\nrunner='/usr/local/bin/cvd-indicator-runner'\nhistory_timeout_ms=10000\nlive_timeout_ms=2000\nqueue_depth=64\n[[indicators.library]]\nid='cvd'\npath='/plugins/libcvd_indicator_cvd.so'\nenabled=true\nmodes=['source','aggregate']\n";
+        let c = Config::parse(legacy).unwrap();
+        assert_eq!(c.server.static_dir, PathBuf::from("/app/static"));
+        assert_eq!(c.legacy_warnings().len(), 2);
+    }
+
+    #[test]
+    fn unknown_keys_still_rejected() {
+        for bad in ["[server]\nunknown=1", "[sources]\nx=1", "http_addr='x'"] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
     }

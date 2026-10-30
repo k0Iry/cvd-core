@@ -1,6 +1,6 @@
 # cvd-core
 
-Public market-data host, SDK, renderer and isolated dynamic-library runner.
+Public market-data host, SDK, renderer and browser-local WASM plugin host.
 
 Clean-history implementation: existing CVD Git history is not imported.
 
@@ -13,11 +13,11 @@ of this repository or public image. Browser clients receive values only.
 |---|---|
 | `crates/cvd-server` | host binary `cvd`: ingestion (Binance, Coinbase spot, Coinbase USDC perps), recovery, persistence/outbox, aggregation, source quality, HTTP/WS, indicator supervision |
 | `crates/indicator-sdk` | ABI v1 / protocol v1 SDK for indicator authors (`Indicator` trait + `export_indicator!`) |
-| `crates/indicator-runner` | `cvd-indicator-runner`: loads one operator-configured library in its own process |
-| `crates/indicator-host` | async runner client used by the host |
-| `tests/fixtures/plugins` | test libraries: `sample-indicator` (normal-path protocol fixture, `sample.channel`), fault-injection, bad-ABI, zero-context and raw-ABI |
-| `docs/plugin-api-v1.md` | normative library contract |
-| `docs/host-indicator-integration.md` | HTTP/WS indicator contract |
+| `crates/browser-host` | trusted Rust→WASM plugin policy/validation/dispatch host (`static/wasm-host/cvd_browser_host.wasm`) |
+| `crates/browser-coordinator` | trusted Rust→WASM data/session planner (`static/wasm-host/cvd_browser_coordinator.wasm`) |
+| `tests/fixtures/plugins` | public protocol fixture `sample-indicator` (`sample.channel`); hostile/stateful wasm fixtures live in `tests/fixtures/wasm` |
+| `docs/plugin-api-v1.md` | RETIRED native C-ABI/runner contract (historical; SDK types only) |
+| `docs/plugin-wasm-v1.md` | normative browser WASM plugin ABI + base-data boundary |
 
 ## Deploy with Docker Compose
 
@@ -51,7 +51,7 @@ application to upgrade. Longer-context indicators may need new-source warm-up.
 
 ## Build
 
-    cargo build --release -p cvd-server -p cvd-indicator-runner   # host + runner
+    cargo build --release -p cvd-server   # base-data host; trusted wasm: see Dockerfile / scripts/assemble-static.sh
 
 Indicator libraries (e.g. the separate cvd-indicators repository) are built
 against `crates/indicator-sdk` and deployed as `.so` files listed in the
@@ -68,7 +68,7 @@ in the cvd-indicators repository, built independently there.
 | env | meaning |
 |---|---|
 | `DATABASE_URL` | PostgreSQL (required) |
-| `CVD_CONFIG` | optional TOML (`config/cvd.example.toml`): HTTP address, static dir, runner path, indicator libraries |
+| `CVD_CONFIG` | optional TOML (`config/cvd.example.toml`): HTTP address, static dir (legacy `[indicators]` is ignored with a warning) |
 | `CVD_OUTBOX_PATH` | SQLite outbox path (default `data/outbox.sqlite`) |
 | `LIVE_ACCESS_KEY` | optional realtime access key |
 
@@ -120,3 +120,17 @@ the bare host instead, not plugin rendering.
 Format only owned packages
 (`cargo fmt -p <pkg>`), never `cargo fmt --all` from a repository that has
 path dependencies on this one.
+
+## Indicators (browser-local WASM)
+
+Indicators run in the visitor's browser as imported `.wasm` modules; the
+server never loads plugins. Normative ABI/resource/lifecycle contract:
+[`docs/plugin-wasm-v1.md`](docs/plugin-wasm-v1.md). Core gate (self-contained,
+host-owned public fixtures, real Chromium): `scripts/wasm-foundation-gate.sh`.
+Self-contained app/interaction gate (builds host, coordinator and TEST-ONLY
+`cvd`/`flow` alias fixtures from this checkout, assembles the shipped static
+tree, runs the 12 real-Chromium scenarios): `scripts/core-app-gate.sh <OUT> [reps]`.
+Upgrade steps: `docs/deployment.md` → "Upgrade: browser-local indicators".
+`tests/wasm-oracle-client.mjs` is the test-only numerical oracle for
+`tests/browser-interaction.mjs`: it runs the shipped `plugin-worker.js` +
+`cvd_browser_host.wasm` in Node on the same public `.wasm` (no native runner).

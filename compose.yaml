@@ -40,12 +40,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: ./artifacts/plugins
-        target: /plugins
-        read_only: true
-        bind:
-          create_host_path: false
       - outbox-data:/app/data
 
 volumes:

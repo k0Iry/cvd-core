@@ -3,9 +3,7 @@ mod binance;
 mod coinbase;
 mod coinbase_perp;
 mod config;
-mod indicators;
 mod ingestion;
-mod live_indicators;
 mod models;
 mod persistence;
 mod quality;
@@ -173,7 +171,12 @@ pub struct Shard {
     /// Times of canonical bars dropped as non-renderable (per tf), recorded
     /// before filtering so indicator windows covering them fail closed.
     pub invalid_times: Arc<std::sync::Mutex<HashMap<Tf, std::collections::BTreeSet<i64>>>>,
+    /// Latest live-published (rev, valid) per bucket time and tf, bounded by
+    /// VALIDITY_MARKS_CAP. Overlaid on DB history pages (overlay_live_validity).
+    pub validity_marks: Arc<std::sync::Mutex<HashMap<Tf, std::collections::BTreeMap<i64, (u64, bool)>>>>,
 }
+
+pub const VALIDITY_MARKS_CAP: usize = 4 * HISTORY_CAPACITY;
 
 fn mk_shard() -> Shard {
     let (tx_1m, _) = broadcast::channel::<WsPayload>(BROADCAST_CHANNEL_CAPACITY);
@@ -204,6 +207,7 @@ fn mk_shard() -> Shard {
         rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         published: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(0))),
         invalid_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        validity_marks: Arc::new(std::sync::Mutex::new(HashMap::new())),
     }
 }
 
@@ -235,8 +239,19 @@ impl Shard {
         }
     }
 
+    #[cfg(test)]
     pub fn invalid_times_for(&self, tf: Tf) -> Vec<i64> {
         self.invalid_times.lock().unwrap().get(&tf).map(|s| s.iter().copied().collect()).unwrap_or_default()
+    }
+
+    /// Record the live publication (caller holds the tf publication lock).
+    pub fn mark_validity(&self, tf: Tf, time: i64, rev: u64, valid: bool) {
+        let mut all = self.validity_marks.lock().unwrap();
+        let m = all.entry(tf).or_default();
+        m.insert(time, (rev, valid));
+        while m.len() > VALIDITY_MARKS_CAP {
+            m.pop_first();
+        }
     }
 
     pub fn published_for(&self, tf: Tf) -> &tokio::sync::Mutex<u64> {
@@ -267,8 +282,6 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub ready: AtomicBool,
     pub access_key: Option<String>,
-    pub indicators: Arc<indicators::IndicatorManager>,
-    pub hubs: Arc<live_indicators::LiveHubs>,
     pub static_dir: std::path::PathBuf,
 }
 
@@ -316,7 +329,9 @@ struct Params {
     limit: Option<usize>,
     before: Option<i64>,
     after: Option<i64>,
-    /// Comma-separated installed indicator ids; absent = all configured, empty = none.
+    /// Retired server-side indicator selector. Accepted and ignored so old
+    /// clients keep receiving base data; indicators now compute in the browser.
+    #[allow(dead_code)]
     indicators: Option<String>,
 }
 
@@ -329,7 +344,6 @@ struct ExchangeMeta {
 
 #[derive(Serialize)]
 struct MetaPayload {
-    indicators: Vec<indicators::IndicatorInfo>,
     exchanges: Vec<ExchangeMeta>,
     instruments: &'static [types::Instrument],
     contract_series: &'static str,
@@ -860,12 +874,11 @@ async fn load_history_page(
     after: Option<i64>,
     max_time: Option<i64>,
     realtime_enabled: bool,
-    mgr: &indicators::IndicatorManager,
-    indicator_ids: &[String],
 ) -> Result<models::HistoryPayload> {
     let limit = limit.clamp(1, HISTORY_CAPACITY);
-    // Warm-up rows come only from the requested indicators' declared context.
-    let render_context = mgr.max_context(indicator_ids, tf);
+    // Server no longer computes indicators: no hidden warm-up rows. Browser
+    // plugins page canonical history themselves (exact warm-up, fenced).
+    let render_context: usize = 0;
 
     // 同时传 before + after 直接拒绝，避免歧义
     if before.is_some() && after.is_some() {
@@ -1056,19 +1069,16 @@ async fn load_history_page(
     let invalid_times = invalid_bar_times(&v);
     v.retain(Bar::is_renderable);
 
-    let keep_start = history_keep_start(&v, limit, after);
-    let scope = indicators::ScopeBase {
-        exchange: exchange.to_string(),
-        market: market.to_string(),
-        symbol: symbol.to_string(),
-        tf: tf.to_string(),
-    };
-    let indicator_outputs =
-        indicators::compute_history_guarded(mgr, indicator_ids, &scope, 0, &v, keep_start, &invalid_times).await;
     let has_more_before = trim_history_page(&mut v, limit, after, has_more_before);
 
     let oldest_time = v.first().map(|b| b.time);
     let newest_time = v.last().map(|b| b.time);
+    // Successor of compute_history_guarded's fail-closed window guard: the
+    // canonical producer reports every bucket dropped as non-renderable inside
+    // the page's truthful SCAN coverage (computed before filtering), so leading
+    // or trailing invalid rows at a page seam are never erased from both pages.
+    let (coverage_from, coverage_to) = page_coverage(before, after, has_more_before, has_more_after, oldest_time, newest_time, &invalid_times);
+    let invalid_times = invalid_times_in_page(&invalid_times, coverage_from, coverage_to);
 
     Ok(models::HistoryPayload {
         series: if MarketCategory::from_market(market) == MarketCategory::Spot { SPOT_SERIES } else { CONTRACT_SERIES },
@@ -1078,49 +1088,125 @@ async fn load_history_page(
         oldest_time,
         newest_time,
         realtime_enabled,
-        indicator_api_version: indicators::API_VERSION,
-        indicators: indicator_outputs,
+        invalid_times,
+        coverage_from,
+        coverage_to,
+        epoch: producer_epoch(),
+        validity: Vec::new(),
     })
 }
 
-/// Index of the first bar kept by [`trim_history_page`]; earlier bars are
-/// warm-up context only.
+/// Inclusive time coverage this page is authoritative for (None = unbounded).
+/// Rows in the coverage that are not returned were scanned and are invalid.
+/// A cursor-limited side ends at the last returned valid row (the next page
+/// rescans beyond it); with no valid row it ends at the last scanned invalid
+/// row so the cursor still advances on all-invalid pages.
+fn page_coverage(
+    before: Option<i64>,
+    after: Option<i64>,
+    has_more_before: bool,
+    has_more_after: bool,
+    oldest: Option<i64>,
+    newest: Option<i64>,
+    scanned_invalid: &[i64],
+) -> (Option<i64>, Option<i64>) {
+    if let Some(after) = after {
+        let to = if has_more_after { newest.or_else(|| scanned_invalid.iter().copied().max()) } else { None };
+        (Some(after + 1), to)
+    } else {
+        let from = if has_more_before { oldest.or_else(|| scanned_invalid.iter().copied().min()) } else { None };
+        (from, before.map(|b| b - 1))
+    }
+}
+
+/// Process-lifetime producer epoch: `rev` values are only comparable within
+/// one epoch (the counter restarts with the process).
+pub fn producer_epoch() -> u64 {
+    static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(|| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+        // Keep within JS Number's exact-integer range.
+        ((now ^ ((std::process::id() as u64) << 20)) & ((1u64 << 52) - 1)) | 1
+    })
+}
+
+/// Overlay the live producer's revision-bound validity marks on a DB page.
+/// The DB/outbox can lag live publication: a bucket invalidated live is
+/// removed even if the DB still holds an older valid row, and a bucket
+/// repaired live replaces a stale/invalid DB row with the in-memory canonical
+/// bar. Every mark inside the page coverage is reported with its `rev` so the
+/// browser orders HTTP observations against WS frames by data revision.
+pub fn overlay_live_validity(
+    payload: &mut models::HistoryPayload,
+    marks: &std::collections::BTreeMap<i64, (u64, bool)>,
+    hist: &VecDeque<Bar>,
+    live: Option<&Bar>,
+    max_time: Option<i64>,
+) {
+    let lo = payload.coverage_from.unwrap_or(i64::MIN);
+    let hi = payload.coverage_to.unwrap_or(i64::MAX).min(max_time.unwrap_or(i64::MAX));
+    if lo > hi {
+        return;
+    }
+    for (&time, &(rev, valid)) in marks.range(lo..=hi) {
+        let known = payload.invalid_times.contains(&time) || payload.bars.iter().any(|b| b.time == time);
+        if valid {
+            // A valid mark is proof only together with the canonical bar it
+            // certifies (closed history OR the open live bar). Without that
+            // representation, fail closed: withdraw any DB row for the bucket
+            // as an unmarked (rev 0) invalid fact and publish no valid mark.
+            let canonical = live.filter(|b| b.time == time).or_else(|| hist.iter().rev().find(|b| b.time == time));
+            match canonical {
+                Some(bar) if known => {
+                    payload.invalid_times.retain(|&t| t != time);
+                    payload.bars.retain(|b| b.time != time);
+                    let at = payload.bars.partition_point(|b| b.time < time);
+                    payload.bars.insert(at, bar.clone());
+                    payload.validity.push(models::ValidityMark { time, rev, valid });
+                }
+                Some(_) => {}
+                None => {
+                    if known {
+                        payload.bars.retain(|b| b.time != time);
+                        if !payload.invalid_times.contains(&time) {
+                            payload.invalid_times.push(time);
+                        }
+                    }
+                }
+            }
+        } else {
+            payload.bars.retain(|b| b.time != time);
+            if !payload.invalid_times.contains(&time) {
+                payload.invalid_times.push(time);
+            }
+            payload.validity.push(models::ValidityMark { time, rev, valid });
+        }
+    }
+    payload.invalid_times.sort_unstable();
+    payload.oldest_time = payload.bars.first().map(|b| b.time);
+    payload.newest_time = payload.bars.last().map(|b| b.time);
+}
+
+/// Scanned invalid bucket times inside the page coverage (inclusive; None = unbounded).
+fn invalid_times_in_page(invalid: &[i64], oldest: Option<i64>, newest: Option<i64>) -> Vec<i64> {
+    invalid.iter().copied().filter(|&t| oldest.is_none_or(|o| t >= o) && newest.is_none_or(|n| t <= n)).collect()
+}
+
 /// Times of rows that are not renderable; collected BEFORE filtering.
 fn invalid_bar_times<'a>(bars: impl IntoIterator<Item = &'a Bar>) -> Vec<i64> {
     bars.into_iter().filter(|b| !b.is_renderable()).map(|b| b.time).collect()
 }
 
-fn history_keep_start(bars: &[Bar], limit: usize, after: Option<i64>) -> usize {
-    match after {
-        Some(after) => bars.partition_point(|bar| bar.time <= after),
-        None => bars.len().saturating_sub(limit),
-    }
-}
 
-/// Resolve requested ids against installed indicators only (unknown ids are
-/// ignored; no path/URL is ever accepted from clients).
-fn requested_indicators(mgr: &indicators::IndicatorManager, raw: Option<&str>) -> Vec<String> {
-    let installed = mgr.ids();
-    match raw {
-        None => installed,
-        Some(list) => {
-            let mut ids: Vec<String> = Vec::new();
-            for id in list.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-                if installed.iter().any(|i| i == id) && !ids.iter().any(|i| i == id) {
-                    ids.push(id.to_string());
-                }
-            }
-            ids
-        }
-    }
-}
 
 fn trim_history_page(bars: &mut Vec<Bar>, limit: usize, after: Option<i64>, has_more_before: bool) -> bool {
     if let Some(after) = after {
         bars.retain(|bar| bar.time > after);
         has_more_before
     } else {
-        let has_more = bars.len() > limit;
+        // Rows filtered as invalid still count as scanned: an older scanned
+        // row exists whenever the raw scan overflowed (truthful pagination).
+        let has_more = has_more_before || bars.len() > limit;
         bars.drain(..bars.len().saturating_sub(limit));
         has_more
     }
@@ -1178,7 +1264,6 @@ pub(crate) async fn install_history(
         let mut hist = sh.for_tf(tf).0.write().await;
         merge_history(&mut hist, loaded);
     }
-    state.hubs.context_changed((exchange, market, symbol, tf));
 }
 
 /// Startup hydration: record invalid rows BEFORE dropping them from the cache.
@@ -1312,6 +1397,9 @@ async fn main() -> Result<()> {
     // Postgres URL from env
     // Example:
     let config = config::Config::from_env()?;
+    for warning in config.legacy_warnings() {
+        eprintln!("WARNING: {warning}");
+    }
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let db = PgPoolOptions::new().max_connections(DB_CONNECTIONS).connect(&database_url).await?;
@@ -1338,8 +1426,6 @@ async fn main() -> Result<()> {
         http: market_http_client()?,
         ready: AtomicBool::new(false),
         access_key,
-        indicators: indicators::IndicatorManager::start(&config),
-        hubs: Arc::new(live_indicators::LiveHubs::new()),
         static_dir: config.server.static_dir.clone(),
     };
     let state = Arc::new(state);
@@ -1366,7 +1452,6 @@ async fn main() -> Result<()> {
 fn app_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/meta", get(meta))
-        .route("/indicators", get(indicators_endpoint))
         .route("/health", get(health))
         .route("/history", get(history))
         .route("/ws", get(ws_upgrade))
@@ -1402,10 +1487,8 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 && source["recovery"]["state"] == "live"
                 && source["last_trade_ms"].as_i64().is_some_and(|time| Utc::now().timestamp_millis() - time < 90_000)
         });
-    // Indicator availability is reported but never affects ingestion health.
     Json(
-        serde_json::json!({"healthy": healthy, "ready": ready, "pending_bars": pending.ok(), "retired_pending_bars": retired.ok(), "sources": sources,
-        "indicators": state.indicators.infos().into_iter().map(|i| serde_json::json!({"id": i.id, "status": i.status, "error": i.error})).collect::<Vec<_>>()}),
+        serde_json::json!({"healthy": healthy, "ready": ready, "pending_bars": pending.ok(), "retired_pending_bars": retired.ok(), "sources": sources}),
     )
 }
 
@@ -1450,6 +1533,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
         Ok(selection) => selection,
         Err(error) => return error.into_response(),
     };
+    let (exchange_enum, market_enum, symbol_enum) = (exchange, market, symbol);
     let (exchange, market, symbol, tf) = (exchange.as_str(), market.as_str(), symbol.as_str(), tf_enum.as_str());
     let limit_cap = if tf_enum == Tf::H1 { H1_HISTORY_CAPACITY } else { HISTORY_CAPACITY };
     let limit = p.limit.unwrap_or(800).min(limit_cap);
@@ -1468,12 +1552,20 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
         after,
         max_time,
         realtime_enabled,
-        &state.indicators,
-        &requested_indicators(&state.indicators, p.indicators.as_deref()),
     )
     .await
     {
-        Ok(payload) => Json(payload).into_response(),
+        Ok(mut payload) => {
+            let sh = pick_shard(&state, exchange_enum, market_enum, symbol_enum);
+            let (marks, hist, live) = {
+                let _published = sh.published_for(tf_enum).lock().await;
+                let marks = sh.validity_marks.lock().unwrap().get(&tf_enum).cloned().unwrap_or_default();
+                let live = sh.live_bar_for_tf(tf_enum).read().await.clone();
+                (marks, sh.for_tf(tf_enum).0.read().await.clone(), live)
+            };
+            overlay_live_validity(&mut payload, &marks, &hist, live.as_ref(), max_time);
+            Json(payload).into_response()
+        }
         Err(e) => {
             let status = if e.to_string().contains("before and after cannot both be set") {
                 axum::http::StatusCode::BAD_REQUEST
@@ -1485,11 +1577,8 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
     }
 }
 
-async fn indicators_endpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "api_version": indicators::API_VERSION, "indicators": state.indicators.infos() }))
-}
 
-async fn meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn meta() -> impl IntoResponse {
     let exchanges = Exchange::ALL
         .into_iter()
         .map(|exchange| {
@@ -1517,7 +1606,6 @@ async fn meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         instruments: types::INSTRUMENTS,
         contract_series: CONTRACT_SERIES,
         spot_series: SPOT_SERIES,
-        indicators: state.indicators.infos(),
         coinbase_contract_source:
             "Coinbase USDC perpetuals via Deribit-powered gateway; independent new series, not INTX history",
     })
@@ -1559,19 +1647,15 @@ async fn ws_handler(
         Tf::M30 => sh.tx_30m.subscribe(),
         Tf::H1 => sh.tx_1h.subscribe(),
     };
-    // Shared per-scope indicator hub (None when no indicators are configured).
-    let mut indicator_sub = state.hubs.subscribe(&state, (exchange, market, symbol, tf));
-
     loop {
-        // Biased: a base frame enqueued before an indicator frame is always
-        // forwarded first (the hub's bootstrap base frame precedes the
-        // initial result computed from it).
         tokio::select! {
             biased;
             msg = rx.recv() => {
                 match msg {
                     Ok(mut payload) => {
-                        quality::enrich_delivery(&state, symbol, &mut payload.bar).await;
+                        if let Some(bar) = payload.bar.as_mut() {
+                            quality::enrich_delivery(&state, symbol, bar).await;
+                        }
                         let Ok(txt) = serde_json::to_string(&payload) else { continue; };
                         if socket.send(Message::Text(txt.into())).await.is_err() {
                             break;
@@ -1582,25 +1666,6 @@ async fn ws_handler(
                         break;
                     }
                     Err(_) => break,
-                }
-            }
-            ind = async {
-                match indicator_sub.as_mut() {
-                    Some(sub) => sub.rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let text: Arc<str> = match ind {
-                    Ok(text) => text,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Viewer missed indicator deltas: ask it to refetch.
-                        let generation = indicator_sub.as_ref().map(|s| s.hub.generation()).unwrap_or(0);
-                        live_indicators::IndicatorFrame::reset(generation).to_text()
-                    }
-                    Err(_) => { indicator_sub = None; continue; }
-                };
-                if socket.send(Message::Text(text.as_ref().into())).await.is_err() {
-                    break;
                 }
             }
             incoming = socket.recv() => {
@@ -1850,6 +1915,11 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
     let mut h = hist.write().await;
     if !bar.is_renderable() {
         sh.mark_invalid(tf, bar.time);
+        // Drop any earlier valid version of this bucket so neither the cache
+        // nor live aggregation keeps it authoritative, then signal subscribers.
+        h.retain(|b| b.time != bar.time);
+        drop(h);
+        invalidate_live_bucket(sh, tf, market, bar.time, &mut published).await;
         return;
     }
     sh.clear_invalid(tf, bar.time);
@@ -1873,10 +1943,23 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
     };
     let rev = sh.rev.fetch_add(1, Ordering::AcqRel) + 1;
     *published = rev;
-    // Base frame is enqueued before the hub can see the event, so a result
-    // stamped with `rev` can never precede its base frame on a connection.
-    let _ = tx.send(WsPayload { rev, series: series_for_market(market), action, bar: bar.clone() });
-    state.hubs.notify((exchange, market, symbol, tf), &bar, rev);
+    sh.mark_validity(tf, bar.time, rev, true);
+    let _ = tx.send(WsPayload::bar(rev, series_for_market(market), action, bar));
+}
+
+/// Shared invalidation path (caller holds the tf publication lock): clears a
+/// same-time live bar and publishes a revision-bound, scope-keyed Invalidate.
+async fn invalidate_live_bucket(sh: &Shard, tf: Tf, market: Market, time: i64, published: &mut u64) {
+    {
+        let mut live_bar = sh.live_bar_for_tf(tf).write().await;
+        if live_bar.as_ref().is_some_and(|live| live.time == time) {
+            *live_bar = None;
+        }
+    }
+    let rev = sh.rev.fetch_add(1, Ordering::AcqRel) + 1;
+    *published = rev;
+    sh.mark_validity(tf, time, rev, false);
+    let _ = sh.for_tf(tf).1.send(WsPayload::invalidate(rev, series_for_market(market), time));
 }
 
 async fn broadcast_live_payload(
@@ -1894,6 +1977,7 @@ async fn broadcast_live_payload(
     let mut published = sh.published_for(tf).lock().await;
     if !bar.is_renderable() {
         sh.mark_invalid(tf, bar.time);
+        invalidate_live_bucket(sh, tf, market, bar.time, &mut published).await;
         return;
     }
     sh.clear_invalid(tf, bar.time);
@@ -1909,10 +1993,8 @@ async fn broadcast_live_payload(
     };
     let rev = sh.rev.fetch_add(1, Ordering::AcqRel) + 1;
     *published = rev;
-    // Base frame is enqueued before the hub can see the event, so a result
-    // stamped with `rev` can never precede its base frame on a connection.
-    let _ = tx.send(WsPayload { rev, series: series_for_market(market), action, bar: bar.clone() });
-    state.hubs.notify((exchange, market, symbol, tf), &bar, rev);
+    sh.mark_validity(tf, bar.time, rev, true);
+    let _ = tx.send(WsPayload::bar(rev, series_for_market(market), action, bar));
 }
 
 pub fn parse_iso8601_to_ms(s: &str) -> Result<i64> {
@@ -1934,9 +2016,7 @@ mod drb_migration_tests;
 mod quality_tests;
 
 #[cfg(test)]
-mod pg_plugin_tests;
-#[cfg(test)]
-mod plugin_tests;
+mod producer_fixture_export;
 
 #[cfg(test)]
 mod tests {
@@ -2000,7 +2080,11 @@ mod tests {
         assert_eq!(bars.len(), 1600);
         assert_eq!(bars[0].time, 401);
         let mut older: Vec<_> = (1..=400).map(|time| bar(time, 1.0)).collect();
-        assert!(!trim_history_page(&mut older, 1600, None, true));
+        assert!(!trim_history_page(&mut older, 1600, None, false));
+        // E4-P1: rows filtered as invalid still count as scanned; a raw scan
+        // overflow means older rows exist even with fewer valid rows left.
+        let mut filtered: Vec<_> = (1..=400).map(|time| bar(time, 1.0)).collect();
+        assert!(trim_history_page(&mut filtered, 1600, None, true));
     }
 
     #[test]
@@ -2028,10 +2112,6 @@ mod tests {
     }
 
     pub(crate) async fn state() -> AppState {
-        state_with(indicators::IndicatorManager::empty()).await
-    }
-
-    pub(crate) async fn state_with(manager: Arc<indicators::IndicatorManager>) -> AppState {
         let shards = Exchange::ALL
             .into_iter()
             .flat_map(|exchange| {
@@ -2047,8 +2127,6 @@ mod tests {
             ready: AtomicBool::new(false),
             db: PgPoolOptions::new().connect_lazy("postgres://localhost/cvd_test").unwrap(),
             access_key: None,
-            indicators: manager,
-            hubs: Arc::new(live_indicators::LiveHubs::new()),
             static_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../static"),
         }
     }
@@ -2084,5 +2162,61 @@ mod tests {
             aggregate_live_cvd(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, &current).await,
             120.0
         );
+    }
+
+    /// V1 producer validity (formerly KNOWN-RED). A same-time correction that
+    /// becomes non-renderable must evict the stale valid bucket and emit an
+    /// exact, revision-bound Invalidate; a later valid version repairs it.
+    #[tokio::test]
+    async fn live_invalid_same_time_correction_is_signalled() {
+        let state = state().await;
+        let sh = pick_shard(&state, Exchange::Binance, Market::Spot, Symbol::Btc);
+        let other = pick_shard(&state, Exchange::Coinbase, Market::Spot, Symbol::Btc);
+        let mut other_rx = other.tx_1m.subscribe();
+        let mut rx = sh.tx_1m.subscribe();
+        push_publish(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, bar(59, 9.0)).await;
+        push_publish(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, bar(119, 10.0)).await;
+        let f0 = rx.try_recv().unwrap();
+        let f1 = rx.try_recv().unwrap();
+        assert!(matches!(f1.action, WsAction::Append) && f1.bar.as_ref().unwrap().time == 119);
+        let mut bad = bar(119, 11.0);
+        bad.price_close = f64::NAN;
+        push_publish(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, bad).await;
+        assert_eq!(sh.invalid_times_for(Tf::M1), vec![119], "poison recorded");
+        assert!(!sh.hist_1m.read().await.iter().any(|b| b.time == 119), "stale valid bucket evicted");
+        assert!(sh.hist_1m.read().await.iter().any(|b| b.time == 59), "unaffected bucket kept");
+        let inv = rx.try_recv().expect("invalidation frame");
+        assert!(matches!(inv.action, WsAction::Invalidate));
+        assert_eq!(inv.invalid_time, Some(119));
+        assert!(inv.bar.is_none());
+        assert_eq!(inv.rev, f1.rev + 1, "revision-bound");
+        assert!(f0.rev < f1.rev);
+        let json = serde_json::to_value(&inv).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"rev": inv.rev, "series": SPOT_SERIES, "action": "invalidate", "invalid_time": 119, "epoch": producer_epoch()})
+        );
+        let healthy = serde_json::to_value(&f1).unwrap();
+        assert!(healthy.get("invalid_time").is_none() && healthy["bar"]["time"] == 119 && healthy["action"] == "append");
+        assert!(rx.try_recv().is_err(), "exactly one frame");
+        assert!(other_rx.try_recv().is_err(), "other source scope untouched");
+        assert!(other.invalid_times_for(Tf::M1).is_empty());
+        // live (open) bucket invalidation clears the stale live bar too
+        broadcast_live_payload(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, bar(179, 12.0)).await;
+        let live = rx.try_recv().unwrap();
+        let mut bad_live = bar(179, 13.0);
+        bad_live.delta_usdt = f64::INFINITY;
+        broadcast_live_payload(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, bad_live).await;
+        let inv2 = rx.try_recv().unwrap();
+        assert!(matches!(inv2.action, WsAction::Invalidate) && inv2.invalid_time == Some(179) && inv2.rev == live.rev + 1);
+        assert!(sh.live_bar_1m.read().await.is_none(), "stale live bar cleared");
+        // valid repair: later rev, clears poison for that time only, re-appends
+        push_publish(&state, Exchange::Binance, Market::Spot, Symbol::Btc, Tf::M1, bar(119, 14.0)).await;
+        let rep = rx.try_recv().unwrap();
+        assert!(matches!(rep.action, WsAction::Append));
+        assert_eq!(rep.bar.as_ref().unwrap().time, 119);
+        assert_eq!(rep.rev, inv2.rev + 1);
+        assert_eq!(sh.invalid_times_for(Tf::M1), vec![179]);
+        assert!(sh.hist_1m.read().await.iter().any(|b| b.time == 119));
     }
 }

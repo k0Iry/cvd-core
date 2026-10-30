@@ -1,0 +1,20 @@
+[package]
+license.workspace = true
+rust-version.workspace = true
+name = "cvd-browser-host"
+description = "Rust (wasm32) browser host: validates and fences cvd-wasm v1 indicator plugins run by the browser WebAssembly engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cvd-indicator-sdk = { path = "../indicator-sdk" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+sample-indicator = { path = "../../tests/fixtures/plugins/sample-indicator" }
+stateful-indicator = { path = "../../tests/fixtures/wasm/stateful-plugin" }

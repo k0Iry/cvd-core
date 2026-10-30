@@ -11,16 +11,15 @@
 //   CVD_PROFILE       synthetic data profile: fragmented | continuous (default fragmented)
 //   CVD_SCENARIOS     comma-separated subset (default: all)
 //
-//   CVD_INDICATOR_RUNNER  real cvd-indicator-runner binary (required)
-//   CVD_INDICATOR_LIBS    comma-separated operator-owned cdylib paths (required)
+//   CVD_LOCAL_WASM        comma-separated public plugin .wasm paths (required)
 //
 // Everything is loopback: a synthetic /meta, /history and /ws fixture plus the
 // served static files and the pinned vendored Lightweight Charts. Indicator
-// results are REAL: every /history page and live tick is computed by the real
-// public cdylibs under the real runner and served in the host envelopes
-// (/indicators, history `indicators`, typed /ws `indicator` frames). Live
-// frames are produced by stateless history requests over a warm-up window
-// (the runner live-session path is covered by cvd-indicators Rust tests). No production
+// results are REAL: the browser computes them from the imported public .wasm;
+// the harness's independent NUMERICAL ORACLE runs the same .wasm through the
+// shipped trusted plugin-worker.js + cvd_browser_host.wasm in Node
+// (tests/wasm-oracle-client.mjs; successor of the retired native runner).
+// Oracle envelopes are never displayed. No production
 // host, database or market feed is contacted. Input is real CDP pointer/wheel
 // input (trusted DOM events), not programmatic range setters; setup-only
 // positioning uses the chart API and is excluded from measurements.
@@ -34,7 +33,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { RunnerClient, inputBar } from './runner-client.mjs'
+import { WasmOracleClient, inputBar } from './wasm-oracle-client.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SRC = path.resolve(process.env.CVD_STATIC_ROOT || path.join(HERE, '../static'))
@@ -75,11 +74,10 @@ function resetDataset() { dataset = Array.from({ length: TOTAL }, (_, i) => make
 const control = { beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0 }
 
 // ------------------------------------------------------------ real indicators
-const RUNNER = process.env.CVD_INDICATOR_RUNNER
-const LIBS = (process.env.CVD_INDICATOR_LIBS || '').split(',').filter(Boolean)
-if (!RUNNER || !LIBS.length) throw new Error('CVD_INDICATOR_RUNNER and CVD_INDICATOR_LIBS are required (real runner + public cdylibs)')
+const ORACLE_WASM = (process.env.CVD_LOCAL_WASM || '').split(',').filter(Boolean)
+if (!ORACLE_WASM.length) throw new Error('CVD_LOCAL_WASM is required (comma-separated public plugin .wasm paths)')
 const runners = []
-for (const lib of LIBS) runners.push(await RunnerClient.spawn(RUNNER, lib))
+for (const lib of ORACLE_WASM) runners.push(await WasmOracleClient.spawn(lib))
 const discovery = { api_version: 1, indicators: runners.map(r => ({ id: r.descriptor.id, status: 'ready', modes: ['source', 'aggregate'],
     version: r.descriptor.version, descriptor: JSON.parse(r.descriptorJson), error: null, restarts: 0 })) }
 // Coherent scope identity: the scope of the most recent request (exchange /
@@ -191,12 +189,14 @@ globalThis.__cvd = {
     title: () => document.title,
     seriesHandle: key => renderers.get(key)?.seriesHandle?.(),
     segmentedInfo: () => [...renderers.values()].filter(r => r.output.kind === "segmented_lines").map(r => ({ key: r.output.key, count: r.seriesCount(), entries: r.entries().map(e => ({ kind: e.kind, marker: e.marker, width: e.lineWidth, color: e.color, points: e.series.data().length })) })),
-    value: (key, mode, time) => indicatorStore.get(key, mode, time),
-    faults: () => JSON.parse(JSON.stringify(pluginStatus)),
+    value: (key, mode, time) => localValues.get(key + "|" + mode)?.get(time),
+    settle: () => new Promise(r => { const t = () => localCompute && localCompute.idle() ? requestAnimationFrame(() => requestAnimationFrame(r)) : setTimeout(t, 20); t() }),
+    localHost: () => localHost, localRecords: () => localRecords, localValues: () => localValues, localCompute: () => localCompute,
+    faults: () => Object.fromEntries([...localRecords.keys()].map(id => [id, localCompute?.fault(id)]).filter(([, f]) => f)),
     registry: () => ({ plugins: registry.plugins.map(p => p.id), pending: registry.pending.map(p => ({ id: p.id, status: p.status })) }),
-    resync: () => resyncIndicators(),
+    resync: async () => {}, // server indicator resync retired (browser computes locally)
     epoch: () => indicatorStore.epoch,
-    loadIndicators: () => loadIndicators(),
+    loadIndicators: async () => {}, // server discovery retired: rows come only from local imports
     // Actual LWC series state per plugin (not app-level prefs).
     pluginSeries: id => [...renderers.values()].filter(r => r.output.pluginId === id).map(r => { const s = r.seriesHandle?.(); return { key: r.output.key, visible: !!s && s.options().visible !== false, points: s ? s.data().length : 0 } }),
 }
@@ -350,6 +350,36 @@ async function wheel(deltaY, count, stepMs = 16) {
 }
 
 // ------------------------------------------------------------ scenario setup
+// Browser-local WASM (lane B): the app computes indicators itself from
+// locally imported modules; the oracle envelopes above (shipped worker+host in Node) remain only as
+// the native NUMERICAL ORACLE (and must never be displayed). The REAL public
+// CVD/Flow .wasm are imported once per profile through the trusted file input
+// (DOM.setFileInputFiles) and enabled with trusted clicks; IndexedDB keeps
+// them across navigations exactly like a user's browser.
+const LOCAL_WASM = (process.env.CVD_LOCAL_WASM || '').split(',').filter(Boolean)
+if (!LOCAL_WASM.length) throw new Error('CVD_LOCAL_WASM is required (comma-separated public cvd/flow .wasm paths)')
+async function ensureLocalPlugins() {
+    await waitFor(`!!__cvd.localHost && !!__cvd.localHost()`)
+    const ids = runners.map(r => r.descriptor.id)
+    if (!(await evaluate(`${JSON.stringify(ids)}.every(id => __cvd.localRecords().has(id))`))) {
+        const { root } = await call('DOM.getDocument', { depth: -1 })
+        for (const file of LOCAL_WASM) {
+            const { nodeId } = await call('DOM.querySelector', { nodeId: root.nodeId, selector: '.plugin-import-input' })
+            const before = await evaluate('__cvd.localRecords().size')
+            await call('DOM.setFileInputFiles', { nodeId, files: [file] })
+            await waitFor(`__cvd.localRecords().size > ${before} || /already/.test(document.querySelector('.plugin-menu-notice')?.textContent ?? '')`)
+        }
+    }
+    for (const id of ids) {
+        if (await evaluate(`__cvd.localRecords().get(${JSON.stringify(id)}).enabled`)) continue
+        if (await evaluate(`document.getElementById('plugin-menu').hidden`)) await evaluate(`document.querySelector('.plugin-menu-trigger').click()`)
+        const p = await evaluate(`(() => { const b = document.querySelector('.plugin-menu-row[data-plugin=${JSON.stringify(id)}] input').getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 } })()`)
+        await call('Input.dispatchMouseEvent', { type: 'mousePressed', ...p, button: 'left', buttons: 1, clickCount: 1 })
+        await call('Input.dispatchMouseEvent', { type: 'mouseReleased', ...p, button: 'left', buttons: 0, clickCount: 1 })
+    }
+    if (!(await evaluate(`document.getElementById('plugin-menu').hidden`))) await evaluate(`document.querySelector('.plugin-menu-trigger').click()`)
+    await waitFor(`${JSON.stringify(ids)}.every(id => [...__cvd.localValues().keys()].some(k => k.startsWith(id + '/'))) && __cvd.localCompute().idle()`, 30000)
+}
 const CACHE_TARGET = 16000
 // Price + one pane per separate (indicator, pane_group) from real descriptors.
 const EXPECTED_PANES = 1 + new Set(runners.flatMap(r => r.descriptor.outputs.filter(o => o.pane === 'separate' && !o.readout_only).map(o => `${r.descriptor.id}:${o.pane_group ?? o.key}`))).size
@@ -360,11 +390,13 @@ async function openPage() {
     control.requests.length = 0
     await call('Page.navigate', { url: `http://127.0.0.1:${PORT}/` })
     await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
+    await ensureLocalPlugins()
     // Setup only: grow the cache through the real older-page path.
     for (let i = 0; i < 40 && (await evaluate('__cvd.page.bars.length')) < CACHE_TARGET; i++) {
         await sleep(320)
         await evaluate('__cvd.loadMoreBefore()')
     }
+    await evaluate("__cvd.settle()") // setup: let browser-local recomputes of the grown cache land before measuring
     await frames(3)
     paneBox = await evaluate(`(() => { const r = __cvd.elements.chartEl.getBoundingClientRect(); const h = __cvd.chart.panes()[0].getHeight(); return { x: r.left, y: r.top, width: r.width - 70, height: h } })()`)
 }
@@ -458,9 +490,9 @@ const scenarios = {
             const flowState = () => evaluate(`(() => { const s = __cvd.chart.panes().find(p => p.getSeries().includes(__cvd.seriesHandle('flow/buy_sell'))).getSeries(); const custom = s.find(x => x.seriesType() === 'Custom'); const hist = s.find(x => x.seriesType() === 'Histogram'); return { custom: custom?.options().visible, hist: hist?.options().visible, last: custom?.data().at(-1)?.values ?? null, delta: hist?.data().at(-1)?.value ?? null, summary: document.querySelector('[data-pane-summary="flow:flow"]').textContent } })()`)
             await flowSelect('flow/buy_sell')
             const buySell = await flowState()
-            await evaluate(`(() => { const e = __cvd.elements.aggToggle; e.checked = true; e.onchange(); return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))) })()`)
+            await evaluate(`(() => { const e = __cvd.elements.aggToggle; e.checked = true; e.onchange(); return __cvd.settle() })()`)
             const agg = { ...(await flowState()), cvd: await evaluate(`__cvd.chart.panes()[1].getSeries()[0].data().at(-1).value`) }
-            await evaluate(`(() => { const e = __cvd.elements.aggToggle; e.checked = false; e.onchange(); return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))) })()`)
+            await evaluate(`(() => { const e = __cvd.elements.aggToggle; e.checked = false; e.onchange(); return __cvd.settle() })()`)
             await flowSelect('flow/delta')
             const delta = await flowState()
             const labelGeometry = await evaluate(`(() => { const top = document.querySelector('.plugin-pane-label[data-pane="flow:flow"]').getBoundingClientRect().top - __cvd.elements.chartEl.getBoundingClientRect().top; const panes = __cvd.chart.panes(); const i = panes.findIndex(p => p.getSeries().includes(__cvd.seriesHandle('flow/buy_sell'))); return { top, expected: panes.slice(0, i).reduce((a, p) => a + p.getHeight(), 0) + i } })()`)
@@ -708,7 +740,7 @@ const scenarios = {
     async lifecycle_fences() {
         // Real-browser availability / fencing gate. Frames are hand-sequenced
         // (generation/session/seq/as_of_rev) but every output VALUE is computed
-        // by the real public cdylib under the real runner for the exact bar.
+        // by the WASM oracle (same public .wasm, shipped host) for the exact bar.
         const plugin = runners[0].descriptor
         const outKey = plugin.outputs.find(o => !o.readout_only).key
         const key = `${plugin.id}/${outKey}`
@@ -797,7 +829,7 @@ const scenarios = {
     async history_coherence() {
         // Base bar and derived result are ONE admission decision: whenever the
         // public CVD result is shown it must equal the DISPLAYED canonical
-        // cvd_usdt. Values come from the real cdylib under the real runner via
+        // cvd_usdt. Values come from the WASM oracle (same public .wasm) via
         // the real /history path (resync) and real typed WS frames.
         const cvd = runners.find(r => r.descriptor.id === 'cvd')
         if (!cvd) return { m: null, checks: { cvd_library_loaded: false } }
@@ -929,14 +961,17 @@ const scenarios = {
     async indicator_menu() {
         // Compact indicator multiselect, driven ONLY by trusted CDP pointer
         // and key input. Rows for 'cvd'/'flow' etc. come from REAL public
-        // cdylib descriptors under the real runner; rows named synthetic.* are
+        // plugin descriptors validated by the shipped host; rows named synthetic.* are
         // SYNTHETIC discovery entries (pending/failed/overflow) served by the
         // loopback /indicators fixture and never computed.
         const shots = path.join(OUT, 'indicator-menu')
         fs.mkdirSync(shots, { recursive: true })
         const shot = async name => { const r = await call('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(shots, name + '.png'), Buffer.from(r.data, 'base64')); return name + '.png' }
         const failures = []
-        const check = (name, ok, detail) => { x.checks[name] = !!ok; if (!ok) failures.push(name + ' ' + JSON.stringify(detail ?? null).slice(0, 400)) }
+        // Checks whose fixture was the retired SERVER discovery (reordered/pending/failed/error rows, 40 synthetic
+        // descriptor-less rows): no such rows can exist for local packages. Recorded as retired, never as passed.
+        const RETIRED_CHECKS = /^(kb_reordered_uses_rendered_order|kb_all_disabled_leaves_trigger|kb_empty_leaves_trigger|pending_failed_rows_disabled|error_empty_understandable|.*_scrollable_bounded)$/
+        const check = (name, ok, detail) => { if (RETIRED_CHECKS.test(name)) { (x.details.retired ??= []).push(name); return } x.checks[name] = !!ok; if (!ok) failures.push(name + ' ' + JSON.stringify(detail ?? null).slice(0, 400)) }
         const x = { checks: {}, screenshots: [], details: {} }
         const S = `document.querySelector('#plugin-controls > button')`
         const state = () => evaluate(`(() => { const t = ${S}, p = document.getElementById('plugin-menu'), r = p.getBoundingClientRect()
@@ -1007,6 +1042,7 @@ const scenarios = {
             const visOff = Object.fromEntries(await Promise.all(realIds.map(async id => [id, await evaluate(`__cvd.pluginSeries(${JSON.stringify(id)})`)])))
             await click(row(realIds[0]))
             const after = await state()
+            await evaluate('__cvd.settle()') // re-enable recomputes in the plugin Worker (async)
             const visOn = await evaluate(`__cvd.pluginSeries(${JSON.stringify(realIds[0])})`)
             await sleep(400); await frames(4)
             const end = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades, sockets: sockets.size }
@@ -1093,7 +1129,7 @@ const scenarios = {
         x.details.keyboard = { neighbours: nbr, ...kb }
         const path_ = steps => steps.map(q => q.at)
         check('kb_neighbours_known', !!nbr.prev && !!nbr.next, nbr)
-        check('kb_forward_rows_then_next_control', JSON.stringify(path_(kb.forward)) === JSON.stringify(['trigger', ...kb.enabledIds, nbr.next]) && kb.forward[0].open && !kb.forward.at(-1).open && kb.forward.slice(0, -1).every(q => q.open), kb.forward)
+        check('kb_forward_rows_then_next_control', JSON.stringify(path_(kb.forward).filter((v, i, a) => v !== a[i - 1])) === JSON.stringify(['trigger', ...kb.enabledIds, 'BUTTON', nbr.next]) /* each row: checkbox + its Remove/Params actions (same row id), then Import .wasm, then next control */ && kb.forward[0].open && !kb.forward.at(-1).open && kb.forward.slice(0, -1).every(q => q.open), kb.forward)
         check('kb_backward_first_to_trigger_to_prev', kb.backward.b0 === kb.enabledIds[0] && kb.backward.b1.at === 'trigger' && kb.backward.b1.open && kb.backward.b2.at === nbr.prev && !kb.backward.b2.open, kb.backward)
         check('kb_reordered_uses_rendered_order', JSON.stringify(kb.reorderedRows) === JSON.stringify([...realIds].reverse()) && JSON.stringify(path_(kb.reordered)) === JSON.stringify(['trigger', ...[...realIds].reverse(), nbr.next]) && !kb.reordered.at(-1).open, { rows: kb.reorderedRows, path: kb.reordered })
         check('kb_all_disabled_leaves_trigger', JSON.stringify(path_(kb.allDisabled)) === JSON.stringify(['trigger', nbr.next]) && kb.allDisabled[0].open && !kb.allDisabled.at(-1).open, kb.allDisabled)
@@ -1218,7 +1254,7 @@ const scenarios = {
         const tr = await evaluate('__menuTrusted')
         check('all_menu_input_trusted', trusted && tr.n > 0 && tr.untrusted === 0, tr)
         x.failures = failures
-        fs.writeFileSync(path.join(shots, 'indicator-menu-results.json'), JSON.stringify({ label: 'Headless Chromium (not Safari). Rows cvd/flow-style ids come from REAL public cdylibs via the real runner; synthetic.* rows are SYNTHETIC loopback discovery entries.', real_ids: realIds, ...x, toggle_measure: { requests: m.requests.length, calls: m.calls, before: t.before, end: t.end } }, null, 1))
+        fs.writeFileSync(path.join(shots, 'indicator-menu-results.json'), JSON.stringify({ label: 'Headless Chromium (not Safari). Rows cvd/flow-style ids come from REAL public .wasm validated by the shipped host; synthetic.* rows are SYNTHETIC loopback discovery entries.', real_ids: realIds, ...x, toggle_measure: { requests: m.requests.length, calls: m.calls, before: t.before, end: t.end } }, null, 1))
         if (failures.length) console.log('indicator_menu failures:\n  ' + failures.join('\n  '))
         return { m, checks: x.checks }
     },
@@ -1264,8 +1300,18 @@ try {
     await call('Page.addScriptToEvaluateOnNewDocument', { source: `if (!sessionStorage.getItem('cvd_keep_prefs')) localStorage.setItem('cvd_prefs_v1', JSON.stringify({ exchange: 'binance', symbol: 'BTC', market: 'spot', tf: '1m', showRd: true, showKd: true, showFd: true, showHd: true, showLevels: true, showAgg: false, flowMode: 'delta' }))` })
     const unknown = [...(ONLY ?? [])].filter(name => !(name in scenarios))
     if (unknown.length) throw new Error(`unknown CVD_SCENARIOS: ${unknown.join(',')}`)
+    // Scenarios whose subject was the SERVER indicator transport (typed WS
+    // indicator frames, as_of_rev/session fences, /indicators discovery
+    // states). The browser no longer consumes those envelopes, so they are
+    // explicitly RETIRED (listed in results, never silently skipped). Their
+    // invariants moved to the browser boundary: scope/revision/instance fences,
+    // stale-result rejection, fault isolation and no-stale-paint are asserted by
+    // tests/local-plugins.test.mjs and tests/local-wasm-browser.mjs.
+    const RETIRED = { lifecycle_fences: 'server indicator frame fences', history_coherence: 'server history/live indicator coherence', discovery_states: 'server /indicators discovery states' }
+    results.retired = RETIRED
     for (const [name, run] of Object.entries(scenarios)) {
         if (ONLY && !ONLY.has(name)) continue
+        if (RETIRED[name]) { console.log(`${name}: RETIRED (${RETIRED[name]}; see B-browser.md)`); continue }
         const reps = []
         for (let rep = 0; rep < REPS; rep++) {
             await openPage()

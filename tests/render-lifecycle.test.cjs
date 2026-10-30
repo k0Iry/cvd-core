@@ -490,7 +490,7 @@ test('fragmented LEVELS stay bounded: native tail + one custom history per layer
     // Toggle off removes everything; on recreates bounded set.
     h.run('levelsToggle.checked = false; levelsToggle.onchange()')
     assert.equal(h.run('levelsRenderedSeries.length + levelsSlots.length'), 0)
-    h.run(`page.bars = ${JSON.stringify(bars)}; renderedWindow = { start: 0, bars: page.bars }; levelsToggle.checked = true; levelsToggle.onchange()`)
+    h.run(`page.bars = ${JSON.stringify(bars)}; renderedWindow = { start: 0, bars: page.bars }; levelsToggle.checked = true; levelsToggle.onchange(); __project(page.bars); setLevelsData(page.bars)`)
     assert.equal(h.run('levelsRenderedSeries.length'), 12)
     // Continuous data keeps six native tails only.
     h.run(`aggToggle.checked = false; setLevelsData(${JSON.stringify(fragmentedBars(50, 1000))})`)

@@ -154,8 +154,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
                 after_time,
                 None,
                 true,
-                &indicators::IndicatorManager::empty(),
-                &[],
             )
             .await
             .unwrap();
@@ -179,8 +177,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
             None,
             None,
             true,
-            &indicators::IndicatorManager::empty(),
-            &[],
         )
         .await
         .unwrap();
@@ -235,8 +231,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
             after_time,
             max_time,
             max_time.is_none(),
-            &indicators::IndicatorManager::empty(),
-            &[],
         )
         .await
         .unwrap();
@@ -326,7 +320,7 @@ async fn retired_sources_are_absent_from_shards_and_metadata() {
     let state = tests::state().await;
     assert_eq!(state.shards.len(), 14);
     assert!(state.shards.keys().all(|(exchange, _, _)| exchange.as_str() != "bybit"));
-    let response = meta(State(Arc::new(tests::state().await))).await.into_response();
+    let response = meta().await.into_response();
     let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["exchanges"].as_array().unwrap().len(), 2);

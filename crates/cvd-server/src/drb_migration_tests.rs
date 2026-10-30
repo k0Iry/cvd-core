@@ -135,13 +135,13 @@ async fn http_and_authorized_ws_fence_before_database_and_advertise_source() {
     .unwrap();
     shard
         .tx_1h
-        .send(WsPayload { rev: 0, series: CONTRACT_SERIES, action: WsAction::Append, bar: tests::bar(119, 1.0) })
+        .send(WsPayload::bar(0, CONTRACT_SERIES, WsAction::Append, tests::bar(119, 1.0)))
         .unwrap();
     let msg = tokio::time::timeout(Duration::from_secs(2), socket.next()).await.unwrap().unwrap().unwrap();
     let payload: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(payload["series"], CONTRACT_SERIES);
     socket.close(None).await.unwrap();
-    let response = meta(State(Arc::new(tests::state().await))).await.into_response();
+    let response = meta().await.into_response();
     let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
     let meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(meta["contract_series"], CONTRACT_SERIES);
