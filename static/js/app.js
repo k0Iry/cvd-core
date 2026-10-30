@@ -497,7 +497,6 @@ function applyPrefs(prefs) {
         ? prefs.exchange : "binance"
     setSelectOptions(exchangeSel, Object.keys(exchangeMeta), preferredExchange)
     updateOptionsForExchange()
-    const markets = exchangeMeta[exchangeSel.value].markets
     const retired = exchangeSel.value === "coinbase" && prefs.market === "usdm"
     setSelectOptions(symbolSel, exchangeMeta[exchangeSel.value].symbols, prefs.symbol)
     const preferredMarket = retired && available(exchangeSel.value, "usdc", symbolSel.value) ? "usdc" : prefs.market
@@ -782,7 +781,6 @@ function scopeNow() {
 // kind "tail" = ordinary live tick (append/replace of the newest bars, served
 // by LiveUpdate); anything else changes the history basis (load/prepend).
 let historyRevision = 0
-let localScopeKey = ""
 let lastDemandBasis = null
 function noteDataChanged(kind = "history") {
     // Metadata-only notifications (labels/health relabel, same scope, same
@@ -797,7 +795,6 @@ function noteDataChanged(kind = "history") {
     const scope = scopeNow()
     const scopeKey = JSON.stringify(scope)
     // A scope change clears the accepted values in Rust (view.clear via onView).
-    localScopeKey = scopeKey
     publishLocalDemand(scope, scopeKey)
 }
 function publishLocalDemand(scope = scopeNow(), scopeKey = JSON.stringify(scope)) {

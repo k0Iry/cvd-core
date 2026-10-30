@@ -672,6 +672,20 @@ const scenarios = {
             const flowState = () => evaluate(`(() => { const s = __cvd.chart.panes().find(p => p.getSeries().includes(__cvd.seriesHandle('flow/buy_sell'))).getSeries(); const custom = s.find(x => x.seriesType() === 'Custom'); const hist = s.find(x => x.seriesType() === 'Histogram'); return { custom: custom?.options().visible, hist: hist?.options().visible, last: custom?.data().at(-1)?.values ?? null, delta: hist?.data().at(-1)?.value ?? null, summary: document.querySelector('[data-pane-summary="flow:flow"]').textContent } })()`)
             await flowSelect('flow/buy_sell')
             const buySell = await flowState()
+            // Real toolbar export: the production handler's anchor (click intercepted
+            // once) carries a PNG of the real LWC canvas whose Flow pane shows both colours.
+            const exported = await evaluate(`(() => { let a = null; const orig = HTMLAnchorElement.prototype.click
+                HTMLAnchorElement.prototype.click = function () { a = this }
+                try { __cvd.elements.screenshotBtn.click() } finally { HTMLAnchorElement.prototype.click = orig }
+                const c = __cvd.chart.takeScreenshot(), g = c.getContext('2d'), panes = __cvd.chart.panes()
+                const i = panes.findIndex(p => p.getSeries().includes(__cvd.seriesHandle('flow/buy_sell')))
+                const k = c.height / panes.reduce((n, p) => n + p.getHeight(), 0), y0 = Math.ceil((panes.slice(0, i).reduce((n, p) => n + p.getHeight(), 0) + 12) * k)
+                const d = g.getImageData(0, y0, Math.max(1, c.width - Math.ceil(100 * k)), Math.max(1, Math.floor(panes[i].getHeight() * k) - 12)).data
+                let green = 0, red = 0
+                for (let j = 0; j < d.length; j += 4) { const r = d[j], gg = d[j + 1], b = d[j + 2]
+                    if (gg > r * 1.25 && gg > b * 1.1 && gg > 90) green++; if (r > gg * 1.4 && r > b * 1.15 && r > 130) red++ }
+                return { href: a ? a.href.slice(0, 40) : null, download: a?.download ?? null, green, red }
+            })()`)
             await evaluate(`(() => { const e = __cvd.elements.aggToggle; e.checked = true; e.onchange(); return __cvd.settle() })()`)
             const agg = { ...(await flowState()), cvd: await evaluate(`__cvd.chart.panes()[1].getSeries()[0].data().at(-1).value`) }
             await evaluate(`(() => { const e = __cvd.elements.aggToggle; e.checked = false; e.onchange(); return __cvd.settle() })()`)
@@ -679,7 +693,7 @@ const scenarios = {
             const delta = await flowState()
             const labelGeometry = await evaluate(`(() => { const top = document.querySelector('.plugin-pane-label[data-pane="flow:flow"]').getBoundingClientRect().top - __cvd.elements.chartEl.getBoundingClientRect().top; const panes = __cvd.chart.panes(); const i = panes.findIndex(p => p.getSeries().includes(__cvd.seriesHandle('flow/buy_sell'))); return { top, expected: panes.slice(0, i).reduce((a, p) => a + p.getHeight(), 0) + i } })()`)
             const savedPrefs = await evaluate(`JSON.parse(localStorage.getItem('cvd_prefs_v1'))`)
-            return { layout, buySell, agg, delta, labelGeometry, savedPrefs }
+            return { layout, buySell, exported, agg, delta, labelGeometry, savedPrefs }
         })
         const x = m.extra
         const last = dataset.at(-1)
@@ -691,6 +705,8 @@ const scenarios = {
             total_readout_both_modes: /· Total \d/.test(x.buySell.summary) && /· Total \d/.test(x.delta.summary),
             quality_badge: typeof x.layout.quality === 'string' && x.layout.quality.length > 0,
             buy_sell_visible: x.buySell.custom === true && x.buySell.hist === false && JSON.stringify(x.buySell.last) === JSON.stringify([last.buy_volume_usdt, 0, -last.sell_volume_usdt, 0]),
+            screenshot_png_export: /^data:image\/png;base64,iVBORw0KGgo/.test(x.exported.href) && /^cvd-.+\.png$/.test(x.exported.download),
+            buy_sell_rendered_colors: x.exported.green > 30 && x.exported.red > 30,
             agg_flow_and_cvd: JSON.stringify(x.agg.last) === JSON.stringify([last.agb, 0, -last.ags, 0]) && x.agg.cvd === last.ac,
             delta_restored: x.delta.hist === true && x.delta.custom === false && Math.abs(x.delta.delta - last.delta_usdt) < 1e-9,
             flow_label_on_third_pane: Math.abs(x.labelGeometry.top - x.labelGeometry.expected) < 16,
