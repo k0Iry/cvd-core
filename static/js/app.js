@@ -1,20 +1,20 @@
-import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=local-wasm-2"
-import { elements } from "./dom.js?v=local-wasm-2"
+import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=local-wasm-3"
+import { elements } from "./dom.js?v=local-wasm-3"
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=local-wasm-2"
-import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=local-wasm-2"
-import { parseIndicatorFrame, seriesValueAt } from "./plugin-wire.mjs?v=local-wasm-2"
-import { openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, sanitizeParams, validRecord, parseParamInput, contextBars } from "./local-plugins.mjs?v=local-wasm-2"
-import { createLocalCompute } from "./local-compute.mjs?v=local-wasm-2"
-import { createCoordinator } from "./coordinator.mjs?v=local-wasm-2"
-import { WasmPluginHost } from "/wasm-host/host-bridge.js?v=local-wasm-2"
-import { createIndicatorStore } from "./plugin-store.mjs?v=local-wasm-2"
-import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=local-wasm-2"
-import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=local-wasm-2"
-import { createOutputRenderer } from "./plugin-render.mjs?v=local-wasm-2"
-import { createIndicatorMenu } from "./indicator-menu.mjs?v=local-wasm-2"
-import { createTimeLabelFormatters } from "./time-labels.mjs?v=local-wasm-2"
+import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=local-wasm-3"
+import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=local-wasm-3"
+import { parseIndicatorFrame, seriesValueAt } from "./plugin-wire.mjs?v=local-wasm-3"
+import { openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, sanitizeParams, validRecord, parseParamInput, contextBars } from "./local-plugins.mjs?v=local-wasm-3"
+import { createLocalCompute } from "./local-compute.mjs?v=local-wasm-3"
+import { createCoordinator } from "./coordinator.mjs?v=local-wasm-3"
+import { WasmPluginHost } from "/wasm-host/host-bridge.js?v=local-wasm-3"
+import { createIndicatorStore } from "./plugin-store.mjs?v=local-wasm-3"
+import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=local-wasm-3"
+import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=local-wasm-3"
+import { createOutputRenderer } from "./plugin-render.mjs?v=local-wasm-3"
+import { createIndicatorMenu } from "./indicator-menu.mjs?v=local-wasm-3"
+import { createTimeLabelFormatters } from "./time-labels.mjs?v=local-wasm-3"
 
 const {
     exchangeSel,
@@ -1000,8 +1000,9 @@ function refreshPluginOutputs(ids, statusChanged, touched = null) {
     const incremental = !statusChanged && firstTouched !== null && tailStart !== undefined && firstTouched >= tailStart
     forEachRenderer(renderer => {
         if (!ids.has(renderer.output.pluginId)) return
-        if (statusChanged || !incremental || renderer.output.throttled) { renderer.dirty = true; return }
-        if (!outputActive(renderer.output)) { renderer.dirty = true; return }
+        // A dirty renderer is filled from the current window by syncPluginSeries
+        // below; never attempt an incremental update on its stale contents.
+        if (statusChanged || !incremental || renderer.output.throttled || renderer.dirty || !outputActive(renderer.output)) { renderer.dirty = true; return }
         for (const bar of window) if (bar.time >= firstTouched) renderer.update(bar, aggregate)
     })
     syncPluginSeries(window, false)

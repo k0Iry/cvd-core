@@ -103,7 +103,7 @@ function pushRaw(frame) { const text = JSON.stringify(frame); for (const s of so
 function nextRev() { return ++baseRev }
 function dropSockets() { for (const s of sockets) s.destroy(); sockets.clear() }
 function releaseHeld() { const h = control.held ?? []; control.held = []; for (const x of h) x.send(); return h.map(x => x.search) }
-const BRIDGE = `\nwindow.__cvd = { page, renderers: () => renderers, chart, loadMoreBefore, values: () => localValues, compute: () => localCompute, host: () => localHost, records: () => localRecords, notice: () => importNotice, revision: () => dataRevision, historyRevision: () => historyRevision, noteDataChanged, olderPages: () => localOlderPages, coverage: () => localCoverage, registryFromRecords, renderIndicatorMenu, pluginState: () => pluginStateEl && pluginStateEl.title, fmtReadout: (key, v) => { const o = registry.panes.flatMap(p => p.outputs).find(o => o.key === key); return o ? readoutText(o, v) : null }, setMode: m => { aggToggle.checked = m === 'aggregate'; aggToggle.onchange() }, db: () => localDb, toggleReceipts: () => (typeof toggleReceipts === 'undefined' ? null : toggleReceipts), poison: () => [...invalidPoison.keys()], epoch: () => producerEpoch, fetchSkip: (l, b, a) => fetchHistorySkippingInvalid(l, b, a), validAuth: t => validAuth.get(t) ?? null }\n`
+const BRIDGE = `\nwindow.__cvd = { page, renderers: () => renderers, chart, loadMoreBefore, values: () => localValues, compute: () => localCompute, host: () => localHost, records: () => localRecords, notice: () => importNotice, revision: () => dataRevision, historyRevision: () => historyRevision, noteDataChanged, olderPages: () => localOlderPages, coverage: () => localCoverage, registryFromRecords, renderIndicatorMenu, pluginState: () => pluginStateEl && pluginStateEl.title, fmtReadout: (key, v) => { const o = registry.panes.flatMap(p => p.outputs).find(o => o.key === key); return o ? readoutText(o, v) : null }, setMode: m => { aggToggle.checked = m === 'aggregate'; aggToggle.onchange() }, db: () => localDb, toggleReceipts: () => (typeof toggleReceipts === 'undefined' ? null : toggleReceipts), poison: () => [...invalidPoison.keys()], epoch: () => producerEpoch, fetchSkip: (l, b, a) => fetchHistorySkippingInvalid(l, b, a), validAuth: t => validAuth.get(t) ?? null, refresh: (ids, sc, touched) => refreshPluginOutputs(ids, sc, touched), window: () => renderedWindow.bars }\n`
 const appSource = fs.readFileSync(process.env.CVD_APP_OVERRIDE || path.join(SRC, 'js/app.js'), 'utf8').replace(/\ninit\(\)\s*$/, BRIDGE + '\ninit()\n')
 const html = fs.readFileSync(path.join(SRC, 'index.html'), 'utf8').replace(/<link[^>]*fonts\.(googleapis|gstatic)[^>]*>/g, '')
 const server = http.createServer((req, res) => {
@@ -238,7 +238,7 @@ try {
     // outside this repository). Same app/UI/host path; no plugin special case.
     const { runExternalCases } = await import(path.resolve(process.env.CVD_EXTERNAL_SUITE))
     await runExternalCases({ evaluate, waitFor, check, importFile, toggle, valuesOf, settled, sleep, control, ds: () => dataset, pushLive, STEP, FILES, makeBar,
-      call, click, openMenu, rowSel, shot, reopen: open, external, consoleErrors, OUT })
+      call, click, openMenu, rowSel, shot, reopen: open, external, consoleErrors, OUT, dropSockets })
   } else if (process.env.CVD_LOCAL_SUITE === 'data') {
     const { runDataCases } = await import('./local-data-cases.inc.mjs')
     const pf = process.env.CVD_PRODUCER_FIXTURE ? JSON.parse(fs.readFileSync(process.env.CVD_PRODUCER_FIXTURE, 'utf8')) : null
@@ -333,6 +333,20 @@ try {
   pushLive({ ...dataset.at(-1), cvd_usdt: 4242.5 })
   await waitFor(`__cvd.values().get('cvd/cvd|source')?.get(${liveT}) === 4242.5 && ${settled}`)
   check('live_replace_applied', true)
+  // Caller path: a DIRTY renderer (stale empty contents) receiving a tail
+  // result must be filled from the current window, with NO incremental update.
+  const dirtyCase = await evaluate(`(() => {
+    const r = __cvd.renderers().get('cvd/cvd'); const w = __cvd.window(); let updates = 0
+    r.render([]); r.dirty = true; const orig = r.update; r.update = (...a) => { updates++; return orig.apply(r, a) }
+    let error = null
+    try { __cvd.refresh(new Set([r.output.pluginId]), false, [w[w.length - 2].time]) } catch (e) { error = String(e) } finally { r.update = orig }
+    const vals = __cvd.values().get('cvd/cvd|source')
+    const want = w.filter(b => typeof vals?.get(b.time) === 'number').map(b => [b.time, vals.get(b.time)])
+    const got = r.seriesHandle().data().filter(p => p.value !== undefined).map(p => [p.time, p.value])
+    return JSON.stringify({ updates, error, dirty: r.dirty, n: want.length, same: JSON.stringify(got) === JSON.stringify(want) })
+  })()`)
+  const dc = JSON.parse(dirtyCase)
+  check('dirty_renderer_filled_before_incremental', dc.updates === 0 && !dc.error && !dc.dirty && dc.n > 2 && dc.same, dirtyCase)
 
   // 6b. Actual live semantics at APP level with A's public stateful fixture:
   // History runs on a fresh instance (+1000); ticks run op2/op3 on ONE

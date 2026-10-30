@@ -151,7 +151,7 @@ export async function runAuthorityCases(t) {
       const gone = () => window.__wit.T != null && __cvd.poison().includes(window.__wit.T)
       for (const [key, r] of __cvd.renderers()) { if (typeof r?.seriesHandle !== "function") continue; const s = r.seriesHandle(); if (!s || s.__witWrapped) continue; s.__witWrapped = true
         const u = s.update.bind(s), d = s.setData.bind(s)
-        s.update = p => { if (window.__wit.on) window.__wit.writes.push([key, p.time, p.value, gone()]); return u(p) }
+        s.update = (p, ...rest) => { if (window.__wit.on) window.__wit.writes.push([key, p.time, p.value, gone()]); return u(p, ...rest) }
         s.setData = arr => { if (window.__wit.on) { const g = gone(); for (const p of arr) window.__wit.writes.push([key, p.time, p.value, g]) } return d(arr) } }
       const els = [...document.querySelectorAll('[data-pane-summary]')]
       window.__witObs = new MutationObserver(() => { if (window.__wit.on && gone()) for (const e of els) window.__wit.texts.push(e.textContent) })

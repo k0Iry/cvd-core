@@ -53,6 +53,17 @@ export function bandPoints(time, value) {
     return [upper === null ? { time } : { time, value: upper }, lower === null ? { time } : { time, value: lower }]
 }
 
+// One occupancy state per renderer: `last` = newest written time, null = empty.
+// LWC's plain series.update() only appends or replaces the LAST point; an
+// existing older point (penultimate re-close, tail catch-up) must be written
+// with historicalUpdate=true or LWC throws "Cannot update oldest data".
+// Measured (N-simplify-review.md): full-window setData p95 15-25 ms at
+// 1600-3200 bars vs <0.5 ms for this path, so older-point patches stay here.
+function tailUpdate(series, point, last) {
+    series.update(point, last !== null && point.time < last)
+    return last === null || point.time > last ? point.time : last
+}
+
 function zeroLine(series) {
     if (typeof series.createPriceLine !== "function") return
     series.createPriceLine({ price: 0, color: "rgba(107, 118, 138, 0.7)", lineWidth: 1, lineStyle: 0, axisLabelVisible: false, title: "" })
@@ -80,14 +91,14 @@ function seriesRenderer(chart, deps, output, paneIndex) {
         toPoint = (bar, aggregate) => dualRangePoint(bar.time, outputValue(bar, output.key, aggregate))
     }
     if (output.kind !== "line") zeroLine(series)
-    let hasData = false
     let shown = false
+    let last = null
     return {
         output,
         dirty: true,
-        render(bars, aggregate) { series.setData(bars.map(bar => toPoint(bar, aggregate))); hasData = bars.length > 0; this.dirty = false },
-        update(bar, aggregate) { series.update(toPoint(bar, aggregate)) },
-        clear() { if (hasData) series.setData([]); hasData = false; this.dirty = true },
+        render(bars, aggregate) { series.setData(bars.map(bar => toPoint(bar, aggregate))); last = bars.at(-1)?.time ?? null; this.dirty = false },
+        update(bar, aggregate) { last = tailUpdate(series, toPoint(bar, aggregate), last) },
+        clear() { if (last !== null) series.setData([]); last = null; this.dirty = true },
         setVisible(visible) { if (shown !== visible) { shown = visible; series.applyOptions({ visible }) } },
         priceScales: () => [series.priceScale()],
         seriesCount: () => 1,
@@ -100,8 +111,8 @@ function bandRenderer(chart, deps, output, paneIndex) {
     const { LightweightCharts: LWC, outputValue } = deps
     const options = { color: output.style.upColor, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false }
     const edges = [chart.addSeries(LWC.LineSeries, options, paneIndex), chart.addSeries(LWC.LineSeries, { ...options, color: output.style.downColor }, paneIndex)]
-    let hasData = false
     let shown = false
+    let last = null
     const split = (bars, aggregate) => {
         const columns = [[], []]
         for (const bar of bars) bandPoints(bar.time, outputValue(bar, output.key, aggregate)).forEach((point, i) => columns[i].push(point))
@@ -110,9 +121,9 @@ function bandRenderer(chart, deps, output, paneIndex) {
     return {
         output,
         dirty: true,
-        render(bars, aggregate) { split(bars, aggregate).forEach((data, i) => edges[i].setData(data)); hasData = bars.length > 0; this.dirty = false },
-        update(bar, aggregate) { bandPoints(bar.time, outputValue(bar, output.key, aggregate)).forEach((point, i) => edges[i].update(point)) },
-        clear() { if (hasData) edges.forEach(edge => edge.setData([])); hasData = false; this.dirty = true },
+        render(bars, aggregate) { split(bars, aggregate).forEach((data, i) => edges[i].setData(data)); last = bars.at(-1)?.time ?? null; this.dirty = false },
+        update(bar, aggregate) { const prev = last; bandPoints(bar.time, outputValue(bar, output.key, aggregate)).forEach((point, i) => { last = tailUpdate(edges[i], point, prev) }) },
+        clear() { if (last !== null) edges.forEach(edge => edge.setData([])); last = null; this.dirty = true },
         setVisible(visible) { if (shown !== visible) { shown = visible; edges.forEach(edge => edge.applyOptions({ visible })) } },
         priceScales: () => [],
         seriesCount: () => 2,

@@ -125,7 +125,7 @@ export async function runAdmissionCases(t) {
     await evaluate(`(() => { let r; const p = new Promise(x => r = x); window.__delay.hold = { p, r }; window.__delay.held = 0
       window.__pw = { on: false, writes: [] }; const s = __cvd.renderers().get(${JSON.stringify(KEY)}).seriesHandle()
       if (!s.__pwWrapped) { s.__pwWrapped = true; const u = s.update.bind(s), d = s.setData.bind(s)
-        s.update = p => { if (window.__pw.on) window.__pw.writes.push([p.time, p.value ?? null]); return u(p) }
+        s.update = (p, ...rest) => { if (window.__pw.on) window.__pw.writes.push([p.time, p.value ?? null]); return u(p, ...rest) }
         s.setData = arr => { if (window.__pw.on) for (const p of arr) window.__pw.writes.push([p.time, p.value ?? null]); return d(arr) } } })()`)
     const last = ds().at(-1)
     pushLive({ ...last, price_close: last.price_close + 3 })

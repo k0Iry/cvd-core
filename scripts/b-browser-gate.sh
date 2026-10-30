@@ -8,7 +8,7 @@ set -u
 AUD=${1:?audit dir}; REPS=${2:-1}; OUT=${B_GATE_OUT:-$AUD/B-rev2-evidence}
 ROOT=$(cd "$(dirname "$0")/.." && pwd); cd "$ROOT"; mkdir -p "$OUT"; : > "$OUT/exit-codes.txt"
 W=$AUD/build/public/wasm32-unknown-unknown/wasm-release
-STAGES=${B_GATE_STAGES:-coordinator node local data p2 toggle interaction}
+STAGES=${B_GATE_STAGES:-coordinator node lwcrender local data p2 toggle interaction}
 # One explicit coordinator target dir for test, build AND copy: an inherited
 # CARGO_TARGET_DIR must never select a stale artifact.
 CT=${B_COORD_TARGET:-$AUD/build/b-coordinator}
@@ -30,6 +30,11 @@ if want coordinator; then
 fi
 if want node; then
   ( inject node && node --test tests/*.test.cjs tests/*.test.mjs static/js/*.test.cjs ) > "$OUT/node-tests.log" 2>&1; record node $?
+fi
+# Real-LWC plugin renderer regression (penultimate/historical update,
+# null<->value, both band edges, empty->update->clear occupancy).
+if want lwcrender; then
+  ( inject lwcrender && timeout 120 node tests/lwc-tail-update-browser.mjs ) > "$OUT/lwc-render-browser.log" 2>&1; record lwcrender $?
 fi
 if want local; then
   ( inject local && CVD_WASM_DIR=$W CVD_HOSTILE_DIR=$AUD/A-parent-rev3/fixtures/hostile CVD_LOCAL_OUT=$OUT/local-wasm timeout 600 node tests/local-wasm-browser.mjs ) > "$OUT/local-wasm-browser.log" 2>&1; record local $?

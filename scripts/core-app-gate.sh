@@ -10,7 +10,7 @@
 # the assembled static tree, Docker context or any Release.
 # Exit 0 only when every build step ran, the assembled tree carries exactly the
 # two trusted wasm, and every scenario in the inventory completed.
-# CORE_APP_GATE_INJECT=<build|assemble|interaction|inventory> forces that step
+# CORE_APP_GATE_INJECT=<build|assemble|interaction|inventory|lwcrender> forces that step
 # to fail (control: omitted required work can never return zero).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); REPS=${2:-1}
@@ -60,4 +60,9 @@ if(!want.length||want.join()!==got.join()){console.error('FAIL inventory want',w
 const bad=got.filter(k=>{const s=r.scenarios[k];return s.all_ok!==true});
 if(bad.length||(r.errors&&r.errors.length)){console.error('FAIL scenarios',bad,r.errors);process.exit(1)}
 console.log('INVENTORY',got.length,'scenarios:',got.join(','))"
+echo "== real-LWC plugin renderer regression (assembled static tree)"
+inject lwcrender
+# Exactly 4 renderer kinds must PASS; nonzero exit propagates via set -e.
+CVD_STATIC_ROOT=$ST timeout 120 node tests/lwc-tail-update-browser.mjs | tee "$OUT/lwc-render-browser.log"
+[ "$(grep -c '^PASS ' "$OUT/lwc-render-browser.log")" = 4 ] && grep -qx '4/4 renderer kinds GREEN' "$OUT/lwc-render-browser.log" || { echo "FAIL lwcrender inventory"; exit 1; }
 echo "CORE APP GATE PASS"
