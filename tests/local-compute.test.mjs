@@ -1,4 +1,4 @@
-// Red->green lifecycle/live tests for static/js/local-compute.mjs driven by the
+// Red->green lifecycle/live tests for the Worker driver in static/wasm-host/host-bridge.js driven by the
 // REAL Rust coordinator (static/wasm-host/cvd_browser_coordinator.wasm, built
 // from crates/browser-coordinator). The plugin host is scripted so ordering
 // races (slow/failed load, late errors, slow peers) are deterministic; real
@@ -6,9 +6,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { createLocalCompute } from '../static/js/local-compute.mjs'
-import { createCoordinator } from '../static/js/coordinator.mjs'
-import { INPUT_FIELDS } from '../static/js/local-plugins.mjs'
+import { createLocalCompute, createCoordinator } from '../static/wasm-host/host-bridge.js'
+const INPUT_FIELDS = ['po', 'ph', 'pl', 'price_close', 'apo', 'aph', 'apl', 'apc', 'cvd_usdt', 'ac', 'delta_usdt', 'ad', 'bvb', 'abvb', 'svb', 'asvb', 'buy_volume_usdt', 'agb', 'sell_volume_usdt', 'ags']
 
 // scripts/node-unit-gate.sh injects the coordinator it just built from source
 // (CVD_COORDINATOR_WASM); otherwise the gate-assembled static copy is used.

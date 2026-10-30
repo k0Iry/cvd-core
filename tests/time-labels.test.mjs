@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { TF_SECONDS, barOpenTime, createTimeLabelFormatters } from '../static/js/time-labels.mjs'
+import { TF_SECONDS, barOpenTime, createTimeLabelFormatters } from '../static/js/chart.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 // Producer contract (aggregator.rs / make_live_bar): ((id+1)*tf_ms-1)/1000.
@@ -60,7 +60,7 @@ test('formatter reads the timeframe live (no stale tf capture)', () => {
 
 test('app wires formatters without touching data timestamps; module ships in assembled static', () => {
     const app = fs.readFileSync(path.join(ROOT, 'static/js/app.js'), 'utf8')
-    assert.match(app, /import \{ createTimeLabelFormatters \} from "\.\/time-labels\.mjs\?v=local-wasm-3"/)
+    assert.match(app, /import \{[^}]*\bcreateTimeLabelFormatters\b[^}]*\} from "\.\/chart\.js\?v=local-wasm-6"/)
     assert.match(app, /localization: \{ timeFormatter: timeLabels\.timeFormatter \}/)
     assert.match(app, /tickMarkFormatter: timeLabels\.tickMarkFormatter/)
     assert.match(app, /timelineTimes = bars\.map\(b => b\.time\)/)
@@ -70,8 +70,8 @@ test('app wires formatters without touching data timestamps; module ships in ass
         fs.writeFileSync(wasm, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]))
         const out = path.join(dir, 'static')
         execFileSync('sh', [path.join(ROOT, 'scripts/assemble-static.sh'), path.join(ROOT, 'static'), wasm, wasm, out], { cwd: dir, stdio: 'pipe' })
-        const shipped = path.join(out, 'js/time-labels.mjs')
-        assert.deepEqual(fs.readFileSync(shipped), fs.readFileSync(path.join(ROOT, 'static/js/time-labels.mjs')))
+        const shipped = path.join(out, 'js/chart.js')
+        assert.deepEqual(fs.readFileSync(shipped), fs.readFileSync(path.join(ROOT, 'static/js/chart.js')))
         return import(pathToFileURL(shipped).href).then(m => {
             assert.equal(m.createTimeLabelFormatters(() => '15m').tickMarkFormatter(canonicalEnd(utc([2026, 9, 30, 9, 22, 0]), '15m'), TIME), '09:15')
         }).finally(() => fs.rmSync(dir, { recursive: true, force: true }))

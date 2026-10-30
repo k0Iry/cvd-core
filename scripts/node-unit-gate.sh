@@ -36,7 +36,7 @@ rc=$?; set -e
 tail -n 9 "$OUT/node-tests.log"
 [ "$rc" -eq 0 ] || { grep -n '^not ok' "$OUT/node-tests.log" || true; echo "FAIL node suite rc=$rc"; exit "$rc"; }
 inject inventory
-read -r et ep es <<<"${NODE_UNIT_EXPECT:-183 167 16}"
+read -r et ep es <<<"${NODE_UNIT_EXPECT:-168 167 1}"
 n() { sed -n "s/^# $1 \([0-9]*\)$/\1/p" "$OUT/node-tests.log"; }
 got="$(n tests) $(n pass) $(n fail) $(n skipped)"
 [ "$got" = "$et $ep 0 $es" ] || { echo "FAIL node inventory tests/pass/fail/skipped=$got expected $et $ep 0 $es"; exit 1; }

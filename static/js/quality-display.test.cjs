@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const context = vm.createContext({});
-vm.runInContext(fs.readFileSync(path.join(__dirname, 'quality-display.mjs'), 'utf8').replaceAll('export function', 'function'), context);
+vm.runInContext(fs.readFileSync(path.join(__dirname, 'chart.js'), 'utf8').replace(/^export /gm, ''), context);
 const call = (name, ...args) => context[name](...args);
 test('empty quality evidence stays unknown', () => {
   assert.match(call('qualityDisplay', {time:60,quality:{observed_at_ms:100000,status_observed_at_ms:100000,bar_state:'elapsed',coverage:'unverified',expected_sources:0,present_sources:0,sources:[]}},true,100001,true).label,/unknown/i);

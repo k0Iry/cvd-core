@@ -34,6 +34,7 @@ import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { WasmOracleClient, inputBar } from './wasm-oracle-client.mjs'
+import { teardown } from './harness-teardown.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SRC = path.resolve(process.env.CVD_STATIC_ROOT || path.join(HERE, '../static'))
@@ -197,7 +198,7 @@ globalThis.__cvd = {
     faults: () => Object.fromEntries([...localRecords.keys()].map(id => [id, localCompute?.fault(id)]).filter(([, f]) => f)),
     registry: () => ({ plugins: registry.plugins.map(p => p.id), pending: registry.pending.map(p => ({ id: p.id, status: p.status })) }),
     resync: async () => {}, // server indicator resync retired (browser computes locally)
-    epoch: () => indicatorStore.epoch,
+    epoch: () => baseEpoch,
     loadIndicators: async () => {}, // server discovery retired: rows come only from local imports
     // Actual LWC series state per plugin (not app-level prefs).
     pluginSeries: id => [...renderers.values()].filter(r => r.output.pluginId === id).map(r => { const s = r.seriesHandle?.(); return { key: r.output.key, visible: !!s && s.options().visible !== false, points: s ? s.data().length : 0 } }),
@@ -1406,11 +1407,13 @@ try {
 } finally {
     clearTimeout(hard)
     socket?.close()
-    chrome.kill('SIGTERM')
-    for (const s of sockets) s.destroy()
-    server.close()
     for (const r of runners) r.close()
-    await new Promise(r => { if (chrome.exitCode !== null) r(); else { chrome.once('exit', r); setTimeout(r, 5000) } })
-    try { fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 5 }) } catch (error) { console.warn('profile cleanup:', error.message) }
+    // Shared bounded teardown: browser + owned helpers -> server/sockets -> profile.
+    const cleanup = await teardown({ child: chrome, server, sockets, profileDir })
+    results.cleanup = cleanup
+    fs.mkdirSync(OUT, { recursive: true })
+    fs.writeFileSync(path.join(OUT, 'interaction-results.json'), JSON.stringify({ ...results, errors }, null, 1))
+    console.log('cleanup:', JSON.stringify(cleanup))
+    if (!cleanup.ok) { failed = true; console.log('FAILED cleanup', path.join(OUT, 'interaction-results.json')) }
 }
 process.exitCode = failed ? 1 : 0

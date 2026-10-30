@@ -4,6 +4,9 @@
 //! {cmd:"history", scope, revision, bars, context, want_from_index, want_to_index, exhausted}
 //! {cmd:"live", plugin, scope_key, scope, context, tail}
 //! Optional `invalid_times: [i64]` on history/live (fail-closed validity).
+//! {cmd:"done", plugin, token, error?, descriptor?} + optional "\n" + raw output frame
+//! {cmd:"invalidate", times}  {cmd:"presentation_fault", plugin}
+//! {cmd:"approve", descriptor, params, strict} -> {descriptor, params}
 //! {cmd:"commit", plugin, ok}  {cmd:"reset", plugin}  {cmd:"map", bars}
 use super::*;
 use std::cell::RefCell;
@@ -49,6 +52,52 @@ pub fn dispatch(c: &mut Coordinator, cmd: &Value) -> Result<Value, CoordError> {
         }
         "commit" => { c.commit(s("plugin")?, field(cmd, "ok")?.as_bool().unwrap_or(false)); Ok(Value::Null) }
         "reset" => { c.reset(s("plugin")?); Ok(Value::Null) }
+        "plugins" => {
+            let list = arr(cmd, "list")?.iter().map(|p| {
+                let id = p.get("id").and_then(Value::as_str).ok_or_else(|| invalid("plugin id"))?.to_string();
+                let key = p.get("load_key").and_then(Value::as_str).unwrap_or("").to_string();
+                Ok((id, key))
+            }).collect::<Result<Vec<_>, CoordError>>()?;
+            Ok(serde_json::json!({ "events": c.sched_plugins(&list) }))
+        }
+        "clear_fault" => { c.sched_clear_fault(s("plugin")?); Ok(Value::Null) }
+        "demand" => {
+            let older = match cmd.get("older_ranges") {
+                Some(Value::Array(a)) => a.iter().map(|r| Ok(sched::OlderRange {
+                    from_index: usize_of(r, "from_index")?, to_index: usize_of(r, "to_index")?,
+                    from: field(r, "from")?.as_i64().ok_or_else(|| invalid("older from"))?,
+                    to: field(r, "to")?.as_i64().ok_or_else(|| invalid("older to"))?,
+                })).collect::<Result<Vec<_>, CoordError>>()?,
+                _ => Vec::new(),
+            };
+            let d = sched::Demand {
+                scope: scope_of(cmd)?, scope_key: s("scope_key")?.to_string(),
+                revision: field(cmd, "revision")?.as_u64().unwrap_or(0),
+                history_revision: field(cmd, "history_revision")?.as_u64().unwrap_or(0),
+                exhausted: cmd.get("exhausted").and_then(Value::as_bool).unwrap_or(false),
+                want_from_index: cmd.get("want_from_index").and_then(Value::as_u64).unwrap_or(0) as usize,
+                want_to_index: cmd.get("want_to_index").and_then(Value::as_u64).map(|x| x as usize),
+                older, invalid_times: invalid_of(cmd)?,
+            };
+            let bars = match cmd.get("bars") { Some(Value::Array(a)) => Some(a.clone()), _ => None };
+            let tail = match cmd.get("tail") { Some(Value::Array(a)) => Some((a.clone(), usize_of(cmd, "len")?)), _ => None };
+            Ok(c.sched_demand(d, bars, tail))
+        }
+        "superseded" => { c.sched_superseded(s("plugin")?); Ok(Value::Null) }
+        "next" => Ok(c.sched_next(s("plugin")?)),
+        "done" => Ok(c.sched_done(s("plugin")?, usize_of(cmd, "token")? as u64, cmd.get("error").and_then(Value::as_str), cmd.get("descriptor"), cmd.get("output"))),
+        "invalidate" => {
+            let times = arr(cmd, "times")?.iter().map(|t| t.as_i64().ok_or_else(|| invalid("invalidate time not an integer"))).collect::<Result<Vec<_>, _>>()?;
+            Ok(c.sched_invalidate(&times))
+        }
+        "drop_values" => Ok(c.sched_drop(s("plugin")?)),
+        "presentation_fault" => Ok(c.sched_presentation_fault(s("plugin")?)),
+        "pending" => Ok(Value::Bool(c.sched_pending(s("plugin")?))),
+        "idle" => Ok(Value::Bool(c.sched_idle())),
+        "inspect" => Ok(c.sched_inspect(s("plugin")?)),
+        "running" => Ok(serde_json::json!(c.sched_running())),
+        "stop" => Ok(serde_json::json!({ "events": c.sched_stop() })),
+        "approve" => approve(field(cmd, "descriptor")?, cmd.get("params").unwrap_or(&Value::Null), cmd.get("strict").and_then(Value::as_bool).unwrap_or(false)),
         "map" => Ok(serde_json::to_value(input_bars(arr(cmd, "bars")?)?).unwrap()),
         _ => Err(CoordError { code: "bad_command", message: "unknown cmd".into() }),
     }
@@ -68,7 +117,17 @@ pub unsafe extern "C" fn coord_free(p: *mut u8, n: usize) { drop(Vec::from_raw_p
 #[no_mangle]
 pub unsafe extern "C" fn coord_call(p: *const u8, n: usize) -> u32 {
     let input = std::slice::from_raw_parts(p, n);
-    let (status, out) = match serde_json::from_slice::<Value>(input) {
+    // `done` may append the Worker's raw output frame after one '\n'
+    // (JSON.stringify never emits a raw newline): parsed exactly once here,
+    // never re-encoded inside the command. Unparseable output = invalid_output.
+    let (head, extra) = match input.iter().position(|&b| b == b'\n') { Some(i) => (&input[..i], Some(&input[i + 1..])), None => (input, None) };
+    let parsed = serde_json::from_slice::<Value>(head).map(|mut cmd| {
+        if let Some(raw) = extra {
+            match serde_json::from_slice::<Value>(raw) { Ok(o) => cmd["output"] = o, Err(_) => cmd["error"] = Value::from("invalid_output") }
+        }
+        cmd
+    });
+    let (status, out) = match parsed {
         Err(_) => (1, serde_json::json!({ "code": "bad_command", "message": "malformed json" })),
         Ok(cmd) => match COORD.with(|c| dispatch(&mut c.borrow_mut(), &cmd)) {
             Ok(v) => (0, v),

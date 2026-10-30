@@ -159,7 +159,7 @@ host_validate_module, host_session_reset, host_accept_abi, host_check_region, ho
 host_accept_create, host_begin, host_accept_output, host_poison, host_fence`; fence cmds
 `start → {generation}`, `retire`, `issue → {id, generation}`, `supersede → {dropped:[ids]}`, `cancel`,
 `accept → {verdict:"accepted", op} | {verdict:"rejected", reason}`, `stats → {pending, live, rejected}`.
-Trusted JS bridge (`static/wasm-host/host-bridge.js`): `WasmPluginHost.create(hostWasm, {limits, workerUrl})`;
+Trusted JS bridge (`WasmPluginHost` in `static/wasm-host/host-bridge.js`): `WasmPluginHost.create(hostWasm, {limits, workerUrl})`;
 `validateModule(bytes) → Promise<ModuleReport>`; `load(instance, bytes, params) → {generation, descriptor}`;
 `compute(instance, scopeKey, revision, op, body) → validated Output JSON text`;
 `supersede(instance, scopeKey, revision) → cancelled count`; `disable(instance)`;

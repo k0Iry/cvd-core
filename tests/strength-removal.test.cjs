@@ -9,9 +9,10 @@ const vm = require('node:vm')
 const read = file => fs.readFileSync(path.join(__dirname, '..', file), 'utf8')
 const html = read('static/index.html')
 const app = read('static/js/app.js')
-const dom = read('static/js/dom.js')
-const quality = read('static/js/quality-display.mjs')
-const levels = read('static/js/segmented-series.mjs')
+const chart = read('static/js/chart.js')
+const dom = app.slice(app.indexOf('const elements ='), app.indexOf('} = elements'))
+const quality = chart.slice(chart.indexOf('Source-quality readout'))
+const levels = chart.slice(chart.indexOf('Segmented-line geometry'), chart.indexOf('Time labels'))
 
 test('page has no Strength pane, RD/KD/FD/HD toggles or cycle readout', () => {
     for (const id of ['toggle-rd', 'toggle-kd', 'toggle-fd', 'toggle-hd', 'signal-state']) {
@@ -47,7 +48,7 @@ test('frontend source has no retired indicator renderers, keys or readiness help
 
 test('changed frontend modules share one coherent import version', () => {
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...app.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-3'])
+    assert.deepEqual([...versions], ['local-wasm-6'])
 })
 
 function section(start, end) {
@@ -73,8 +74,8 @@ test('stored legacy Strength preferences are pruned without resetting useful set
         aggToggle: { checked: false }, pluginPrefs: { enabled: {}, modes: {} },
         localStorage: { setItem: (k, v) => { saved[k] = v } },
     })
-    const config = read('static/js/config.js').replaceAll('export const', 'const').replaceAll('export function', 'function')
-    const legacyModule = read('static/js/legacy-prefs.mjs').replaceAll('export function', 'function')
+    const config = section('const CONFIG = {', 'const elements =')
+    const legacyModule = section('const LEGACY_FLOW_MODES', 'function createIndicatorMenu')
     vm.runInContext(config + '\n' + legacyModule + '\n' + section('const fallbackInstruments', 'function mkChart') + '\n' + section('function marketLabel', 'const chart =') + '\n' + section('function sanitizePluginPrefs', 'function pluginEnabled'), context)
     const run = code => vm.runInContext(code, context)
     const legacy = { exchange: 'coinbase', market: 'usdc', symbol: 'ETH', tf: '5m', accessKey: 'k', showRd: true, showKd: true,

@@ -95,9 +95,21 @@ test('banner without a real CDP endpoint is not accepted as ready', async () => 
   assert.equal(r.td.ok, true); fs.rmSync(d, { recursive: true })
 })
 
+test('control: banner pointing at a real CDP endpoint (no port file) is accepted via stderr-banner', async () => {
+  const s = await fakeCdp(0); const d = mk()
+  try {
+    const r = await run(fake(d, `echo "DevTools listening on ws://127.0.0.1:${s.port}/devtools/browser/x" >&2; exec sleep 60`), 3000, d, 5)
+    assert.ifError(r.err); assert.equal(r.ok.via, 'stderr-banner'); assert.ok(r.ok.ms <= 3000)
+    assert.equal(r.ok.httpBase, `http://127.0.0.1:${s.port}`); assert.equal(r.td.ok, true)
+  } finally { await s.close(); fs.rmSync(d, { recursive: true }) }
+})
+
 const real = process.env.CVD_CHROMIUM || '/usr/bin/chromium'
 test('real Chromium reaches CDP readiness', { skip: !fs.existsSync(real) && 'no chromium' }, async () => {
   const d = mk(); const r = await run(real, 20000, d)
   assert.ifError(r.err); assert.match(r.ok.wsUrl, /^ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\//)
-  assert.equal(r.ok.via, 'DevToolsActivePort'); assert.equal(r.td.ok, true); fs.rmSync(d, { recursive: true })
+  // Both discovery paths are valid and each is CDP-probe verified; which one wins the race is not the contract.
+  assert.ok(['DevToolsActivePort', 'stderr-banner'].includes(r.ok.via), r.ok.via)
+  assert.match(r.ok.httpBase, /^http:\/\/127\.0\.0\.1:\d+$/); assert.ok(r.ok.ms <= 20000, `${r.ok.ms}ms`)
+  assert.equal(r.td.ok, true); fs.rmSync(d, { recursive: true })
 })

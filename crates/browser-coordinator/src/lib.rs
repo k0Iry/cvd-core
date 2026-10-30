@@ -186,6 +186,8 @@ pub struct Coordinator {
     sessions: BTreeMap<String, Session>,
     pending: BTreeMap<String, Session>,
     next_revision: u64,
+    /// Rust-owned plugin scheduling/result authority (see `sched`).
+    sched: sched::Scheduler,
 }
 
 impl Coordinator {
@@ -305,4 +307,61 @@ impl Coordinator {
     }
 }
 
+/// Metadata/params approval at the browser's restore/import/replace/edit
+/// boundaries. Reuses the SDK authority (`Descriptor::validate`,
+/// `resolve_params`); only adapts it to the two browser policies:
+/// * `strict` (form edit): the SDK resolver verbatim (unknown/invalid = error);
+/// * lenient (restore / replacement migration): unknown keys are discarded and
+///   each invalid field falls back to its default, decided per field by the
+///   same resolver on a one-parameter view of the descriptor.
+/// Integers beyond JS's exact range (|x| > 2^53-1) are rejected so an
+/// approved value survives the JSON round trip through the page unchanged.
+pub fn approve(descriptor: &Value, params: &Value, strict: bool) -> Result<Value, CoordError> {
+    use cvd_indicator_sdk::{resolve_params, Descriptor, ParamKind, ParamSpec};
+    let desc: Descriptor = serde_json::from_value(descriptor.clone())
+        .map_err(|e| CoordError { code: "invalid_descriptor", message: e.to_string() })?;
+    desc.validate().map_err(|e| CoordError { code: "invalid_descriptor", message: e.message })?;
+    let params_err = |m: String| CoordError { code: "invalid_params", message: m };
+    const JS_SAFE: i64 = (1 << 53) - 1;
+    let unsafe_int = |p: &ParamSpec, v: &Value| {
+        matches!(p.kind, ParamKind::Int { .. }) && v.as_i64().is_some_and(|x| x.unsigned_abs() > JS_SAFE as u64)
+    };
+    let raw = match params {
+        Value::Object(m) => m.clone(),
+        _ if strict && !params.is_null() => return Err(params_err("params must be an object".into())),
+        _ => Map::new(),
+    };
+    let resolve = |d: &Descriptor, m: &Map<String, Value>| {
+        resolve_params(d, &serde_json::to_vec(m).unwrap()).map(|v| v.0).map_err(|e| params_err(e.message))
+    };
+    let out = if strict {
+        if let Some(p) = desc.params.iter().find(|p| raw.get(&p.key).is_some_and(|v| unsafe_int(p, v))) {
+            return Err(params_err(format!("`{}` must be an integer", p.key)));
+        }
+        resolve(&desc, &raw)?
+    } else {
+        let mut out = Map::new();
+        for p in &desc.params {
+            let one = Descriptor { params: vec![p.clone()], ..desc.clone() };
+            let given: Map<String, Value> =
+                raw.get(&p.key).filter(|v| !unsafe_int(p, v)).map(|v| (p.key.clone(), v.clone())).into_iter().collect();
+            // Invalid supplied value: fall back to the default, resolved by the
+            // same SDK resolver, so an invalid default is rejected, not returned.
+            let mut m = match resolve(&one, &given) {
+                Ok(m) => m,
+                Err(_) => resolve(&one, &Map::new())?,
+            };
+            let v = m.remove(&p.key).ok_or_else(|| params_err(format!("`{}` unresolved", p.key)))?;
+            out.insert(p.key.clone(), v);
+        }
+        out
+    };
+    // Final approved integers (defaults included) must be JS-safe.
+    if let Some(p) = desc.params.iter().find(|p| out.get(&p.key).is_some_and(|v| unsafe_int(p, v))) {
+        return Err(params_err(format!("`{}` must be an integer", p.key)));
+    }
+    Ok(serde_json::json!({ "descriptor": desc, "params": out }))
+}
+
 pub mod ffi;
+pub mod sched;

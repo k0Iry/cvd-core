@@ -10,14 +10,14 @@
 >
 > | module | role |
 > |---|---|
-> | `local-plugins.mjs` | Pure helpers + IndexedDB store `cvd-local-plugins/plugins` (one record per descriptor id: bytes, content hash, descriptor, params, enable intent). Canonical bar → SDK `InputBar` exact projection (authoritative `cvd_usdt`/`ac` passed through; missing fields fail closed). Exact warm-up via `output_from` = descriptor `context.bars_for(tf)`. Param sanitising, import file checks, duplicate/replace decision, fixed public error texts. |
-> | `local-compute.mjs` | One coordinator over the ONE shared canonical cache (`page.bars`); one trusted Worker per enabled plugin via `static/wasm-host/host-bridge.js`. Fences: scope key + data revision (latest wins, stale results discarded) + per-plugin token (disable/replace/params) + the Rust fence. Scope change while computing ⇒ `supersede` (Worker terminated) ⇒ reload. Faults stop/release that plugin only; no automatic restart. |
+> | `static/wasm-host/host-bridge.js` | Trusted runtime: `WasmPluginHost` (one terminable Worker per plugin, Rust `host_fence` admission, deadlines/limits), the binding to the Rust coordinator (`cvd_browser_coordinator.wasm`), the per-plugin async driver (asks `next`, performs one Worker call, reports `done` with the raw output frame once) and the IndexedDB store `cvd-local-plugins/plugins` (bytes, content hash, descriptor, params, enable intent; envelope/identity checks, DOM-value coercion, import file checks, duplicate/replace decision, fixed public error texts). Descriptor and parameter approval (SDK `Descriptor::validate` + `resolve_params`; lenient on restore/replacement, strict on form edit) is the coordinator `approve` command, called only at restore/import/replace/edit. Scheduling, readiness, warm-up coverage, retry/stall, scope/revision fencing and the accepted values (merge, history/live precedence, invalidation, drop) are decided in Rust (`crates/browser-coordinator/src/sched.rs`); the app applies the returned view diffs to a read-only projection. Faults stop/release that plugin only; no automatic restart. |
+> | `static/wasm-host/plugin-worker.js` | Worker: validates (Rust) before compile, instantiates, runs one request at a time. |
 >
 > Lifecycle: import = name/size check → hash → bounded Worker `load` (Rust policy check before compile, compile/instantiate/describe/create under deadlines) → displayable descriptor → add / same (byte-equal no-op) / replace (atomic; old instance released; enable intent and compatible params kept). New imports start **disabled**. Enable starts a Worker and computes; Disable terminates the Worker and drops results but keeps file/params/row; **Remove** deletes the package. Every data change (history page, prepend, live append/replace, source/TF/mode) bumps the data revision and recomputes (stateless History op over the cache; unchanged results cost no chart writes, tail-only changes use the incremental path). If a plugin declares more warm-up than the cache holds, older history is prepended through the shared history path. Tests: `tests/local-plugins.test.mjs`, `tests/local-wasm-browser.mjs` (real Chromium + real WASM) and `tests/browser-interaction.mjs` (`CVD_LOCAL_WASM`).
 >
 > The sections below describe rendering/menu behaviour, which is unchanged; references to discovery/`/ws` indicator transport describe the retired server path.
 
-Scope: `static/js/app.js` and the plugin modules. The browser draws what the
+Scope: `static/js/app.js`, `static/js/chart.js` and `static/wasm-host/host-bridge.js`. The browser draws what the
 host relays from indicator libraries; it contains no indicator algorithm and no
 branch on an indicator/output id (enforced by `tests/plugin-ui.test.cjs`).
 
@@ -25,13 +25,8 @@ branch on an indicator/output id (enforced by `tests/plugin-ui.test.cjs`).
 
 | module | role |
 |---|---|
-| `plugin-wire.mjs` | Only module that knows the host envelopes: `GET /indicators`, `/history` `indicators` block, typed `/ws` frames (`indicator`, `indicator_status`, `indicator_reset`). Errors are reduced to public codes; messages are never shown. |
-| `plugin-store.mjs` | Columnar SDK `Output` values keyed by (output, mode, canonical bar time). Base bars are never modified. Live fencing per (indicator, mode): hub generation → runner session → seq. Bounded pending results ahead of the base axis. |
-| `plugin-registry.mjs` | Validates SDK descriptors, builds panes/groups/readouts generically; tracks pending (starting/failed/disabled/unavailable) and rejected entries. |
-| `plugin-render.mjs` | Renderer adapters by output kind. |
-| `segmented-series.mjs` | Generic segmented-line geometry (history custom series + native tail). |
-| `indicator-menu.mjs` | Toolbar indicator multiselect: one `Indicators · N` button in `#plugin-controls` plus a `#plugin-menu` popup of native checkbox rows (ready plugins, disabled pending/failed placeholders, empty state). The popup lives outside the `overflow:auto` toolbar and is placed `position:fixed` from the trigger rect, clamped to the visible region (visualViewport offset + size, layout viewport fallback), repositioned on window resize, any scroll (incl. toolbar) and visualViewport resize/scroll. The trigger is a disclosure button (`aria-expanded`/`aria-controls`, no `aria-haspopup`/menu roles) controlling a labelled checkbox `group`. Tab from the trigger enters the first enabled row; Tab past the last enabled row (current rendered order) closes and continues to the next toolbar control; Shift+Tab from the first row returns to the trigger, and from the trigger leaves backwards and closes; with no enabled rows Tab leaves the trigger normally and closes. Rows are keyed by id and updated in place, so discovery/status rerenders keep it open and focused. Outside pointer / Escape close (Escape refocuses the trigger). Toggling calls `setPluginEnabled` → `applyPluginVisibility` (prefs saved; no reload, WS or viewport change). Interaction evidence: `CVD_SCENARIOS=indicator_menu node tests/browser-interaction.mjs`. |
-| `legacy-prefs.mjs` | One-time migration of pre-plugin prefs (`showLevels`, `flowMode`) into `plugins.enabled/modes`. The only place naming historical ids. |
+| `static/js/chart.js` | Presentation without DOM or policy: descriptor registry (displayable descriptors → panes/groups/readouts; pending and rejected entries), renderer adapters by output kind, segmented-line geometry (history custom series + native tail), candles, display-only time labels and the source-quality readout. LWC is injected by the app. |
+| `static/js/app.js` | Configuration, DOM controls, preferences (including the one-time migration of pre-plugin `showLevels`/`flowMode` prefs — the only place naming historical ids), the indicator menu, history/WebSocket data flow and chart orchestration. Indicator menu: one `Indicators · N` button in `#plugin-controls` plus a `#plugin-menu` popup of native checkbox rows (ready plugins, disabled pending/failed placeholders, empty state). The popup lives outside the `overflow:auto` toolbar and is placed `position:fixed` from the trigger rect, clamped to the visible region (visualViewport offset + size, layout viewport fallback), repositioned on window resize, any scroll (incl. toolbar) and visualViewport resize/scroll. The trigger is a disclosure button (`aria-expanded`/`aria-controls`, no `aria-haspopup`/menu roles) controlling a labelled checkbox `group`. Tab from the trigger enters the first enabled row; Tab past the last enabled row (current rendered order) closes and continues to the next toolbar control; Shift+Tab from the first row returns to the trigger, and from the trigger leaves backwards and closes; with no enabled rows Tab leaves the trigger normally and closes. Rows are keyed by id and updated in place, so rerenders keep it open and focused. Outside pointer / Escape close (Escape refocuses the trigger). Toggling calls `setPluginEnabled` → `applyPluginVisibility` (prefs saved; no reload, WS or viewport change). Interaction evidence: `CVD_SCENARIOS=indicator_menu node tests/browser-interaction.mjs`. |
 
 ## Rendering rules
 
@@ -101,14 +96,8 @@ TMPDIR=... CVD_STATIC_ROOT=<assembled static> CVD_LOCAL_WASM=<cvd.wasm>,<flow.wa
 
 ## Wire compatibility
 
-* Live `indicator` frames carry `as_of_rev`, the newest base-frame `rev` they
-  include. It is required: `plugin-wire.mjs` rejects a frame without a
-  non-negative safe integer. `plugin-store.mjs` uses it to correlate each
-  result with the base-bar revisions it has observed: results stale relative
-  to what is already written or displayed are suppressed, and results computed
-  at a revision not yet observed are held pending until that base arrives.
-* The current host also sends `api_version` and `session` on live frames. The
-  parser still intentionally accepts frames without them: missing
-  `api_version` is read as v1 (any other value is rejected), and a missing or
-  non-safe-integer `session` is read as session 0. This is a compatibility
-  allowance, not a sign the host omits them.
+* Server indicator frames (`/ws` messages whose `type` starts with
+  `indicator`) are ignored: the browser computes plugin outputs locally.
+* Base frames are fenced per bar by their `rev` within one WebSocket
+  connection epoch (`app.js` `baseRevs`): a lower rev for an already shown bar
+  is stale; reconnect starts a new epoch and reload clears the fence.

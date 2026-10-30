@@ -1,38 +1,380 @@
-import { CONFIG, DEFAULT_TITLE, FALLBACK_EXCHANGE_META, SOURCE_INSTRUMENTS, sourceKey, sourceSeries, legacySource, validInstrument, STORAGE_KEY, THEMES } from "./config.js?v=local-wasm-3"
-import { elements } from "./dom.js?v=local-wasm-3"
+// Browser application: configuration, DOM controls, preferences, the
+// indicator menu, history/WebSocket data flow and chart orchestration.
+// Plugin scheduling and accepted indicator values are owned by the Rust
+// coordinator (via ../wasm-host/host-bridge.js); this file applies its read-only
+// view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { mergeHistoryQuality, qualityDisplay } from "./quality-display.mjs?v=local-wasm-3"
-import { createSegmentHistoryView, segmentData, segmentSlotData, sameSegmentData } from "./segmented-series.mjs?v=local-wasm-3"
-import { parseIndicatorFrame, seriesValueAt } from "./plugin-wire.mjs?v=local-wasm-3"
-import { openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, sanitizeParams, validRecord, parseParamInput, contextBars } from "./local-plugins.mjs?v=local-wasm-3"
-import { createLocalCompute } from "./local-compute.mjs?v=local-wasm-3"
-import { createCoordinator } from "./coordinator.mjs?v=local-wasm-3"
-import { WasmPluginHost } from "/wasm-host/host-bridge.js?v=local-wasm-3"
-import { createIndicatorStore } from "./plugin-store.mjs?v=local-wasm-3"
-import { migrateLegacyPrefs } from "./legacy-prefs.mjs?v=local-wasm-3"
-import { activeGroupOutput, buildRegistry, readoutText } from "./plugin-registry.mjs?v=local-wasm-3"
-import { createOutputRenderer } from "./plugin-render.mjs?v=local-wasm-3"
-import { createIndicatorMenu } from "./indicator-menu.mjs?v=local-wasm-3"
-import { createTimeLabelFormatters } from "./time-labels.mjs?v=local-wasm-3"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-6"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-6"
 
-const {
-    exchangeSel,
-    symbolSel,
-    marketSel,
-    tfSel,
-    accessKeyInput,
-    aggToggle,
-    pluginControlsEl,
-    pluginMenuEl,
-    pluginStateEl,
-    screenshotBtn,
-    statusEl,
-    qualityStateEl,
-    sourceSeriesEl,
-    chartEl,
-    paneLabels,
-} = elements
+// ============================================================ configuration
+const CONFIG = {
+    RENDER_WINDOW_SIZE: 3200,
+    RENDER_WINDOW_BUFFER: 512,
+    // Display page size only. Indicator warm-up is declared by each local
+    // plugin (descriptor context) and satisfied by the browser from the shared
+    // canonical cache, prepending older pages when needed (maybeWarmup).
+    HISTORY_PAGE_SIZE: 1600,
+    // Rebuilding every segmented-lines output touches a lot of chart state.
+    // Keep realtime candles/line/histogram outputs instant, but throttle full
+    // segmented refreshes.
+    SEGMENTED_REALTIME_REFRESH_MS: 2000,
+    EDGE_TRIGGER: 30,
+    FETCH_COOLDOWN: 300,
+    DELAY_POLL_MS: 30000,
+}
+
+const THEMES = {
+    day: {
+        bg: "#f6f8fb",
+        panel: "#ffffff",
+        border: "rgba(0,0,0,0.08)",
+        text: "#1d2430",
+        muted: "#6b768a",
+        accent: "#2f80ed",
+        accent2: "#f2994a",
+        chartBg: "#f8f9fc",
+        grid: "#e4e8ee",
+    },
+    night: {
+        bg: "#0f1115",
+        panel: "rgba(255,255,255,0.04)",
+        border: "rgba(255,255,255,0.08)",
+        text: "#e8ecf2",
+        muted: "#8b94a7",
+        accent: "#56ccf2",
+        accent2: "#f2c94c",
+        chartBg: "#11161f",
+        grid: "#1f2530",
+    },
+}
+
+const FALLBACK_EXCHANGE_META = {
+    binance: {
+        markets: ["spot", "usdm", "coinm"],
+        symbols: ["BTC", "ETH"],
+    },
+    coinbase: {
+        markets: ["spot", "usdc"],
+        symbols: ["BTC", "ETH"],
+    },
+}
+
+// Stable source identities. Metadata must match the complete descriptor before
+// a new market is offered; legacy fallback deliberately contains no new USDC.
+const source = (exchange, market, symbol) => {
+    const category = market === "spot" || market === "spot_usdc" ? "spot" : "contract"
+    const quote_asset = exchange === "coinbase" ? (market === "spot" ? "USD" : "USDC")
+        : market === "coinm" ? "USD" : market.endsWith("_usdc") ? "USDC" : "USDT"
+    return { exchange, market, symbol,
+        native_symbol: exchange === "coinbase" ? (market === "spot" ? `${symbol}-USD` : `${symbol}_USDC-PERPETUAL`)
+            : market === "coinm" ? `${symbol}USD_PERP` : `${symbol}${quote_asset}`,
+        category, contract_kind: category === "spot" ? null : market === "coinm" ? "inverse" : "linear",
+        quote_asset, settlement_asset: category === "spot" ? null : market === "coinm" ? symbol : quote_asset }
+}
+const SOURCE_INSTRUMENTS = Object.fromEntries(
+    [["binance", ["spot", "spot_usdc", "usdm", "usdm_usdc", "coinm"]], ["coinbase", ["spot", "usdc"]]]
+        .flatMap(([exchange, markets]) => markets.flatMap(market => ["BTC", "ETH"].map(symbol => {
+            const descriptor = source(exchange, market, symbol)
+            return [`${exchange}:${market}:${symbol}`, descriptor]
+        }))))
+const sourceKey = (exchange, market, symbol) => `${exchange}:${market}:${symbol}`
+const sourceSeries = market => market === "spot" || market === "spot_usdc" ? "spot-v1" : "contracts-drb-v1"
+const legacySource = descriptor => descriptor.market !== "spot_usdc" && descriptor.market !== "usdm_usdc"
+function validInstrument(item) {
+    if (!item || typeof item !== "object") return false
+    const expected = SOURCE_INSTRUMENTS[sourceKey(item.exchange, item.market, item.symbol)]
+    return !!expected && Object.keys(expected).every(field => item[field] === expected[field])
+}
+const STORAGE_KEY = "cvd_prefs_v1"
+const DEFAULT_TITLE = "CVD"
+
+// ============================================================ DOM controls
+const elements = Object.fromEntries(Object.entries({ exchangeSel: "exchange", symbolSel: "symbol", marketSel: "market", tfSel: "tf", accessKeyInput: "access-key", aggToggle: "toggle-agg", pluginControlsEl: "plugin-controls", pluginMenuEl: "plugin-menu", pluginStateEl: "plugin-state", screenshotBtn: "screenshot-btn", statusEl: "status", qualityStateEl: "quality-state", sourceSeriesEl: "source-series", chartEl: "chart", paneLabels: "pane-labels" }).map(([key, id]) => [key, document.getElementById(id)]))
+const { exchangeSel, symbolSel, marketSel, tfSel, accessKeyInput, aggToggle, pluginControlsEl, pluginMenuEl, pluginStateEl, screenshotBtn, statusEl, qualityStateEl, sourceSeriesEl, chartEl, paneLabels } = elements
+
+// ============================================================ preferences
+// One-time migration of pre-plugin preferences (cvd_prefs_v1 written by the
+// fixed-indicator UI) into the generic plugin preference shape. This is the
+// ONLY place that names historical indicator ids; renderers stay generic.
+// Runs only when the stored prefs have no `plugins` block yet; the next save
+// writes the new shape, so it never re-applies.
+const LEGACY_FLOW_MODES = { "buy-sell": "flow/buy_sell", delta: "flow/delta" }
+
+function migrateLegacyPrefs(prefs) {
+    if (!prefs || typeof prefs !== "object" || prefs.plugins) return prefs
+    const plugins = { enabled: {}, modes: {} }
+    if (typeof prefs.showLevels === "boolean") plugins.enabled.levels = prefs.showLevels
+    if (Object.hasOwn(LEGACY_FLOW_MODES, prefs.flowMode)) plugins.modes["flow:flow"] = LEGACY_FLOW_MODES[prefs.flowMode]
+    const { showLevels, flowMode, ...rest } = prefs
+    return { ...rest, plugins }
+}
+
+// ============================================================ indicator menu
+// Compact indicator multiselect: one trigger button in the toolbar and one
+// popup of native checkbox rows. The popup lives OUTSIDE the toolbar (which
+// is overflow:auto for short viewports and would clip an absolute child) and
+// is placed with position:fixed from the trigger's rect, clamped to the
+// viewport. Rows are keyed by id and updated in place so ordinary rerenders
+// keep the popup open and focus where it is. Knows nothing about specific
+// plugin ids; callers pass generic row items.
+//
+// items: [{ id, name, meta, title, checked, disabled, fault?, params? }]
+// Local packages: an always-present "Import .wasm…" control (trusted native
+// file input, nothing uploaded), a status notice, and per-row Params/Remove.
+function createIndicatorMenu({ container, popup, onToggle, onImport = null, onUninstall = null, onParams = null, parseParam = null, label = "Indicators" }) {
+    const doc = globalThis.document
+    const win = globalThis.window ?? {}
+    const make = (tag, className) => { const el = doc.createElement(tag); if (className) el.className = className; return el }
+
+    const trigger = make("button", "toolbar-btn plugin-menu-trigger")
+    trigger.type = "button"
+    // Disclosure button (aria-expanded/controls) for a labelled checkbox
+    // group; deliberately no aria-haspopup/menu roles, whose arrow-key menu
+    // interaction model this popup does not implement.
+    trigger.setAttribute("aria-expanded", "false")
+    trigger.setAttribute("aria-controls", popup.id || "plugin-menu")
+    const triggerText = make("span", "plugin-menu-count")
+    const caret = make("span", "plugin-menu-caret")
+    caret.setAttribute("aria-hidden", "true")
+    caret.textContent = "▾"
+    trigger.append(triggerText, caret)
+    container.replaceChildren(trigger)
+
+    const heading = make("div", "plugin-menu-heading")
+    heading.id = (popup.id || "plugin-menu") + "-heading"
+    heading.textContent = label
+    const list = make("div", "plugin-menu-list")
+    list.setAttribute("role", "group")
+    list.setAttribute("aria-labelledby", heading.id)
+    const empty = make("p", "plugin-menu-empty")
+    empty.dataset.empty = ""
+    empty.textContent = onImport ? "No local indicators imported" : "No indicators available"
+    popup.hidden = true
+    const footer = make("div", "plugin-menu-footer")
+    const notice = make("p", "plugin-menu-notice")
+    notice.setAttribute("role", "status")
+    notice.setAttribute("aria-live", "polite")
+    let fileInput = null
+    if (onImport) {
+        fileInput = make("input")
+        fileInput.type = "file"
+        fileInput.accept = ".wasm,application/wasm"
+        fileInput.className = "plugin-import-input"
+        fileInput.setAttribute("aria-label", "Import local .wasm indicator")
+        fileInput.onchange = () => { const f = fileInput.files?.[0]; fileInput.value = ""; if (f) onImport(f) }
+        const importBtn = make("button", "toolbar-btn plugin-import-btn")
+        importBtn.type = "button"
+        importBtn.textContent = "Import .wasm…"
+        importBtn.title = "Import a cvd-wasm v1 indicator from this computer. It stays in this browser; nothing is uploaded."
+        importBtn.onclick = () => fileInput.click()
+        footer.append(importBtn, fileInput)
+    }
+    footer.append(notice)
+    popup.replaceChildren(heading, list, footer)
+
+    const rows = new Map()
+    let order = []
+    let open = false
+
+    function row(item) {
+        let r = rows.get(item.id)
+        if (!r) {
+            const el = make("label", "plugin-menu-row")
+            el.dataset.plugin = item.id
+            const input = make("input")
+            input.type = "checkbox"
+            const name = make("span", "plugin-menu-name")
+            const meta = make("span", "plugin-menu-meta")
+            el.append(input, name, meta)
+            r = { el, input, name, meta }
+            input.onchange = () => r.onchange?.(input.checked)
+            if (onUninstall) {
+                const actions = make("span", "plugin-menu-actions")
+                const paramsBtn = make("button", "plugin-menu-action")
+                paramsBtn.type = "button"; paramsBtn.textContent = "Params"; paramsBtn.dataset.action = "params"
+                const removeBtn = make("button", "plugin-menu-action")
+                removeBtn.type = "button"; removeBtn.textContent = "Remove"; removeBtn.dataset.action = "remove"
+                const panel = make("span", "plugin-menu-params")
+                panel.hidden = true
+                paramsBtn.onclick = ev => { ev.preventDefault?.(); panel.hidden = !panel.hidden; if (!panel.hidden) fillParams(r) }
+                removeBtn.onclick = ev => { ev.preventDefault?.(); onUninstall(r.id) }
+                actions.append(paramsBtn, removeBtn)
+                el.append(actions, panel)
+                Object.assign(r, { paramsBtn, removeBtn, panel })
+            }
+            rows.set(item.id, r)
+        }
+        r.id = item.id
+        r.item = item
+        if (r.paramsBtn) r.paramsBtn.hidden = !(item.params?.length)
+        if (r.removeBtn) r.removeBtn.setAttribute("aria-label", `Remove ${item.name} from this browser`)
+        if (r.el.dataset.fault !== String(!!item.fault)) r.el.dataset.fault = String(!!item.fault)
+        // Write only on change: avoids churn and keeps focus stable.
+        if (r.el.title !== item.title) r.el.title = item.title
+        if (r.name.textContent !== item.name) r.name.textContent = item.name
+        if (r.meta.textContent !== (item.meta ?? "")) r.meta.textContent = item.meta ?? ""
+        if (r.input.checked !== item.checked) r.input.checked = item.checked
+        if (r.input.disabled !== item.disabled) r.input.disabled = item.disabled
+        r.el.dataset.state = item.disabled ? "unavailable" : "ready"
+        r.onchange = item.disabled ? null : checked => onToggle(item.id, checked)
+        return r.el
+    }
+
+    // Generic parameter form from descriptor ParamSpec (int/float/bool/choice).
+    function fillParams(r) {
+        const specs = r.item?.params ?? []
+        const fields = specs.map(spec => {
+            const wrap = make("label", "plugin-param")
+            const caption = make("span"); caption.textContent = spec.label || spec.key
+            let input
+            if (spec.type === "choice") {
+                input = make("select")
+                for (const option of spec.options ?? []) { const o = make("option"); o.value = option; o.textContent = option; input.append(o) }
+                input.value = spec.value
+            } else {
+                input = make("input")
+                if (spec.type === "bool") { input.type = "checkbox"; input.checked = spec.value === true }
+                else { input.type = "number"; input.min = spec.min; input.max = spec.max; input.step = spec.type === "int" ? "1" : "any"; input.value = String(spec.value) }
+            }
+            input.dataset.param = spec.key
+            wrap.append(caption, input)
+            return { spec, input, wrap }
+        })
+        const apply = make("button", "plugin-menu-action"); apply.type = "button"; apply.textContent = "Apply"; apply.dataset.action = "apply"
+        const err = make("span", "plugin-param-error"); err.setAttribute("role", "alert")
+        apply.onclick = ev => {
+            ev.preventDefault?.()
+            const values = {}
+            for (const { spec, input } of fields) values[spec.key] = parseParam(spec, spec.type === "bool" ? input.checked : input.value)
+            // onParams approves synchronously (Rust, strict) and throws on rejection.
+            try { onParams?.(r.id, values) } catch (e) { err.textContent = String(e?.message ?? e); return }
+            err.textContent = ""
+        }
+        r.panel.replaceChildren(...fields.map(f => f.wrap), apply, err)
+    }
+
+    function render(items, selected, status = null) {
+        if (status && notice.textContent !== (status.text ?? "")) { notice.textContent = status.text ?? ""; notice.dataset.kind = status.kind ?? "" }
+        const ids = items.map(item => item.id)
+        const els = items.map(row)
+        for (const id of [...rows.keys()]) if (!ids.includes(id)) rows.delete(id)
+        const next = els.length ? els : [empty]
+        if (next.length !== order.length || next.some((el, i) => el !== order[i])) {
+            // Move only out-of-place nodes: re-inserting a focused row would
+            // blur it, so unchanged rows stay put across discovery updates.
+            if (typeof list.insertBefore === "function") {
+                next.forEach((el, i) => { if (list.children[i] !== el) list.insertBefore(el, list.children[i] ?? null) })
+                while (list.children.length > next.length) list.lastChild.remove()
+            } else list.replaceChildren(...next)
+            order = next
+        }
+        const text = `${label} · ${selected}`
+        if (triggerText.textContent !== text) triggerText.textContent = text
+        trigger.title = `${selected} of ${items.filter(item => !item.disabled).length} indicators selected`
+        if (open) position()
+    }
+
+    // Fixed placement from the trigger rect, clamped to the VISIBLE region:
+    // visualViewport origin (offsetLeft/Top, non-zero under pinch-zoom/pan)
+    // and extent. Falls back to the layout viewport when unsupported.
+    function position() {
+        const vv = win.visualViewport
+        const view = vv ? { x: vv.offsetLeft ?? 0, y: vv.offsetTop ?? 0, width: vv.width, height: vv.height }
+            : { x: 0, y: 0, width: win.innerWidth ?? 0, height: win.innerHeight ?? 0 }
+        const layoutH = win.innerHeight ?? view.height
+        if (!view.width || !view.height || typeof trigger.getBoundingClientRect !== "function") return
+        const p = placeIndicatorMenu(trigger.getBoundingClientRect(), view, layoutH)
+        Object.assign(popup.style, {
+            width: `${p.width}px`, maxHeight: `${p.maxHeight}px`, left: `${p.left}px`,
+            top: p.up ? "auto" : `${p.top}px`, bottom: p.up ? `${p.bottomPx}px` : "auto",
+        })
+    }
+
+    function setOpen(next, { focusTrigger = false } = {}) {
+        if (open === next) return
+        open = next
+        popup.hidden = !open
+        trigger.setAttribute("aria-expanded", String(open))
+        trigger.classList.toggle?.("active", open)
+        if (open) position()
+        if (!open && focusTrigger) trigger.focus?.()
+    }
+
+    const inside = node => popup.contains?.(node) || trigger.contains?.(node)
+    function handlePointer(event) { if (open && !inside(event.target)) setOpen(false) }
+    function handleKeydown(event) {
+        if (!open) return
+        if (event.key === "Escape") { event.preventDefault?.(); setOpen(false, { focusTrigger: true }); return }
+        if (event.key !== "Tab") return
+        // First/last come from the CURRENT rendered order (not Map order).
+        const enabled = order.map(rowInput).filter(input => input && !input.disabled)
+        // With local-package controls, every visible focusable control in the
+        // popup participates (rows, Params/Remove, Import).
+        if (onImport && typeof popup.querySelectorAll === "function") {
+            enabled.splice(0, enabled.length, ...[...popup.querySelectorAll("input:not([type=file]), button, select")]
+                .filter(el => !el.disabled && !el.hidden && !el.closest?.("[hidden]")))
+        }
+        const first = enabled[0], last = enabled.at(-1)
+        if (event.target === trigger) {
+            // The popup sits after the toolbar in the DOM: Tab from the
+            // trigger enters it; Shift+Tab, or nothing enabled, leaves
+            // natively and closes.
+            if (!event.shiftKey && first) { event.preventDefault?.(); first.focus(); return }
+            setOpen(false)
+        } else if (event.shiftKey && event.target === first) {
+            event.preventDefault?.(); trigger.focus()
+        } else if (!event.shiftKey && event.target === last) {
+            // Continue with the toolbar control after the trigger (e.g. Agg).
+            const next = nextFocusable(trigger)
+            setOpen(false)
+            if (next) { event.preventDefault?.(); next.focus() }
+        }
+    }
+    const rowInput = el => [...rows.values()].find(r => r.el === el)?.input
+    function nextFocusable(from) {
+        if (typeof doc.querySelectorAll !== "function") return null
+        const all = [...doc.querySelectorAll("button, input, select, textarea, a[href], [tabindex]")].filter(el =>
+            el === from || (!el.disabled && el.tabIndex >= 0 && !popup.contains(el) && el.getClientRects().length > 0))
+        const i = all.indexOf(from)
+        return i >= 0 ? all[i + 1] ?? null : null
+    }
+    function handleFocusOut(event) { if (open && event.relatedTarget && !inside(event.relatedTarget)) setOpen(false) }
+
+    trigger.onclick = () => setOpen(!open)
+    // Document-level so Escape still closes after a discovery update removed
+    // the focused row (focus falls back to <body>).
+    doc.addEventListener?.("keydown", handleKeydown)
+    popup.addEventListener?.("focusout", handleFocusOut)
+    doc.addEventListener?.("pointerdown", handlePointer, true)
+    const reposition = () => { if (open) position() }
+    win.addEventListener?.("resize", reposition)
+    win.visualViewport?.addEventListener?.("resize", reposition)
+    win.visualViewport?.addEventListener?.("scroll", reposition) // pinch-zoom pan
+    doc.addEventListener?.("scroll", reposition, true) // includes toolbar scroll
+
+    return { render, trigger, handleKeydown, handlePointer, isOpen: () => open, close: () => setOpen(false) }
+}
+
+// Pure placement math (unit-tested with synthetic viewports). rect: trigger
+// client rect; view: visible region {x, y, width, height} in layout-viewport
+// coordinates; layoutH: layout viewport height (for CSS `bottom`).
+function placeIndicatorMenu(rect, view, layoutH) {
+    const gap = 4, margin = 8
+    const vLeft = view.x, vTop = view.y, vRight = view.x + view.width, vBottom = view.y + view.height
+    const width = Math.min(340, view.width - margin * 2)
+    const below = vBottom - Math.max(rect.bottom, vTop) - gap - margin
+    const above = Math.min(rect.top, vBottom) - vTop - gap - margin
+    const up = below < 180 && above > below
+    const maxHeight = Math.max(80, Math.min(420, up ? above : below, view.height - margin * 2))
+    const left = Math.round(Math.min(Math.max(vLeft + margin, rect.left), vRight - width - margin))
+    const top = Math.round(Math.max(vTop + margin, Math.min(rect.bottom + gap, vBottom - margin - maxHeight)))
+    const anchor = Math.min(vBottom - margin, Math.max(vTop + margin + maxHeight, rect.top - gap))
+    return { up, width, maxHeight, left, top, bottomPx: Math.round(layoutH - anchor) }
+}
+
+// ============================================================ application
 
 const fallbackInstruments = Object.values(SOURCE_INSTRUMENTS).filter(legacySource)
 let availableInstruments = fallbackInstruments
@@ -257,10 +599,6 @@ const mq = window.matchMedia("(prefers-color-scheme: dark)")
 applyTheme(mq.matches ? "night" : "day")
 onMediaQueryChange(mq, e => applyTheme(e.matches ? "night" : "day"))
 
-const PRICE_UP_COLOR = "#27ae60"
-const PRICE_DOWN_COLOR = "#eb5757"
-const PRICE_FLAT_COLOR = "#8b94a7"
-const CURRENT_PRICE_COLOR = "#f2994a"
 
 const priceSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
     upColor: PRICE_UP_COLOR,
@@ -299,21 +637,45 @@ let pluginPrefs = { enabled: {}, modes: {} }
 let discoveryError = ""
 let paneSummaryEls = []
 let pluginLayoutGeneration = 0
-const indicatorStore = createIndicatorStore()
 const currentMode = () => useAggregateMode() ? "aggregate" : "source"
 // Renderers read results by canonical bar time; base bars are never modified.
-// Browser-computed results ONLY (server indicator outputs are ignored):
-// `${outputKey}|${mode}` -> Map(time -> value), replaced atomically per
-// accepted (scope, data revision) compute of that plugin.
+// Browser-computed results ONLY (server indicator outputs are ignored).
+// READ-ONLY projection of the Rust coordinator's accepted values
+// (`${outputKey}|${mode}` -> Map(time -> value)) for synchronous LWC reads.
+// Merge, history/live precedence, stale cutoff, changed times, invalidation
+// and drop are decided in Rust (sched.rs); only applyLocalView writes here.
 let localValues = new Map()
-let localLive = new Map()   // live (op2/op3) values overlaying stateless History
+function applyLocalView(view) {
+    if (!view) return
+    if (view.clear) { localValues = new Map(); forEachRenderer(r => { r.dirty = true }) }
+    for (const k of view.drop ?? []) localValues.delete(k)
+    for (const [k, { set, del }] of Object.entries(view.cols ?? {})) {
+        let col = localValues.get(k)
+        if (!col) { if (!set.length) continue; localValues.set(k, col = new Map()) }
+        for (const t of del) col.delete(t)
+        for (const [t, v] of set) col.set(t, v)
+    }
+}
 const storeValue = (bar, key, aggregate) => bar ? localValues.get(`${key}|${aggregate ? "aggregate" : "source"}`)?.get(bar.time) : undefined
-// Newest live base WS `rev` per bar lives in the store, scoped to the
-// connection epoch and pruned only with the canonical cache (no LRU): a value
-// is current only if its as_of_rev >= that rev, otherwise pending.
-function noteBaseRev(payload) { return indicatorStore.noteBaseRev(payload?.bar?.time, payload?.rev) }
-const renderDeps = { LightweightCharts, createDualRangeHistogramSeries, outputValue: storeValue,
-    segmentData, segmentSlotData, sameSegmentData, createSegmentHistoryView }
+// Newest live base WS `rev` per bar in this connection epoch (revs are per
+// socket): a lower-rev frame for the same bar is stale. Pruned only with the
+// canonical cache, cleared on reload; reconnect starts a new epoch.
+const baseRevs = new Map()   // time -> { epoch, rev }
+let baseEpoch = 0
+function noteBaseRev(payload) {
+    const time = payload?.bar?.time, rev = payload?.rev
+    if (!Number.isSafeInteger(rev) || rev < 0 || !Number.isSafeInteger(time)) return
+    const cur = baseRevs.get(time)
+    if (!(cur?.epoch === baseEpoch && cur.rev >= rev)) baseRevs.set(time, { epoch: baseEpoch, rev })
+}
+function baseSuperseded(time, rev) {
+    const b = baseRevs.get(time)
+    return !!b && b.epoch === baseEpoch && Number.isSafeInteger(rev) && rev < b.rev
+}
+function pruneBaseRevs(time) {
+    if (Number.isSafeInteger(time)) for (const t of [...baseRevs.keys()]) if (t < time) baseRevs.delete(t)
+}
+const renderDeps = { LightweightCharts, createDualRangeHistogramSeries, outputValue: storeValue }
 
 function sanitizePluginPrefs(raw) {
     const clean = { enabled: {}, modes: {} }
@@ -394,6 +756,7 @@ function applyPluginDescriptors(entries, error = "") {
 // have rows. Nothing is uploaded; there is no server discovery or fallback.
 let localDb = null
 let localHost = null
+let localCoord = null
 let localCompute = null
 const localRecords = new Map()     // id -> persisted record
 const localErrors = new Map()      // id -> { state, code } non-compute errors (storage/load)
@@ -433,16 +796,12 @@ function noteDataChanged(kind = "history") {
     if (kind !== "tail") historyRevision += 1   // "meta" reaching here = real scope/mode/cache change
     const scope = scopeNow()
     const scopeKey = JSON.stringify(scope)
-    if (localScopeKey && scopeKey !== localScopeKey) {
-        // Displayed outputs are bound to the accepted scope: never reuse
-        // another scope's values for matching timestamps.
-        if (localValues.size) { localValues = new Map(); localLive = new Map(); forEachRenderer(r => { r.dirty = true }) }
-    }
+    // A scope change clears the accepted values in Rust (view.clear via onView).
     localScopeKey = scopeKey
     if (!localCompute) return
     localCompute.setDemand({ scope, scopeKey, revision: dataRevision, historyRevision, bars: page.bars,
         invalidTimes: [...invalidPoison.keys()].sort((a, b) => a - b),
-        exhausted: !!page.reachedStart, tailSnap: page.bars.slice(-64), ...canonicalRequestedRange(page.bars) })
+        exhausted: !!page.reachedStart, ...canonicalRequestedRange(page.bars) })
 }
 // Canonical requested History range for local plugins (old PUBLIC server
 // page basis): the start is the oldest bar of the pages the app requested for
@@ -457,42 +816,22 @@ let localRequestedFrom = null
 // right end; previously computed newer pages are never re-anchored.
 let localOlderPages = []
 let warmupPrepending = false
-function lowerBound(bars, time) {
-    let lo = 0, hi = bars.length
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (bars[mid].time < time) lo = mid + 1; else hi = mid }
-    return lo
-}
 function canonicalRequestedRange(bars) {
     const n = bars.length
     if (!n) return { wantFromIndex: 0, wantToIndex: 0, olderRanges: [] }
     if (localRequestedFrom == null) localRequestedFrom = bars[0].time
-    const olderRanges = localOlderPages.map(({ from, to }) => ({ fromIndex: lowerBound(bars, from), toIndex: lowerBound(bars, to + 1), from, to }))
+    const olderRanges = localOlderPages.map(({ from, to }) => ({ fromIndex: lowerBoundByTime(bars, from), toIndex: lowerBoundByTime(bars, to + 1), from, to }))
         .filter(r => r.toIndex > r.fromIndex)
-    return { wantFromIndex: lowerBound(bars, localRequestedFrom), wantToIndex: n, olderRanges }
+    return { wantFromIndex: lowerBoundByTime(bars, localRequestedFrom), wantToIndex: n, olderRanges }
 }
 
 
 // Invalidate derived values at bar times whose canonical input is about to
-// change, so the new base is never painted with an old derived value.
+// change, so the new base is never painted with an old derived value. The
+// withdrawal policy (bucket + every enabled plugin at/after the earliest
+// bucket) is Rust's; the diff is applied synchronously, before the write.
 function invalidateLocalAt(times) {
-    for (const col of localValues.values()) for (const t of times) col.delete(t)
-    for (const col of localLive.values()) for (const t of times) col.delete(t)
-    // Fail closed in the interval before the coordinator re-plans. Context is
-    // WARM-UP, not a finite influence bound (an output may carry state from
-    // the window's first input, and per_tf overrides may exceed the default),
-    // so conservatively withhold EVERY admitted output of an enabled plugin at
-    // or after the earliest invalidated bucket. Outputs strictly before it
-    // cannot have consumed it. The Rust coordinator then re-plans only windows
-    // that do not span the bucket (substantive window policy stays in Rust).
-    if (!times.length) return
-    const from = Math.min(...times)
-    for (const [id, record] of localRecords) {
-        if (!record?.enabled) continue
-        for (const map of [localValues, localLive]) for (const [key, col] of map) {
-            if (!key.startsWith(`${id}/`)) continue
-            for (const tm of [...col.keys()]) if (tm >= from) col.delete(tm)
-        }
-    }
+    if (times.length && localCompute) applyLocalView(localCompute.invalidate(times))
 }
 
 function syncLocalCompute() {
@@ -503,109 +842,38 @@ function syncLocalCompute() {
 }
 
 const localCoverage = new Map()
+// Package replace / params change / disable: Rust drops the accepted values.
 function dropLocalValues(id) {
     localCoverage.delete(id)
-    for (const key of [...localLive.keys()]) if (key.startsWith(`${id}/`)) localLive.delete(key)
-    for (const key of [...localValues.keys()]) if (key.startsWith(`${id}/`)) localValues.delete(key)
+    if (localCompute) applyLocalView(localCompute.dropValues(id))
 }
 
-const sameValue = (a, b) => a === b || (a !== null && b !== null && typeof a === "object" && typeof b === "object" && JSON.stringify(a) === JSON.stringify(b))
-
-// Earliest bar time whose canonical input differs between an older demand's
-// bars and the current cache (tail replacements/appends); Infinity if equal.
-const barKey = b => b && JSON.stringify(b)
-function changedFromTime(oldBars, bars) {
-    if (!oldBars) return -Infinity   // unknown basis: present nothing
-    let i = oldBars.length - 1, j = bars.length - 1, from = Infinity
-    while (i >= 0 && j >= 0) {
-        const a = oldBars[i], b = bars[j]
-        if (a.time > b.time) { from = Math.min(from, a.time); i--; continue }
-        if (b.time > a.time) { from = Math.min(from, b.time); j--; continue }
-        if (a !== b && barKey(a) !== barKey(b)) from = a.time
-        i--; j--
-    }
-    return from
-}
-
-function onLocalResult(id, mode, output, want, meta = {}) {
-    if (!localRecords.get(id)?.enabled) return
-    if (want && want.scopeKey !== localScopeKey) return
-    // Data-basis fence: output computed on an older history basis (before a
-    // prepend/load/correction) must never refill invalidated values.
-    if (want && want.historyRevision !== undefined && want.historyRevision !== historyRevision) return
-    // Data-revision presentation fence: a successful compute on an older
-    // data revision (same history basis, later tail replace) still advances
-    // the plugin's session, but its values at times whose canonical input has
-    // since changed are never painted (no stale intermediate paint).
-    const staleFrom = want && want.revision !== undefined && want.revision !== dataRevision ? changedFromTime(want.tailSnap, page.bars) : Infinity
-    const fresh = time => time < staleFrom
+// Rust-approved batch for one accepted compute: apply to the projection,
+// then paint (rendering scope only: shape change = rebuild, else the changed
+// times inside the rendered window).
+function onLocalResult(id, mode, view, want, meta = {}) {
     if (meta.coverage) localCoverage.set(id, { coverage: meta.coverage, needBefore: meta.needBefore ?? 0 })
-    const live = meta.kind === "live"
-    const next = live ? new Map(localValues) : new Map([...localValues].filter(([key]) => !(key.startsWith(`${id}/`) && key.endsWith(`|${mode}`))))
-    // Changed times vs the previously accepted result: unchanged recomputes
-    // (the common live-tick case) cost no chart writes; tail-only changes use
-    // the incremental per-bar path; anything else re-renders the outputs.
-    const changed = new Set()
-    let shapeChanged = false
-    for (const [key, series] of Object.entries(output.series || {})) {
-        const k = `${id}/${key}|${mode}`
-        const prev = localValues.get(k)
-        let overlay = localLive.get(k)
-        // The live overlay is only authoritative on the basis it was built on;
-        // a newer corrected History supersedes an overlay from an older basis.
-        if (overlay && overlay.basis !== historyRevision) { localLive.delete(k); overlay = undefined }
-        if (live && !overlay) { localLive.set(k, overlay = new Map()); overlay.basis = historyRevision }
-        if (live && prev) {
-            // Bounded delta: mutate only the touched times of the live column.
-            output.times.forEach((time, i) => {
-                if (!fresh(time)) return
-                const v = seriesValueAt(series, i)
-                if (!(prev.has(time) && sameValue(prev.get(time), v))) changed.add(time)
-                if (v === undefined) { prev.delete(time); overlay.delete(time) } else { prev.set(time, v); overlay.set(time, v) }
-            })
-            while (overlay.size > 1024) overlay.delete(overlay.keys().next().value)
-            next.set(k, prev)
-            continue
-        }
-        const column = new Map()
-        output.times.forEach((time, i) => {
-            if (!fresh(time)) return
-            const v = seriesValueAt(series, i)
-            if (live) { if (v !== undefined) { column.set(time, v); overlay.set(time, v) } }
-            else if (v !== undefined) column.set(time, v)
-        })
-        // Partial-range merge: valid cached values outside the newly computed
-        // canonical range are preserved (never blanked by a bounded recompute).
-        if (!live && prev && meta.rangeFrom != null) for (const [t, v] of prev) if ((t < meta.rangeFrom || t > meta.rangeTo) && !column.has(t)) column.set(t, v)
-        // Stateless History never overwrites the persistent live session's values.
-        if (!live && overlay) for (const [t, v] of overlay) column.set(t, v)
-        if (!prev) shapeChanged = true
-        else {
-            for (const [t, v] of column) if (!prev.has(t) || !sameValue(prev.get(t), v)) changed.add(t)
-            for (const t of prev.keys()) if (!column.has(t)) changed.add(t)
-        }
-        next.set(k, column)
-    }
-    if (!live) for (const key of localValues.keys()) if (key.startsWith(`${id}/`) && key.endsWith(`|${mode}`) && !next.has(key)) shapeChanged = true
-    localValues = next
+    applyLocalView(view)
     localErrors.delete(id)
-    if (shapeChanged) {
+    if (view.shape || view.drop?.length) {
         forEachRenderer(renderer => { if (renderer.output.pluginId === id) renderer.dirty = true })
         refreshPluginOutputs(new Set([id]), true)
     } else {
-        // Only changes inside the rendered window need chart writes; values
-        // outside it are read by the next window render (prepend/warm-up
-        // recomputes then cost nothing while the user drags/zooms).
         const lo = renderedWindow.bars[0]?.time, hi = renderedWindow.bars.at(-1)?.time
-        const visible = visualWorkSuspended() || lo === undefined ? [...changed] : [...changed].filter(t => t >= lo && t <= hi)
+        const visible = visualWorkSuspended() || lo === undefined ? view.changed : view.changed.filter(t => t >= lo && t <= hi)
         if (visible.length) refreshPluginOutputs(new Set([id]), false, visible)
         else updateFlowReadout()
     }
     maybeWarmup()
 }
+// Standalone Rust view changes (fault/membership drop, scope clear).
+function onLocalView(id, view) {
+    applyLocalView(view)
+    if (id != null) refreshPluginOutputs(new Set([id]), true)
+}
 
 function onLocalStatus(id, st) {
-    if (st.state === "fault") { dropLocalValues(id); refreshPluginOutputs(new Set([id]), true) }
+    if (st.state === "fault") { localCoverage.delete(id); refreshPluginOutputs(new Set([id]), true) }
     else { renderPluginState(); renderIndicatorMenu() }
     if (typeof document !== "undefined" && document.body) document.body.dataset.localPlugins = JSON.stringify(localCompute?.running() ?? [])
 }
@@ -628,14 +896,18 @@ function maybeWarmup() {
     loadMoreBefore()
 }
 
-function registryFromRecords() {
-    applyPluginDescriptors([...localRecords.values()].map(r => ({ id: r.id, status: "ready", descriptor: r.descriptor, error: null })), localUnavailable)
+// The ONE descriptor/params authority: the Rust coordinator (SDK
+// Descriptor::validate + resolve_params), called only at restore, import/
+// replace and form-edit boundaries. Lenient = restore/migration (unknown keys
+// dropped, invalid fields defaulted); strict = form edit (throws). Without a
+// coordinator nothing is approved (fail closed).
+function approveMeta(descriptor, params, strict = false) {
+    if (!localCoord) throw Object.assign(new Error("local plugin coordinator unavailable"), { code: "invalid_descriptor" })
+    return localCoord.approve(descriptor, params, strict)
 }
 
-async function persistRecord(record) {
-    try { await localDb.put(record) } catch (error) {
-        setImportNotice("error", `${record.name}: settings could not be saved (${importMessage(error).text})`)
-    }
+function registryFromRecords() {
+    applyPluginDescriptors([...localRecords.values()].map(r => ({ id: r.id, status: "ready", descriptor: r.descriptor, error: null })), localUnavailable)
 }
 
 function setImportNotice(kind, text) {
@@ -648,11 +920,11 @@ let localUnavailable = ""   // sticky: host/storage start failure (actionable, n
 function loadIndicators() { return localInit ??= initLocalPlugins() }
 async function initLocalPlugins() {
     try {
+        const coordBytes = await (await fetch("/wasm-host/cvd_browser_coordinator.wasm", { cache: "no-cache" })).arrayBuffer()
+        localCoord = await createCoordinator(coordBytes)
         const hostBytes = await (await fetch("/wasm-host/cvd_browser_host.wasm", { cache: "no-cache" })).arrayBuffer()
         localHost = await WasmPluginHost.create(hostBytes, { workerUrl: new URL("/wasm-host/plugin-worker.js", location.origin) })
-        const coordBytes = await (await fetch("/wasm-host/cvd_browser_coordinator.wasm", { cache: "no-cache" })).arrayBuffer()
-        const coord = await createCoordinator(coordBytes)
-        localCompute = createLocalCompute({ host: localHost, coord, onResult: onLocalResult, onStatus: onLocalStatus, onInvalid: onLocalInvalid, log: (...a) => console.warn(...a) })
+        localCompute = createLocalCompute({ host: localHost, coord: localCoord, onResult: onLocalResult, onStatus: onLocalStatus, onInvalid: onLocalInvalid, onView: onLocalView, log: (...a) => console.warn(...a) })
     } catch (error) {
         console.warn("local plugin host unavailable", error)
         localUnavailable = "local plugin host unavailable (unsupported or failed to load)"
@@ -661,8 +933,15 @@ async function initLocalPlugins() {
         localDb = await openPluginDb()
         let invalidRestored = 0
         for (const r of await localDb.all()) {
-            if (!validRecord(r)) { invalidRestored++; continue }
-            r.params = sanitizeParams(r.descriptor, r.params)
+            // Browser envelope/identity (validRecord), then Rust approval of the
+            // stored descriptor + params. No Worker is started to inspect it.
+            try {
+                if (!validRecord(r)) throw new Error("invalid record")
+                const approved = approveMeta(r.descriptor, r.params)
+                if (approved.descriptor.id !== r.id) throw new Error("descriptor id mismatch")
+                r.descriptor = approved.descriptor
+                r.params = approved.params
+            } catch (_) { invalidRestored++; continue }
             localRecords.set(r.id, r)
             committedEnabled.set(r.id, r.enabled === true)
         }
@@ -692,15 +971,15 @@ async function importLocalFileNow(file) {
         const { descriptor } = await localHost.load(probe, bytes, "{}")
         localHost.disable(probe)
         const desc = typeof descriptor === "string" ? JSON.parse(descriptor) : descriptor
-        const check = buildRegistry([{ id: desc?.id, status: "ready", descriptor: desc }])
-        if (!check.plugins.length) throw Object.assign(new Error(check.rejected[0]?.message ?? "invalid"), { code: "invalid_descriptor" })
-        const decision = classifyImport([...localRecords.values()], { id: desc.id, sha256 })
+        let approved = approveMeta(desc, null)
+        const decision = classifyImport([...localRecords.values()], { id: approved.descriptor.id, sha256 })
         if (decision.action === "same" && sameBytes(decision.previous.bytes, bytes)) { setImportNotice("info", `${desc.name || desc.id} ${desc.version} is already imported`); return }
         const previous = decision.previous
         // Replacement: validate the ACTUAL migrated params against the new
         // package (plugin create) BEFORE the durable swap; on rejection the
         // previous package stays installed and running unchanged.
-        const migrated = sanitizeParams(desc, previous?.params)
+        if (previous) approved = approveMeta(desc, previous.params)
+        const migrated = approved.params
         if (previous) {
             const check2 = probeInstance++
             try { await localHost.load(check2, bytes, JSON.stringify(migrated)) }
@@ -709,7 +988,7 @@ async function importLocalFileNow(file) {
         }
         const record = {
             id: desc.id, version: String(desc.version), name: String(desc.name || desc.id), sha256, size: bytes.byteLength,
-            fileName: file.name.slice(0, 120), bytes, descriptor: desc,
+            fileName: file.name.slice(0, 120), bytes, descriptor: approved.descriptor,
             params: migrated, enabled: previous ? previous.enabled : false, importedAt: previous?.importedAt ?? Date.now(),
         }
         const writtenEnabled = record.enabled === true
@@ -755,7 +1034,13 @@ function setLocalParams(id, values) { return registryOp({ type: "params", id }, 
 async function setLocalParamsNow(id, values) {
     const record = localRecords.get(id)
     if (!record) return
-    const params = sanitizeParams(record.descriptor, values)
+    let params
+    // Re-approved strictly against the CURRENT descriptor (a queued replacement
+    // may have changed it); rejection writes nothing and changes nothing.
+    try { params = approveMeta(record.descriptor, values, true).params } catch (error) {
+        setImportNotice("error", `${record.name}: ${String(error?.message ?? error)} — previous parameters kept`)
+        return
+    }
     // Durable write FIRST: on storage failure the running generation, its
     // values and the stored params stay as they were (no false success).
     // Immutable write snapshot: a toggle may mutate `record` while this put is
@@ -808,7 +1093,8 @@ function renderPluginControls() {
 function renderIndicatorMenu() {
     if (!pluginControlsEl || !pluginMenuEl || typeof document.createElement !== "function") return
     indicatorMenu ??= createIndicatorMenu({ container: pluginControlsEl, popup: pluginMenuEl, onToggle: setPluginEnabled,
-        onImport: file => importLocalFile(file), onUninstall: id => uninstallLocalPlugin(id), onParams: (id, values) => setLocalParams(id, values),
+        onImport: file => importLocalFile(file), onUninstall: id => uninstallLocalPlugin(id),
+        onParams: (id, values) => { const record = localRecords.get(id); if (record) setLocalParams(id, approveMeta(record.descriptor, values, true).params) },
         parseParam: parseParamInput })
     const items = [
         ...registry.plugins.map(plugin => {
@@ -1216,17 +1502,6 @@ const page = {
     reachedEnd: false
 }
 
-function emptyHistoryPayload() {
-    return {
-        bars: [],
-        has_more_before: false,
-        has_more_after: false,
-        oldest_time: null,
-        newest_time: null,
-        realtime_enabled: false,
-    }
-}
-
 function currentAccessKey() {
     return accessKeyInput.value.trim()
 }
@@ -1287,75 +1562,8 @@ function updateFlowReadout() {
     updateQualityReadout(bar)
 }
 
-function sanePriceField(value, fallback) {
-    const price = Number(value)
-    if (!Number.isFinite(price) || price <= 0) return fallback
-    return price
-}
-
-function closeForBar(bar) {
-    const currentClose = Number(bar.price_close)
-    if (useAggregateMode()) return sanePriceField(bar.apc, currentClose)
-    return currentClose
-}
-
-function openForBar(bar) {
-    const close = closeForBar(bar)
-    return sanePriceField(useAggregateMode() ? bar.apo : bar.po, close)
-}
-
-function highForBar(bar) {
-    const close = closeForBar(bar)
-    const open = openForBar(bar)
-    const high = sanePriceField(useAggregateMode() ? bar.aph : bar.ph, close)
-    const candidates = [high, open, close].filter(price => Number.isFinite(price) && price > 0)
-    return candidates.length ? Math.max(...candidates) : NaN
-}
-
-function lowForBar(bar) {
-    const close = closeForBar(bar)
-    const open = openForBar(bar)
-    const low = sanePriceField(useAggregateMode() ? bar.apl : bar.pl, close)
-    const candidates = [low, open, close].filter(price => Number.isFinite(price) && price > 0)
-    return candidates.length ? Math.min(...candidates) : NaN
-}
-
-function candleColorForBar(open, close, previousClose) {
-    // Lightweight Charts normally colors candles by close-vs-open. For this
-    // dashboard the more useful signal is price direction versus the previous
-    // candle; otherwise a candle can be green while sitting lower than the
-    // previous bar, which reads as random on tiny intraday candles.
-    if (Number.isFinite(previousClose)) {
-        if (close > previousClose) return PRICE_UP_COLOR
-        if (close < previousClose) return PRICE_DOWN_COLOR
-        return PRICE_FLAT_COLOR
-    }
-    if (Number.isFinite(open) && Number.isFinite(close)) {
-        if (close > open) return PRICE_UP_COLOR
-        if (close < open) return PRICE_DOWN_COLOR
-    }
-    return PRICE_FLAT_COLOR
-}
-
-function pricePointForBar(bar, previousBar = null) {
-    const close = closeForBar(bar)
-    const open = openForBar(bar)
-    const high = highForBar(bar)
-    const low = lowForBar(bar)
-    const previousClose = previousBar ? closeForBar(previousBar) : NaN
-    const color = candleColorForBar(open, close, previousClose)
-    return {
-        time: bar.time,
-        open: Number.isFinite(open) ? open : close,
-        high: Number.isFinite(high) ? high : close,
-        low: Number.isFinite(low) ? low : close,
-        close,
-        color,
-        borderColor: color,
-        wickColor: color,
-    }
-}
-
+const closeForBar = bar => barClose(bar, useAggregateMode())
+const pricePointForBar = (bar, previousBar = null) => candlePoint(bar, previousBar, useAggregateMode())
 function pricePointsForBars(bars, previousBar = null) {
     return bars.map((bar, index) => pricePointForBar(bar, index > 0 ? bars[index - 1] : previousBar))
 }
@@ -1472,7 +1680,7 @@ function setBars(bars, keepRange = null, dataKind = null) {
     const sameArray = bars === page.bars
     page.bars = bars
     page.oldestTime = page.bars[0]?.time ?? null
-    indicatorStore.pruneBefore(page.oldestTime)
+    pruneBaseRevs(page.oldestTime)
     page.newestTime = page.bars[page.bars.length - 1]?.time ?? null
     noteDataChanged(dataKind ?? (sameArray ? "meta" : "history"))
     updateDocumentTitle()
@@ -1710,14 +1918,9 @@ function applyRealtimeInvalidation(payload) {
     removeCacheTimes([t])
 }
 // Withdraw a plugin's values on a window the coordinator refused.
-function onLocalInvalid(id, mode, want, range) {
-    if (!localRecords.get(id)?.enabled) return
-    if (want && (want.scopeKey !== localScopeKey || want.historyRevision !== historyRevision)) return
-    const inRange = t => t >= range.from && t <= range.to
-    for (const map of [localValues, localLive]) for (const [key, col] of map) {
-        if (!key.startsWith(`${id}/`) || !key.endsWith(`|${mode}`)) continue
-        for (const t of [...col.keys()]) if (inRange(t)) col.delete(t)
-    }
+// The withdrawal itself was applied in Rust (synchronously against the current demand).
+function onLocalInvalid(id, mode, want, range, view) {
+    applyLocalView(view)
     refreshPluginOutputs(new Set([id]), true)
 }
 
@@ -1742,16 +1945,8 @@ function equalBarData(left, right) {
 }
 
 function barIndexByTime(bars, time) {
-    let low = 0
-    let high = bars.length - 1
-    while (low <= high) {
-        const middle = Math.floor((low + high) / 2)
-        const found = bars[middle].time
-        if (found === time) return middle
-        if (found < time) low = middle + 1
-        else high = middle - 1
-    }
-    return -1
+    const index = lowerBoundByTime(bars, time)
+    return bars[index]?.time === time ? index : -1
 }
 
 function lowerBoundByTime(bars, time) {
@@ -1826,27 +2021,16 @@ function applyHistoryPage(data, keepRange = null, confirmedBars = data.bars || [
 
 function applyRealtimePayload(payload) {
     if (payload?.action === "invalidate") { assertSourceSeries(payload, marketSel.value); applyRealtimeInvalidation(payload); return }
-    scopeRepaintPending = false
     applyRealtimeBase(payload)
-    // Observation bound advanced: pending results for ANY bar in the scope
-    // may now be current. Repaint after the base bar is displayed (the
-    // hidden-safe path marks renderers dirty instead).
-    if (scopeRepaintPending) {
-        scopeRepaintPending = false
-        const ids = new Set()
-        forEachRenderer(renderer => ids.add(renderer.output.pluginId))
-        if (ids.size) refreshPluginOutputs(ids, false, null)
-    }
 }
 
-let scopeRepaintPending = false
 function applyRealtimeBase(payload) {
     assertSourceSeries(payload, marketSel.value)
     const b = payload?.bar
     if (!b?.time) return
     // A live base frame predating an accepted historical replacement of this
     // bar is stale: displaying it would detach the bar from its results.
-    if (indicatorStore.baseSuperseded(b.time, payload?.rev)) return
+    if (baseSuperseded(b.time, payload?.rev)) return
     // Validity: a frame older than an invalidation of this bucket is stale;
     // a newer one is the validated repair (re-inserted, History recomputed).
     const epoch = frameEpoch(payload)
@@ -1864,23 +2048,12 @@ function applyRealtimeBase(payload) {
         noteDataChanged("history")
         return
     }
-    // Revision of the base frame now shown for this bar (as_of_rev fence).
-    const authorityChanged = noteBaseRev(payload)
-    if (authorityChanged === "scope") scopeRepaintPending = true
+    noteBaseRev(payload)
 
     const last = page.bars[page.bars.length - 1]
     const sameShown = (last?.time === b.time && equalBarData(last, b)) ||
         (last && b.time < last.time && equalBarData(page.bars[barIndexByTime(page.bars, b.time)], b))
-    if (sameShown) {
-        // Identical bar but a newer base revision: pending results may now be
-        // current, so repaint affected outputs (true duplicates stay no-ops).
-        if (authorityChanged === true) {
-            const ids = new Set()
-            forEachRenderer(renderer => ids.add(renderer.output.pluginId))
-            if (ids.size) refreshPluginOutputs(ids, false, [b.time])
-        }
-        return
-    }
+    if (sameShown) return
     if (last && b.time < last.time) {
         const index = barIndexByTime(page.bars, b.time)
         if (index >= 0 && !equalBarData(page.bars[index], b)) {
@@ -1912,7 +2085,7 @@ function applyTailBars(bars, keepRange = null) {
 
     page.newestTime = page.bars[page.bars.length - 1]?.time ?? null
     page.oldestTime = page.bars[0]?.time ?? null
-    indicatorStore.pruneBefore(page.oldestTime)
+    pruneBaseRevs(page.oldestTime)
     noteDataChanged("tail")
     updateDocumentTitle()
     updateFlowReadout()
@@ -1949,11 +2122,6 @@ function syncTimelineTail(bars) {
 
 function sameRange(a, b) {
     return !!a && !!b && Math.abs(a.from - b.from) < 1e-6 && Math.abs(a.to - b.to) < 1e-6
-}
-
-function shiftRange(range, delta) {
-    if (!range || delta === 0) return range
-    return { from: range.from + delta, to: range.to + delta }
 }
 
 // Fetch a history page, stepping over ALL-INVALID pages by the producer's
@@ -2175,7 +2343,7 @@ function connectWs() {
 
     const generation = ++wsGeneration
     // Live fences are per connection; results already stored stay valid.
-    indicatorStore.resetFences()
+    baseEpoch++
     const socket = new WebSocket(url)
     ws = socket
     let syncing = true
@@ -2226,9 +2394,7 @@ function connectWs() {
         try {
             const payload = JSON.parse(ev.data)
             // Legacy server indicator frames are ignored (browser computes).
-            let event = null
-            try { event = parseIndicatorFrame(payload) } catch (_) { return }
-            if (event) return
+            if (typeof payload?.type === "string" && payload.type.startsWith("indicator")) return
             assertSourceSeries(payload, requestedMarket, requestedExchange, requestedSymbol)
             const frameTime = payload?.action === "invalidate" ? payload.invalid_time : payload?.bar?.time
             if (!frameTime) return
@@ -2266,7 +2432,8 @@ async function reload() {
     // state reset is safe while hidden; the visual crosshair clears on paint.
     hoveredFlowTime = null
     // Plugin status/results belong to the old source/timeframe.
-    indicatorStore.reset()
+    baseRevs.clear()
+    baseEpoch++
     resetValidity()
     modeConnectionsReady = false
     historyController.abort()
@@ -2296,15 +2463,6 @@ async function reload() {
     } catch (error) {
         if (generation === historyGeneration) reportHistoryError(error)
     }
-}
-
-function suspendUpdates() {
-    if (updatesSuspended) return
-    updatesSuspended = true
-    stopDelayedPolling()
-    stopRealtimeSocket()
-    cancelVisualWork()
-    statusEl.textContent = realtimeEnabled ? "paused" : "delay 1h"
 }
 
 async function resumeUpdates() {

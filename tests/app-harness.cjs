@@ -63,11 +63,21 @@ const TEST_BRIDGE = `
 // Local-package bridge for unit tests: descriptors applied directly become
 // enabled local records; projected outputs land in the browser result map
 // exactly as accepted WASM computes do (real WASM runs in the Chromium gates).
+// Test-only extraction (production extraction/merge is Rust series_value_at).
+function __valueAt(s, i) {
+    const f = v => typeof v === 'number' && Number.isFinite(v) ? v : null
+    switch (s?.type) {
+        case 'line': case 'histogram': return f(s.values?.[i])
+        case 'dual_range': { const u = f(s.upper?.[i]), l = f(s.lower?.[i]); return u === null || l === null ? null : { upper: u, lower: l } }
+        case 'segmented_lines': return Array.isArray(s.layers) ? s.layers.map(x => f(x?.[i])) : null
+        default: return undefined
+    }
+}
 function __applyLocal(id, mode, output) {
     for (const [key, s] of Object.entries(output.series)) {
         const k = id + '/' + key + '|' + mode
         const col = localValues.get(k) ?? new Map()
-        output.times.forEach((t, i) => { const v = seriesValueAt(s, i); if (v !== undefined) col.set(t, v) })
+        output.times.forEach((t, i) => { const v = __valueAt(s, i); if (v !== undefined) col.set(t, v) })
         localValues.set(k, col)
     }
 }
@@ -155,7 +165,7 @@ function harness(checked = {}, options = {}) {
     const document = { hidden: false, title: '', activeElement: null, documentElement: { style: { setProperty: noop } },
         addEventListener: listen('document:'), createElement: element }
     const context = vm.createContext({
-        elements, document, console, URL, AbortController, DOMException,
+        elements, document, console, URL, AbortController, DOMException, TextEncoder, TextDecoder,
         location: { origin: 'https://example.test', host: 'example.test', protocol: 'https:' },
         localStorage: { getItem: () => null, setItem: noop },
         performance: { now: () => 10000 },
@@ -173,9 +183,10 @@ function harness(checked = {}, options = {}) {
         clearInterval: id => timers.delete(id),
     })
     const read = file => fs.readFileSync(path.join(__dirname, '../static/js', file), 'utf8')
-    const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export async function', 'async function').replaceAll('export function', 'function')
-    const source = read('app.js').replace(/^import .*\n/gm, '').replace(/\ninit\(\)\s*$/, '\n')
-    const modules = ['config.js', 'quality-display.mjs', 'segmented-series.mjs', 'plugin-wire.mjs', 'plugin-store.mjs', 'legacy-prefs.mjs', 'plugin-registry.mjs', 'plugin-render.mjs', 'indicator-menu.mjs', 'time-labels.mjs', 'local-plugins.mjs', 'coordinator.mjs', 'local-compute.mjs'].map(file => strip(read(file))).join('\n')
+    const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export async function', 'async function').replaceAll('export function', 'function').replaceAll('export class', 'class').replaceAll('import.meta.url', "'http://localhost/wasm-host/host-bridge.js'")
+    // The harness supplies `elements` (stub controls) instead of DOM lookups.
+    const source = read('app.js').replace(/^import .*\n/gm, '').replace(/^const elements = .*\n/m, '').replace(/\ninit\(\)\s*$/, '\n')
+    const modules = ['chart.js', '../wasm-host/host-bridge.js'].map(file => strip(read(file))).join('\n')
     vm.runInContext(modules + '\n' + source + '\nconst realEnsureModeConnections = ensureModeConnections; ensureModeConnections = () => {};\n' + (options.projection === false ? '' : PROJECTION) + TEST_BRIDGE, context)
     if (options.descriptors !== null) vm.runInContext(`applyPluginDescriptors(${JSON.stringify(options.descriptors ?? TEST_DESCRIPTORS)})`, context)
     const run = code => vm.runInContext(code, context)

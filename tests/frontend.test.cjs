@@ -24,8 +24,8 @@ function prefsHarness(metaPayload, failMeta = false) {
         pluginPrefs: { enabled: {}, modes: {} },
         localStorage: {setItem: (k,v) => saved[k] = v},
     });
-    const config = fs.readFileSync(require('node:path').join(__dirname,'../static/js/config.js'),'utf8').replaceAll('export const','const').replaceAll('export function','function');
-    const legacy = fs.readFileSync(require('node:path').join(__dirname,'../static/js/legacy-prefs.mjs'),'utf8').replaceAll('export function','function');
+    const config = section('const CONFIG = {', 'const elements =');
+    const legacy = section('const LEGACY_FLOW_MODES', 'function createIndicatorMenu');
     vm.runInContext(config + '\n' + legacy + '\n' + section('const fallbackInstruments','function mkChart') + '\n' + section('function marketLabel','const chart =') + '\n' + section('function sanitizePluginPrefs','function pluginEnabled'), context);
     return { run: code => vm.runInContext(code, context), saved };
 }
@@ -105,6 +105,7 @@ test('one-time legacy migration keeps old Buy-Sell mode and LEVELS visibility, t
 });
 
 const source = fs.readFileSync(require('node:path').join(__dirname, '../static/js/app.js'), 'utf8')
+const chartSource = fs.readFileSync(require('node:path').join(__dirname, '../static/js/chart.js'), 'utf8').replace(/^export /gm, '')
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }
 function harness() {
     const requests = []
@@ -140,7 +141,7 @@ function harness() {
         chart: { timeScale: () => ({ getVisibleLogicalRange: () => null }) },
         updateDocumentTitle: noop, resetViewport: noop, syncPaneLayout: noop,
         clearScheduledSegmentedRefresh: noop, scheduleSegmentedRefresh: noop, applyHistoryIndicators: noop, noteDataChanged: noop, invalidateLocalAt: noop,
-        indicatorStore: { reset: noop, resetFences: noop, pruneBefore: noop, noteBaseRev: noop, baseSuperseded: () => false }, noteBaseRev: noop, parseIndicatorFrame: () => null, handleIndicatorEvent: noop, resyncIndicators: noop,
+        baseRevs: new Map(), baseEpoch: 0, noteBaseRev: noop, pruneBaseRevs: noop, baseSuperseded: () => false, handleIndicatorEvent: noop, resyncIndicators: noop,
         pluginStatus: {}, renderPluginControls: noop,
         // Stands in for the two default public plugin outputs (CVD line + selected Flow).
         updatePluginPoint: bar => { series.update(bar); series.update(bar) },
@@ -148,14 +149,14 @@ function harness() {
         pricePointForBar: bar => bar, updateFlowReadout: () => context.readoutWrites++, useAggregateMode: () => false,
         CONFIG: { FETCH_COOLDOWN: 0, DELAY_POLL_MS: 1000 }, warmupPrepending: false, localOlderPages: [],
     })
-    vm.runInContext(fs.readFileSync(require('node:path').join(__dirname, '../static/js/quality-display.mjs'), 'utf8').replaceAll('export function', 'function'), context)
-    const config = fs.readFileSync(require('node:path').join(__dirname,'../static/js/config.js'),'utf8').replaceAll('export const','const').replaceAll('export function','function');
-    vm.runInContext(config + '\nCONFIG.DELAY_POLL_MS=1000; CONFIG.FETCH_COOLDOWN=0;\n' + section('const fallbackInstruments', 'function savePrefs') + '\n' + section('let programmaticRangeChange', 'function emptyHistoryPayload')
+    vm.runInContext(chartSource, context)
+    const config = section('const CONFIG = {', 'const elements =');
+    vm.runInContext(config + '\nCONFIG.DELAY_POLL_MS=1000; CONFIG.FETCH_COOLDOWN=0;\n' + section('const fallbackInstruments', 'function savePrefs') + '\n' + section('let programmaticRangeChange', 'function currentAccessKey')
         + '\n' + section('function assertSourceSeries', 'function updateOptionsForExchange')
         + '\n' + section('let timelineTimes', 'function selectRenderWindow')
         + '\nfunction setBars(bars) { fullWrites++; page.bars = bars; renderedWindow.bars = bars.slice(); page.oldestTime = bars[0]?.time ?? null; page.newestTime = bars.at(-1)?.time ?? null }\n'
         + section('async function fetchHistory', 'chart.timeScale().subscribeVisibleLogicalRangeChange')
-        + section('function stopDelayedPolling', 'function suspendUpdates')
+        + section('function stopDelayedPolling', 'async function resumeUpdates')
         + '\nensureModeConnections = () => {};', context)
     return { context, requests, timers, sockets, updates, run: code => vm.runInContext(code, context) }
 }
@@ -490,7 +491,9 @@ test('history merge touches only the changed suffix yet stays correct for prepen
 })
 
 test('producer-derived instruments fixture matches frontend descriptors exactly (A types.rs INSTRUMENTS)', async () => {
-    const { SOURCE_INSTRUMENTS, validInstrument, sourceSeries } = await import('../static/js/config.js')
+    const configContext = vm.createContext({})
+    vm.runInContext(section('const CONFIG = {', 'const elements =') + '\n;({ SOURCE_INSTRUMENTS, validInstrument, sourceSeries })', configContext)
+    const { SOURCE_INSTRUMENTS, validInstrument, sourceSeries } = vm.runInContext('({ SOURCE_INSTRUMENTS, validInstrument, sourceSeries })', configContext)
     const produced = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, 'fixtures/usdc-producer-instruments.json'), 'utf8'))
     assert.equal(produced.length, Object.keys(SOURCE_INSTRUMENTS).length)
     for (const item of produced) assert.ok(validInstrument(item), JSON.stringify(item))
@@ -687,19 +690,19 @@ test('admission A4: OLD-epoch validAuth does not suppress a CURRENT-epoch DB inv
     assert.deepEqual(times(run), [60])
 })
 
-test('withdrawal B1: invalidation withholds every enabled-plugin output at/after the bucket (context is warm-up, not an influence bound), keeps earlier ones', () => {
-    const ctx = vm.createContext({ Map, Math, page: { bars: Array.from({ length: 200 }, (_, i) => ({ time: (i + 1) * 60 })) },
-        localValues: new Map(), localLive: new Map(), localRecords: new Map() })
+test('withdrawal B1: invalidateLocalAt applies the Rust withdrawal diff synchronously (policy: crates/browser-coordinator tests)', () => {
+    const calls = []
+    const ctx = vm.createContext({ Map, Object, localValues: new Map(), forEachRenderer: () => {},
+        localCompute: { invalidate: times => { calls.push(times); return { cols: { 'p/sum|history': { set: [], del: [1200, 1260] } } } } } })
+    vm.runInContext(section('let localValues = new Map()', 'const renderDeps').replace('let localValues = new Map()', ''), ctx)
     vm.runInContext(section('function invalidateLocalAt', 'function syncLocalCompute'), ctx)
     const run = code => vm.runInContext(code, ctx)
-    run('localRecords.set("p", {id:"p", enabled:true, descriptor:{context:{bars:50, per_tf:{"1m":120}}}})')
-    run('localValues.set("p/sum|history", new Map(page.bars.map(b => [b.time, b.time])))')
-    run('localValues.set("q/sum|history", new Map(page.bars.map(b => [b.time, b.time])))')
-    run('invalidateLocalAt([60*20])')
-    const kept = JSON.parse(run('JSON.stringify([...localValues.get("p/sum|history").keys()])'))
-    assert.equal(kept.length, 19, 'outputs before the bucket kept')
-    assert.ok(kept.every(t => t < 1200))
-    assert.equal(run('localValues.get("q/sum|history").size'), 199, 'unregistered plugin loses only the invalid bucket itself')
+    run('localValues.set("p/sum|history", new Map([[1140, 1], [1200, 2], [1260, 3]]))')
+    run('invalidateLocalAt([1200])')
+    assert.deepEqual(JSON.parse(JSON.stringify(calls)), [[1200]])
+    assert.deepEqual(JSON.parse(run('JSON.stringify([...localValues.get("p/sum|history").keys()])')), [1140], 'withdrawn before return')
+    run('invalidateLocalAt([])')
+    assert.equal(calls.length, 1, 'no-op invalidation makes no call')
 })
 
 const flush = () => new Promise(resolve => setImmediate(resolve))

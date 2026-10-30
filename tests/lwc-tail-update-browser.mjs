@@ -13,7 +13,7 @@
 // edges). Stage of scripts/b-browser-gate.sh (`lwcrender`).
 //   node tests/lwc-tail-update-browser.mjs
 //   CVD_STATIC_ROOT=<dir>    serve an assembled static tree (core-app-gate)
-//   CVD_RENDER_MODULE=<file>  load another plugin-render.mjs (RED control)
+//   CVD_RENDER_MODULE=<file>  load another renderer module, e.g. an old chart.js (RED control)
 //   CVD_CHROMIUM=<binary>     browser (default /usr/bin/chromium)
 import fs from 'node:fs'
 import os from 'node:os'
@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url'
 import { teardown } from './harness-teardown.mjs'
 
 const SRC = path.resolve(process.env.CVD_STATIC_ROOT || path.join(path.dirname(fileURLToPath(import.meta.url)), '../static'))
-const RENDER = process.env.CVD_RENDER_MODULE ? path.resolve(process.env.CVD_RENDER_MODULE) : path.join(SRC, 'js/plugin-render.mjs')
+const RENDER = process.env.CVD_RENDER_MODULE ? path.resolve(process.env.CVD_RENDER_MODULE) : path.join(SRC, 'js/chart.js')
 const KINDS = 4, DEADLINE_MS = 60000, MAX_STDOUT = 1 << 20
 
 const PAGE = `<!doctype html><html><body><div id=c style="width:600px;height:400px"></div>

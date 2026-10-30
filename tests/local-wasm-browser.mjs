@@ -314,9 +314,16 @@ try {
   await waitFor(`__cvd.records().get('sample.channel').params.length === 5 && (__cvd.values().get('sample.channel/sma|source')?.size ?? 0) > 0 && ${settled}`, 30000)
   const sma5 = await valuesOf('sample.channel/sma'); const lastI = closes.length - 1
   check('param_change_recomputes', Object.is(sma5[closes[lastI][0]], closes.slice(lastI - 4).reduce((a, [, c]) => a + c, 0) / 5))
+  // Invalid edit: rejected by the compiled coordinator (strict SDK resolver);
+  // nothing written to IndexedDB, no Worker load/reload, values kept.
+  const editState = `(async () => ({ db: (await __cvd.db().all()).find(r => r.id === 'sample.channel').params, mem: __cvd.records().get('sample.channel').params, host: __cvd.host().stats().running, loads: __cvd.compute().ops('sample.channel'), seq: __cvd.notice().seq, vals: __cvd.values().get('sample.channel/sma|source')?.size ?? 0 }))()`
+  const beforeBad = await evaluate(editState)
   await evaluate(`(() => { const i = document.querySelector('${rowSel('sample.channel')} [data-param=length]'); i.value = '0' })()`)
   await click(`${rowSel('sample.channel')} [data-action=apply]`)
-  check('invalid_param_rejected_visibly', /length must be/.test(await evaluate(`document.querySelector('${rowSel('sample.channel')} .plugin-param-error').textContent`)))
+  check('invalid_param_rejected_visibly', /length.*out of range/.test(await evaluate(`document.querySelector('${rowSel('sample.channel')} .plugin-param-error').textContent`)))
+  await sleep(300)
+  const afterBad = await evaluate(editState)
+  check('invalid_param_no_db_or_worker_mutation', JSON.stringify(afterBad) === JSON.stringify(beforeBad) && beforeBad.db.length === 5, JSON.stringify({ beforeBad, afterBad }))
   await shot('02-enabled-normal')
 
   // 6. Fault isolation: hostile fixture (invalid output) faults alone.
@@ -414,6 +421,23 @@ try {
   await open()
   await waitFor(`(__cvd.values().get('cvd/cvd|source')?.size ?? 0) > 0 && ${settled}`, 30000)
   check('reload_restores_rows_and_enable', await evaluate(`__cvd.records().size === 5 && __cvd.records().get('cvd').enabled && !__cvd.records().get('sample.channel').enabled && __cvd.records().get('sample.channel').params.length === 5`))
+
+  // 11b. Restore approval in the compiled coordinator (SDK validate +
+  // per-field resolve_params): corrupt stored descriptors are skipped fail
+  // closed; unknown params dropped and an invalid field defaulted; a disabled
+  // record stays disabled and no Worker is started to inspect its metadata.
+  await evaluate(`(async () => { const db = __cvd.db(); const s = (await db.all()).find(r => r.id === 'sample.channel')
+    await db.put({ ...s, params: { ...s.params, length: 0, evil: 1 } })
+    await db.put({ ...s, id: 'corrupt.abi', descriptor: { ...s.descriptor, id: 'corrupt.abi', abi: 99 }, importedAt: s.importedAt + 1 })
+    await db.put({ ...s, id: 'corrupt.output', descriptor: { ...s.descriptor, id: 'corrupt.output', outputs: [{ key: 'x', pane: 'price', type: 'script' }] }, importedAt: s.importedAt + 2 })
+    return true })()`)
+  await open()
+  await waitFor(`(__cvd.values().get('cvd/cvd|source')?.size ?? 0) > 0 && ${settled}`, 30000)
+  const restored = await evaluate(`(() => { const r = __cvd.records().get('sample.channel'); return { size: __cvd.records().size, corrupt: ['corrupt.abi', 'corrupt.output'].some(id => __cvd.records().has(id) || !!document.querySelector('[data-plugin="' + id + '"]')), enabled: r.enabled, params: r.params, notice: __cvd.notice().text, running: __cvd.compute().running(), host: __cvd.host().stats().running } })()`)
+  check('restore_corrupt_descriptor_skipped', restored.size === 5 && !restored.corrupt && /2 stored plugin record\(s\) were invalid/.test(restored.notice), JSON.stringify(restored))
+  check('restore_params_unknown_dropped_invalid_defaulted', !('evil' in restored.params) && restored.params.length === 20, JSON.stringify(restored.params))
+  check('restore_disabled_stays_disabled_no_worker', restored.enabled === false && !restored.running.includes('sample.channel') && restored.host === restored.running.length, JSON.stringify(restored))
+  await evaluate(`(async () => { const db = __cvd.db(); await db.delete('corrupt.abi'); await db.delete('corrupt.output'); return true })()`)
 
   // 12. Version/replacement safety: same id, different bytes (an extra custom
   // section, which the validator skips) replaces atomically, keeps enable

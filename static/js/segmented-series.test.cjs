@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const context = vm.createContext({});
-vm.runInContext(fs.readFileSync(path.join(__dirname, 'segmented-series.mjs'), 'utf8').replaceAll('export function', 'function'), context);
+vm.runInContext(fs.readFileSync(path.join(__dirname, 'chart.js'), 'utf8').replace(/^export /gm, ''), context);
 const call = (name, ...args) => context[name](...args);
 const plain = value => JSON.parse(JSON.stringify(value));
 
