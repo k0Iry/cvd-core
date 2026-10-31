@@ -190,5 +190,5 @@ bash scripts/wasm-foundation-gate.sh ../cvd-wasm-check
 ```
 
 This checks this repo's own host and SDK fixtures and prints `GATE PASS`; it
-does not test your plugin. `CVD_TARGET_DIR` optionally sets the Cargo target
-dir.
+does not test your plugin. `--browser=none` (used by push/PR CI) skips only
+the Chromium checks. `CVD_TARGET_DIR` optionally sets the Cargo target dir.

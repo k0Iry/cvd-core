@@ -1,5 +1,5 @@
 // Startup classification for tests/chromium-launch.mjs using owned fake
-// binaries (deterministic) plus one real Chromium readiness check when present.
+// binaries (deterministic; no real browser is launched here).
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -104,12 +104,5 @@ test('control: banner pointing at a real CDP endpoint (no port file) is accepted
   } finally { await s.close(); fs.rmSync(d, { recursive: true }) }
 })
 
-const real = process.env.CVD_CHROMIUM || '/usr/bin/chromium'
-test('real Chromium reaches CDP readiness', { skip: !fs.existsSync(real) && 'no chromium' }, async () => {
-  const d = mk(); const r = await run(real, 20000, d)
-  assert.ifError(r.err); assert.match(r.ok.wsUrl, /^ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\//)
-  // Both discovery paths are valid and each is CDP-probe verified; which one wins the race is not the contract.
-  assert.ok(['DevToolsActivePort', 'stderr-banner'].includes(r.ok.via), r.ok.via)
-  assert.match(r.ok.httpBase, /^http:\/\/127\.0\.0\.1:\d+$/); assert.ok(r.ok.ms <= 20000, `${r.ok.ms}ms`)
-  assert.equal(r.td.ok, true); fs.rmSync(d, { recursive: true })
-})
+// The real-Chromium readiness check lives in tests/chromium-launch.browser.mjs
+// (explicit browser entry; never part of the default node-unit suite).

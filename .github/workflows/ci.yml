@@ -29,11 +29,15 @@ jobs:
           node-version: '22'
       - name: Rust toolchain
         run: rustup show && rustup target add wasm32-unknown-unknown
-      - name: Rust workspace + wasm foundation gate (host-owned public fixtures, real Chromium)
+      # Push/PR launch no browser; manual workflow_dispatch runs the full browser tier.
+      - name: Rust workspace + wasm foundation gate (host-owned public fixtures; real Chromium on manual runs only)
         shell: bash
+        env:
+          BROWSER_MODE: ${{ github.event_name == 'workflow_dispatch' && 'full' || 'none' }}
         run: |
           set +e
-          CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" bash scripts/wasm-foundation-gate.sh "$RUNNER_TEMP/wasm-gate" > "$RUNNER_TEMP/cvd-tests.log" 2>&1
+          if [ "$BROWSER_MODE" = full ]; then export CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)"; fi
+          bash scripts/wasm-foundation-gate.sh --browser="$BROWSER_MODE" "$RUNNER_TEMP/wasm-gate" > "$RUNNER_TEMP/cvd-tests.log" 2>&1
           result=$?
           cat "$RUNNER_TEMP/cvd-tests.log"
           if [ "$result" -ne 0 ]; then
@@ -47,11 +51,12 @@ jobs:
             printf '::error title=Rust test diagnostic::%s\n' "$diagnostic"
           fi
           exit "$result"
-      - name: Frontend unit contracts
-        run: CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" bash scripts/node-unit-gate.sh "$RUNNER_TEMP/node-unit"
+      - name: Frontend unit contracts (browser-free)
+        run: bash scripts/node-unit-gate.sh "$RUNNER_TEMP/node-unit"
       - name: Owned process-group + output-path cleanup controls
         run: bash tests/owned-group-control.sh && bash tests/out-guard-control.sh
-      - name: Self-contained core app interaction (own host/coordinator/TEST-ONLY fixture wasm, real Chromium)
+      - name: Self-contained core app interaction (own host/coordinator/TEST-ONLY fixture wasm, real Chromium; manual only)
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" TMPDIR="$RUNNER_TEMP" \
