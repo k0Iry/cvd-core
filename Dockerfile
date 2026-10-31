@@ -19,9 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY --from=builder /usr/src/app/target/release/cvd /usr/local/bin/cvd
 COPY --from=builder /out/static ./static
-COPY config/cvd.container.toml ./config.toml
 COPY LICENSE NOTICE THIRD_PARTY_LICENSES.txt ./
 USER 10001:10001
-ENV CVD_CONFIG=/app/config.toml CVD_OUTBOX_PATH=/app/data/outbox.sqlite
+ENV CVD_OUTBOX_PATH=/app/data/outbox.sqlite
 EXPOSE 8080
+# Defaults: HTTP 0.0.0.0:8080, static dir ./static (= /app/static). No config file.
 CMD ["cvd"]

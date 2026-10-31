@@ -1,6 +1,0 @@
-# Copy to artifacts/cvd.toml before editing.
-# Public CVD/Flow indicators are no longer configured here: download the public
-# .wasm release assets and import them in the browser (Indicators -> Import).
-[server]
-http_addr = "0.0.0.0:8080"
-static_dir = "/app/static"

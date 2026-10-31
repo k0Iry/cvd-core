@@ -256,7 +256,7 @@ try {
   check('no_page_exceptions', exceptions.length === 0, exceptions.join('\n'))
   const keyed = seen.filter(u => { try { return new URL(u).searchParams.has('key') || u.includes(LEGACY) } catch { return true } })
   check('no_legacy_key_transmitted', keyed.length === 0 && seen.some(u => u.includes('/history?')) && seen.some(u => /^wss?:.*\/ws\?/.test(u)), JSON.stringify(keyed))
-  check('fresh_local_wasm_9_urls', seen.some(u => u.includes('v=local-wasm-9')) && !seen.some(u => u.includes('local-wasm-8')))
+  check('fresh_local_wasm_10_urls', seen.some(u => u.includes('v=local-wasm-10')) && !seen.some(u => u.includes('local-wasm-9')))
   // Narrow allowlist: only the existing product Google Fonts stylesheet/font GETs.
   const allowed = e => e.method === 'GET' && ((e.url.startsWith('https://fonts.googleapis.com/css2?') && e.type === 'Stylesheet') || (e.url.startsWith('https://fonts.gstatic.com/') && e.type === 'Font'))
   const ext = external.filter(e => !allowed(e))

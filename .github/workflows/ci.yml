@@ -113,15 +113,13 @@ jobs:
           docker network create cvdsmoke
           docker run -d --name pg --network cvdsmoke -e POSTGRES_USER=cvdadmin -e POSTGRES_DB=cvd -e POSTGRES_PASSWORD=smoke postgres:16
           for i in $(seq 60); do docker exec pg pg_isready -U cvdadmin -d cvd && break; sleep 1; done
-          # Legacy [indicators] config must be accepted, ignored and reported.
-          printf '[server]\nhttp_addr="0.0.0.0:8080"\nstatic_dir="/app/static"\n[indicators]\nrunner="/usr/local/bin/cvd-indicator-runner"\n[[indicators.library]]\nid="cvd"\npath="/plugins/libcvd_indicator_cvd.so"\n' > "$RUNNER_TEMP/legacy.toml"
+          # No config file: built-in defaults must serve HTTP on 8080 from /app/static.
+          docker run --rm --entrypoint sh cvd-core:ci -c 'test ! -e /app/config.toml && test -z "${CVD_CONFIG:-}"'
           docker run -d --name cvd --network cvdsmoke -p 127.0.0.1:18080:8080 \
-            -v "$RUNNER_TEMP/legacy.toml:/app/config.toml:ro" \
             -e DATABASE_URL=postgres://cvdadmin:smoke@pg:5432/cvd cvd-core:ci
           for i in $(seq 60); do curl -fsS http://127.0.0.1:18080/meta >/dev/null && break; sleep 1; done
           docker logs cvd > "$RUNNER_TEMP/cvd-smoke.log" 2>&1
-          grep -q "config \[indicators\] is retired and IGNORED" "$RUNNER_TEMP/cvd-smoke.log"
-          grep -q "ignored retired indicator library id=cvd" "$RUNNER_TEMP/cvd-smoke.log"
+          grep -q "Open UI: http://0.0.0.0:8080/" "$RUNNER_TEMP/cvd-smoke.log"
           curl -fsS -o "$RUNNER_TEMP/cvd-root.html" http://127.0.0.1:18080/
           grep -qi "<html" "$RUNNER_TEMP/cvd-root.html"
           curl -fsS http://127.0.0.1:18080/meta | python3 -c 'import json,sys; m=json.load(sys.stdin); assert "indicators" not in m and m["instruments"]'

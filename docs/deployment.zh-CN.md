@@ -7,10 +7,26 @@
 `sha-<完整提交>`）。每个标签都是同一个多架构镜像，`linux/amd64` 与 `linux/arm64`
 均为原生构建并测试；Docker 会自动选择匹配架构（无需 `platform:` 设置或登录）。服务器上不编译任何东西；指标之后在浏览器里导入。
 
-始终保留 `.env`、`artifacts/cvd.toml` 和 Docker 卷（PostgreSQL 数据与
+始终保留 `.env` 和 Docker 卷（PostgreSQL 数据与
 `/app/data` 中的 outbox）。切勿使用 `docker compose down -v`——它会删除数据。
 如果你平时运行 Compose 带有 `-f` 或 `-p` 参数，请在下面每条 `docker compose`
 命令里加上同样的参数。
+
+## 配置
+
+不再有配置文件。服务监听 `0.0.0.0:8080`，从工作目录下的 `static` 提供静态文件
+（镜像内即 `/app/static`）。可选覆盖：`CVD_HTTP_ADDR` 与 `CVD_STATIC_DIR`。
+在容器外直接运行二进制时默认端口也改为 8080（原为 80）。
+
+`CVD_CONFIG` / `cvd.toml` 已淘汰且不再读取。如果你的 Compose 仍把
+`artifacts/cvd.toml`（或 `/plugins` 目录）挂载进 `cvd`：
+
+1. 如旧文件设置了非默认的 `[server] http_addr` 或 `static_dir`，先把这些值写入
+   `cvd` 服务的 `CVD_HTTP_ADDR` / `CVD_STATIC_DIR`，否则会被静默丢弃。
+2. 删除该配置卷条目和 `CVD_CONFIG` 变量。
+3. 执行下方升级命令（先 `pull`，再 `up -d --no-deps --no-build cvd`）；
+   仅执行 `up` 可能仍在运行旧镜像。
+4. 之后如愿意再删除旧文件。
 
 ## 升级
 
@@ -23,7 +39,7 @@ docker compose logs --tail=50 cvd
 
 ### 一次性：把原来的源码构建部署切换到镜像
 
-先备份 `.env`、`artifacts/cvd.toml` 和数据。在你**原有的**目录中用 `git pull` 更新
+先备份 `.env` 和数据。在你**原有的**目录中用 `git pull` 更新
 代码检出（新的 `compose.yaml` 把 `cvd` 服务的 `build:`/`pull_policy: never` 换成
 GHCR 镜像；目录、项目名、服务名、卷、未跟踪的 `.env`/配置以及 `-f`/`COMPOSE_FILE`
 选项都不变），然后执行上面的升级命令：
@@ -47,11 +63,10 @@ docker compose config --quiet
 仅用于全新安装，不要在已有部署上运行。下面只一次性下载部署文件（无需源码）：
 
 ```bash
-mkdir cvd-core && cd cvd-core && mkdir -p artifacts &&
+mkdir cvd-core && cd cvd-core &&
 base=https://raw.githubusercontent.com/k0Iry/cvd-core/master &&
 curl -fsSLo compose.yaml "$base/compose.yaml" &&
 curl -fsSLo .env "$base/.env.example" &&
-curl -fsSLo artifacts/cvd.toml "$base/config/cvd.public.toml" &&
 chmod 600 .env
 ```
 

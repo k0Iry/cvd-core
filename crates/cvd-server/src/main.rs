@@ -1298,12 +1298,7 @@ async fn startup_data_pipeline(state: Arc<AppState>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Postgres URL from env
-    // Example:
-    let config = config::Config::from_env()?;
-    for warning in config.legacy_warnings() {
-        eprintln!("WARNING: {warning}");
-    }
+    let settings = config::Settings::from_env()?;
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let db = PgPoolOptions::new().max_connections(DB_CONNECTIONS).connect(&database_url).await?;
@@ -1328,7 +1323,7 @@ async fn main() -> Result<()> {
         outbox,
         http: market_http_client()?,
         ready: AtomicBool::new(false),
-        static_dir: config.server.static_dir.clone(),
+        static_dir: settings.static_dir.clone(),
     };
     let state = Arc::new(state);
 
@@ -1340,7 +1335,7 @@ async fn main() -> Result<()> {
     // axum app
     let app = app_router(state);
 
-    let addr: SocketAddr = config.server.http_addr.parse()?;
+    let addr: SocketAddr = settings.http_addr;
     println!("Open UI: http://{addr}/");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 

@@ -5,8 +5,8 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-9"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-9"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-10"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-10"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -696,7 +696,7 @@ function pluginEnabled(plugin) {
 // Any fault clears and labels the outputs; nothing stale stays drawn.
 function pluginFault(plugin) {
     const fault = localCompute?.fault(plugin.id)
-    return fault ? { state: "fault", code: fault.code } : (localErrors.get(plugin.id) ?? null)
+    return fault ? { state: "fault", code: fault.code } : null
 }
 
 function faultText(fault) {
@@ -757,7 +757,6 @@ let localHost = null
 let localCoord = null
 let localCompute = null
 const localRecords = new Map()     // id -> persisted record
-const localErrors = new Map()      // id -> { state, code } non-compute errors (storage/load)
 let importNotice = { kind: "", text: "", seq: 0, op: null }
 // Registry operations (import / uninstall / params) are serialized: each runs
 // to completion (storage included) before the next starts, so a late removal
@@ -870,7 +869,6 @@ function dropLocalValues(id) {
 function onLocalResult(id, mode, view, want, meta = {}) {
     if (meta.coverage) localCoverage.set(id, { coverage: meta.coverage, needBefore: meta.needBefore ?? 0 })
     applyLocalView(view)
-    localErrors.delete(id)
     if (view.shape || view.drop?.length) {
         forEachRenderer(renderer => { if (renderer.output.pluginId === id) renderer.dirty = true })
         refreshPluginOutputs(new Set([id]), true)
@@ -1020,7 +1018,6 @@ async function importLocalFileNow(file) {
         // package becomes visible; old results can never paint.
         dropLocalValues(record.id)
         localCompute?.clearFault(record.id)
-        localErrors.delete(record.id)
         localRecords.set(record.id, record)
         registryFromRecords()
         syncLocalCompute()
@@ -1406,10 +1403,6 @@ function currentChartRange() {
     // backboneSeries spans every cached timestamp (the stable timeline
     // backbone), so chart logical indices are cache indices directly.
     return pendingChartRange ?? chart.timeScale().getVisibleLogicalRange()
-}
-
-function chartRangeForCache(range) {
-    return range
 }
 
 // Timestamp-only snapshot of the backbone membership; resynced only when any
@@ -1880,10 +1873,8 @@ function absorbHistoryValidity(data) {
         if (m.valid) { const was = invalidPoison.has(t); if (acceptValid(t, m.rev, epoch) && was) changed = true }
         else if (acceptInvalid(t, m.rev, epoch)) { drop.push(t); changed = true }
     }
-    const pageInvalid = new Set()
     for (const t of data.invalid_times ?? []) {
         if (!Number.isInteger(t)) continue
-        pageInvalid.add(t)
         if (marks.has(t)) continue
         if (acceptInvalid(t, 0, epoch)) { drop.push(t); changed = true }
     }
@@ -2008,7 +1999,7 @@ function setMergedBars(bars, keepRange = null) {
     applyTailBars(tail, keepRange)
     if (keepRange && !visualWorkSuspended() && !chartNeedsRender) {
         programmaticRangeChange = true
-        chart.timeScale().setVisibleLogicalRange(chartRangeForCache(keepRange))
+        chart.timeScale().setVisibleLogicalRange(keepRange)
         releaseProgrammaticRangeChange()
     }
 }

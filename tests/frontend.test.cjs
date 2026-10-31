@@ -129,7 +129,7 @@ function harness() {
         URL, AbortController, DOMException, console, Map, Date,
         document: { hidden: false }, chartNeedsRender: false, fullWrites: 0, readoutWrites: 0, timeReads: 0,
         pendingChartRange: null, initialViewportPending: false, cancelVisualWork: noop,
-        renderedWindow: { start: 0, bars: [] }, chartRangeForCache: range => range, refreshRenderWindow: noop,
+        renderedWindow: { start: 0, bars: [] }, refreshRenderWindow: noop,
         currentChartRange: () => null,
         visualWorkSuspended: () => false,
         location: { origin: 'http://localhost', protocol: 'http:', host: 'localhost' },

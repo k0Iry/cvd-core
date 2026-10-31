@@ -26,17 +26,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://cvdadmin:${POSTGRES_PASSWORD}@postgres:5432/cvd
-      CVD_CONFIG: /app/config.toml
       CVD_OUTBOX_PATH: /app/data/outbox.sqlite
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - type: bind
-        source: ./artifacts/cvd.toml
-        target: /app/config.toml
-        read_only: true
-        bind:
-          create_host_path: false
       - outbox-data:/app/data
 
 volumes:

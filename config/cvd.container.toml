@@ -1,6 +1,0 @@
-# Non-root container defaults. Mount an operator-owned replacement read-only.
-# Indicators run in the visitor's browser (local .wasm import); there is no
-# server-side indicator configuration.
-[server]
-http_addr = "0.0.0.0:8080"
-static_dir = "/app/static"

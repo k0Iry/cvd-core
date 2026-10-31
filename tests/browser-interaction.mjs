@@ -185,7 +185,7 @@ globalThis.__cvd = {
     timeRange: () => chart.timeScale().getVisibleRange(),
     seriesCount: () => __series.size,
     loadMoreBefore: () => loadMoreBefore(),
-    setRange: r => chart.timeScale().setVisibleLogicalRange(chartRangeForCache(r)),
+    setRange: r => chart.timeScale().setVisibleLogicalRange(r),
     snapshot: () => ({ calls: { ...__calls }, setBarsMs: __setBarsMs.slice(), longTasks: __longTasks.slice(), input: { ...__input } }),
     reset() { for (const k of Object.keys(__calls)) delete __calls[k]; __setBarsMs.length = 0; __longTasks.length = 0; for (const k of Object.keys(__input)) __input[k] = 0 },
     startRecording() { __rec = { intervals: [], samples: [], coverageMisses: 0, last: null }; requestAnimationFrame(__frame) },

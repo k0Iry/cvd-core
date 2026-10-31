@@ -1,8 +1,0 @@
-# Example operator configuration. Point CVD_CONFIG at a copy of this file.
-# Without CVD_CONFIG the host runs with defaults.
-# Indicators are imported locally in the browser as .wasm (docs/plugin-wasm-v1.md);
-# a legacy [indicators] section is accepted, ignored and reported at startup.
-
-[server]
-http_addr = "0.0.0.0:80"
-static_dir = "static"

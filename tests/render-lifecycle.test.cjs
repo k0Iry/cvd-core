@@ -51,7 +51,7 @@ test('long-history prepend preserves the viewport moved during the request witho
     h.flushFrames()
     h.run('let historyResponse; fetch = () => new Promise(resolve => { historyResponse = resolve })')
     const loading = h.run('loadMoreBefore()')
-    h.run('chart.timeScale().setVisibleLogicalRange(chartRangeForCache({from:7100,to:7120}))')
+    h.run('chart.timeScale().setVisibleLogicalRange({from:7100,to:7120})')
     const priceData = h.series[0].data
     h.writes.length = 0
     h.run(`historyResponse({ok:true,json:async()=>({bars:${JSON.stringify(Array.from({ length: 400 }, (_, index) => bar((index + 9600) * 60)))},has_more_before:true,has_more_after:false,realtime_enabled:true})})`)
@@ -96,7 +96,7 @@ test('live windows grow within the buffer and compact in batches while retaining
     h.flushFrames()
     assert.equal(h.series[0].data.length, 3300)
     assert.equal(h.writes.filter(value => value === 'setData').length, 0, 'base series keep incremental updates while LEVELS work remains throttled')
-    h.run('chart.timeScale().setVisibleLogicalRange(chartRangeForCache({from:3270,to:3299}))')
+    h.run('chart.timeScale().setVisibleLogicalRange({from:3270,to:3299})')
     h.run(`applyTailBars(${JSON.stringify(Array.from({ length: 500 }, (_, index) => bar((index + 3301) * 60)))})`)
     h.flushFrames()
     assert.equal(h.series[0].data.length, 3200)
