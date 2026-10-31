@@ -119,9 +119,11 @@ jobs:
             -v "$RUNNER_TEMP/legacy.toml:/app/config.toml:ro" \
             -e DATABASE_URL=postgres://cvdadmin:smoke@pg:5432/cvd cvd-core:ci
           for i in $(seq 60); do curl -fsS http://127.0.0.1:18080/meta >/dev/null && break; sleep 1; done
-          docker logs cvd 2>&1 | grep -q "config \[indicators\] is retired and IGNORED"
-          docker logs cvd 2>&1 | grep -q "ignored retired indicator library id=cvd"
-          curl -fsS http://127.0.0.1:18080/ | grep -qi "<html"
+          docker logs cvd > "$RUNNER_TEMP/cvd-smoke.log" 2>&1
+          grep -q "config \[indicators\] is retired and IGNORED" "$RUNNER_TEMP/cvd-smoke.log"
+          grep -q "ignored retired indicator library id=cvd" "$RUNNER_TEMP/cvd-smoke.log"
+          curl -fsS -o "$RUNNER_TEMP/cvd-root.html" http://127.0.0.1:18080/
+          grep -qi "<html" "$RUNNER_TEMP/cvd-root.html"
           curl -fsS http://127.0.0.1:18080/meta | python3 -c 'import json,sys; m=json.load(sys.stdin); assert "indicators" not in m and m["instruments"]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/indicators)" = 404
           curl -fsS 'http://127.0.0.1:18080/history?exchange=binance&market=spot&symbol=BTC&tf=1m&series=spot-v1&limit=5' | python3 -c 'import json,sys; h=json.load(sys.stdin); assert "indicators" not in h and isinstance(h["invalid_times"], list)'
