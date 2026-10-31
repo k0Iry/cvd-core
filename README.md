@@ -8,6 +8,11 @@ indicators that run in your browser.
 - **Indicators** (CVD, Flow, or your own) are `.wasm` files you import in the
   browser. No server-side indicator plugin setup is needed.
 
+![BTC 30-minute chart in cvd-core with CVD and Flow indicator panes](docs/images/overview.jpg)
+
+*BTC 30m with the public CVD and Flow indicators. The extra price overlay is a
+separately imported custom indicator and is not part of the public CVD/Flow release.*
+
 ## What you need
 
 A Linux **amd64 or arm64** server with **Docker** (Compose v2). The server pulls a
