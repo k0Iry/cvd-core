@@ -18,10 +18,8 @@ services:
     shm_size: "1gb"
 
   cvd:
-    image: cvd-core:local
-    pull_policy: never
-    build:
-      context: .
+    # Prebuilt linux/amd64 image from CI. Pin with CVD_IMAGE=...:sha-<commit> if wanted.
+    image: ${CVD_IMAGE:-ghcr.io/k0iry/cvd-core:latest}
     restart: unless-stopped
     depends_on:
       postgres:

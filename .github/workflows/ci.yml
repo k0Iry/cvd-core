@@ -6,12 +6,24 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# Master pushes are serialized in one group. Queue order is NOT a commit-order
+# guarantee; the publish step re-checks the upstream master head before :latest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && 'master-publish' || github.run_id }}
+  cancel-in-progress: false
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # packages:write is used only by the guarded publish step below; fork PRs
+    # always receive a read-only token.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -45,7 +57,10 @@ jobs:
           CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" TMPDIR="$RUNNER_TEMP" \
             bash scripts/core-app-gate.sh "$RUNNER_TEMP/core-app" 1
       - name: Public-only container build
-        run: docker build --tag cvd-core:ci .
+        run: |
+          docker build --platform linux/amd64 --tag cvd-core:ci \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" .
       - name: Runnable image smoke (synthetic, no DB credentials, no plugins)
         shell: bash
         run: |
@@ -79,3 +94,39 @@ jobs:
           bash scripts/verify-served-assets.sh http://127.0.0.1:18080
           docker exec cvd test -s /app/data/outbox.sqlite
           docker rm -f cvd pg; docker network rm cvdsmoke
+      # Publishes the SAME image tested above (no rebuild), only on push to master.
+      - name: Publish tested image to GHCR (master push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'k0Iry/cvd-core'
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image=ghcr.io/k0iry/cvd-core
+          rev=$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' cvd-core:ci)
+          test "$rev" = "$GITHUB_SHA"
+          platform=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' cvd-core:ci)
+          test "$platform" = linux/amd64
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag cvd-core:ci "$image:sha-$GITHUB_SHA"
+          docker push "$image:sha-$GITHUB_SHA"
+          # Fail closed: a failed or malformed head lookup never grants :latest.
+          head=$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/master | cut -f1)
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "master head lookup invalid" >&2; exit 1; }
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            docker tag cvd-core:ci "$image:latest"
+            docker push "$image:latest"
+            latest="$image:latest (published)"
+          else
+            latest="NOT updated: superseded by master $head"
+          fi
+          docker logout ghcr.io
+          {
+            echo "### Published image"
+            echo "- commit: $GITHUB_SHA"
+            echo "- sha tag: $image:sha-$GITHUB_SHA"
+            echo "- latest: $latest"
+            echo "- image id: $(docker image inspect -f '{{.Id}}' cvd-core:ci)"
+            echo "- platform: $platform"
+            echo "- digest: $(docker image inspect -f '{{join .RepoDigests " "}}' cvd-core:ci)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

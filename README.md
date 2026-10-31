@@ -10,8 +10,9 @@ indicators that run in your browser.
 
 ## What you need
 
-A Linux server with **Git** and **Docker** (Compose v2). The Docker build
-compiles everything else; you don't need Rust, Node or a browser on the server.
+A Linux x86-64 (amd64) server with **Docker** (Compose v2). The server pulls a
+prebuilt image from `ghcr.io/k0iry/cvd-core`; no Git, Rust, Node or browser is
+needed there.
 
 ## Deploy or upgrade
 

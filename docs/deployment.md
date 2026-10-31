@@ -2,46 +2,62 @@
 
 [简体中文](deployment.zh-CN.md) · [README](../README.md)
 
-You need a Linux server with **Git** and **Docker Compose v2**. Only this
-repository (`cvd-core`) goes on the server; indicators are imported in the
-browser later.
+You need a Linux **x86-64 (amd64)** server with **Docker Compose v2**. The app
+runs from the prebuilt image `ghcr.io/k0iry/cvd-core` (published by CI from
+`master`: tags `latest` and `sha-<full commit>`). Nothing is compiled on the
+server; indicators are imported in the browser later.
 
-## Upgrade an existing installation
+Always keep your `.env`, `artifacts/cvd.toml` and Docker volumes (PostgreSQL
+data and the outbox in `/app/data`). Never use `docker compose down -v` — it
+deletes your data. If you normally run Compose with `-f` or `-p`, add the same
+options to every `docker compose` command below.
 
-Before you start, back up your configuration (`.env`, `artifacts/cvd.toml`) and
-data, and make sure PostgreSQL data and the outbox are persistent (the default
-outbox directory is `/app/data`; if you changed it, check your actual path).
-If you are unsure where your data lives, check that first — replacing the
-container must not lose it.
-
-Run this in your **existing** `cvd-core` directory:
+## Upgrade
 
 ```bash
 cd /path/to/your/cvd-core &&
-git pull --ff-only &&
-docker compose config --quiet &&
-docker compose build cvd &&
+docker compose pull cvd &&
 docker compose up -d --no-deps --no-build cvd &&
 docker compose logs --tail=50 cvd
 ```
 
-If you normally run Compose with `-f` or `-p` options, add the same options to
-every `docker compose` command above.
+### One time: switch an existing source-build install to the image
 
-Keep your existing `.env` and `artifacts/cvd.toml`; don't replace them with the
-example files. Never use `docker compose down -v` — it deletes your data.
+Back up `.env`, `artifacts/cvd.toml` and your data first. In your **existing**
+directory, update the checkout with `git pull` (the new `compose.yaml` replaces
+the `cvd` service's `build:`/`pull_policy: never` with the GHCR image; your
+directory, project name, service names, volumes, untracked `.env`/config and
+any `-f`/`COMPOSE_FILE` options stay the same), then run the upgrade commands above:
+
+```bash
+cd /path/to/your/cvd-core &&
+git pull --ff-only &&
+docker compose config --quiet
+```
+
+If you edited `compose.yaml` yourself, instead change only the `cvd` service:
+remove `build:` and `pull_policy: never`, and set
+`image: ${CVD_IMAGE:-ghcr.io/k0iry/cvd-core:latest}`.
+
+To pin a version, set `CVD_IMAGE=ghcr.io/k0iry/cvd-core:sha-<full commit>`
+in `.env`.
+
+Maintainer note: after the first publish, set the GHCR package `cvd-core` to
+**Public** once (and link it to this repository if not linked); afterwards
+clients pull anonymously.
 
 ## First install (new server)
 
-Only for a brand-new installation; don't run this over an existing one.
+Only for a brand-new installation; don't run this over an existing one. This
+downloads the deployment files once (no source checkout):
 
 ```bash
-git clone https://github.com/k0Iry/cvd-core.git &&
-cd cvd-core &&
-cp .env.example .env &&
-chmod 600 .env &&
-mkdir -p artifacts &&
-cp config/cvd.public.toml artifacts/cvd.toml
+mkdir cvd-core && cd cvd-core && mkdir -p artifacts &&
+base=https://raw.githubusercontent.com/k0Iry/cvd-core/master &&
+curl -fsSLo compose.yaml "$base/compose.yaml" &&
+curl -fsSLo .env "$base/.env.example" &&
+curl -fsSLo artifacts/cvd.toml "$base/config/cvd.public.toml" &&
+chmod 600 .env
 ```
 
 Now edit `.env` and set `POSTGRES_PASSWORD` to a long random value
@@ -49,10 +65,13 @@ Now edit `.env` and set `POSTGRES_PASSWORD` to a long random value
 
 ```bash
 docker compose config --quiet &&
-docker compose build cvd &&
+docker compose pull &&
 docker compose up -d --no-build &&
 docker compose logs --tail=50 cvd
 ```
+
+Developers: to run a locally built image, `docker build -t cvd-core:local .`
+and set `CVD_IMAGE=cvd-core:local`.
 
 ## Check it works
 
