@@ -12,14 +12,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && 'master-publish' || github.run_id }}
   cancel-in-progress: false
 jobs:
+  # Shared contracts run ONCE (amd64); images are built natively per arch below.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # packages:write is used only by the guarded publish step below; fork PRs
-    # always receive a read-only token.
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,12 +59,44 @@ jobs:
         run: |
           CVD_CHROMIUM="$(command -v chromium || command -v google-chrome)" TMPDIR="$RUNNER_TEMP" \
             bash scripts/core-app-gate.sh "$RUNNER_TEMP/core-app" 1
-      - name: Public-only container build
+  image:
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Native hosted runners only; no QEMU/binfmt, no platform relabeling.
+          - arch: amd64
+            runner: ubuntu-24.04
+            uname: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            uname: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # packages:write is used only by the guarded staging push; fork PRs always
+    # receive a read-only token.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Native public-only container build (${{ matrix.arch }})
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          UNAME: ${{ matrix.uname }}
         run: |
-          docker build --platform linux/amd64 --tag cvd-core:ci \
+          set -euo pipefail
+          test "$(uname -m)" = "$UNAME"
+          test "$(docker info -f '{{.Architecture}}')" = "$UNAME"
+          docker build --platform "linux/$ARCH" --tag cvd-core:ci \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" .
-      - name: Runnable image smoke (synthetic, no DB credentials, no plugins)
+          test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' cvd-core:ci)" = "linux/$ARCH"
+      - name: Runnable image smoke on native ${{ matrix.arch }} (synthetic, no DB credentials, no plugins)
         shell: bash
         run: |
           set -euo pipefail
@@ -99,28 +129,84 @@ jobs:
           bash scripts/verify-served-assets.sh http://127.0.0.1:18080
           docker exec cvd test -s /app/data/outbox.sqlite
           docker rm -f cvd pg; docker network rm cvdsmoke
-      # Publishes the SAME image tested above (no rebuild), only on push to master.
-      - name: Publish tested image to GHCR (master push only)
+      # Pushes the SAME tested image (no rebuild) to a per-arch staging tag and
+      # records its pushed digest; only the publish job creates sha-/latest.
+      - name: Stage tested image digest (master push only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'k0Iry/cvd-core'
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image=ghcr.io/k0iry/cvd-core
+          test "$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' cvd-core:ci)" = "$GITHUB_SHA"
+          test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' cvd-core:ci)" = "linux/$ARCH"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tag="$image:stage-$GITHUB_SHA-$ARCH"
+          docker tag cvd-core:ci "$tag"
+          docker push "$tag" | tee "$RUNNER_TEMP/push.log"
+          docker logout ghcr.io
+          digest=$(grep -oE 'digest: sha256:[0-9a-f]{64}' "$RUNNER_TEMP/push.log" | tail -n1 | cut -d' ' -f2 || true)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "pushed digest missing" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/digest"
+          printf '%s %s %s\n' "$ARCH" "$GITHUB_SHA" "$digest" > "$RUNNER_TEMP/digest/$ARCH"
+          echo "- $ARCH: native $(uname -m) build+smoke, $image@$digest" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload digest metadata (tiny text file only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'k0Iry/cvd-core'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+  # Metadata-only: assembles ONE multi-platform index from BOTH tested digests.
+  # Runs only when every matrix leg succeeded (default needs semantics).
+  publish:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'k0Iry/cvd-core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digest
+      - name: Publish multi-arch manifest to GHCR
         shell: bash
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           image=ghcr.io/k0iry/cvd-core
-          rev=$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' cvd-core:ci)
-          test "$rev" = "$GITHUB_SHA"
-          platform=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' cvd-core:ci)
-          test "$platform" = linux/amd64
+          refs=$(bash scripts/check-arch-digests.sh "$RUNNER_TEMP/digest" "$GITHUB_SHA" "$image")
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker tag cvd-core:ci "$image:sha-$GITHUB_SHA"
-          docker push "$image:sha-$GITHUB_SHA"
+          # Each tested child must really carry its platform + revision.
+          arch_list=(amd64 arm64); i=0
+          for ref in $refs; do
+            docker buildx imagetools inspect --raw "$ref" \
+              | python3 -c 'import json,sys; m=json.load(sys.stdin); assert "config" in m and "manifests" not in m, "child must be a single-platform manifest"'
+            docker buildx imagetools inspect "$ref" --format '{{json .Image}}' \
+              | python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["os"]=="linux" and c["architecture"]==sys.argv[2], c["architecture"]; assert c["config"]["Labels"]["org.opencontainers.image.revision"]==sys.argv[1]' "$GITHUB_SHA" "${arch_list[$i]}"
+            i=$((i+1))
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create --tag "$image:sha-$GITHUB_SHA" $refs
+          docker buildx imagetools inspect --raw "$image:sha-$GITHUB_SHA" \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); p=sorted(x["platform"]["os"]+"/"+x["platform"]["architecture"] for x in m["manifests"]); assert p==["linux/amd64","linux/arm64"], p'
+          index=$(docker buildx imagetools inspect "$image:sha-$GITHUB_SHA" --format '{{.Manifest.Digest}}')
           # Fail closed: a failed or malformed head lookup never grants :latest.
           head=$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/master | cut -f1)
           [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "master head lookup invalid" >&2; exit 1; }
           if [ "$head" = "$GITHUB_SHA" ]; then
-            docker tag cvd-core:ci "$image:latest"
-            docker push "$image:latest"
+            docker buildx imagetools create --tag "$image:latest" "$image@$index"
             latest="$image:latest (published)"
           else
             latest="NOT updated: superseded by master $head"
@@ -129,9 +215,8 @@ jobs:
           {
             echo "### Published image"
             echo "- commit: $GITHUB_SHA"
-            echo "- sha tag: $image:sha-$GITHUB_SHA"
+            echo "- sha tag: $image:sha-$GITHUB_SHA ($index)"
             echo "- latest: $latest"
-            echo "- image id: $(docker image inspect -f '{{.Id}}' cvd-core:ci)"
-            echo "- platform: $platform"
-            echo "- digest: $(docker image inspect -f '{{join .RepoDigests " "}}' cvd-core:ci)"
+            echo "- platforms: linux/amd64 + linux/arm64, each natively built and smoked"
+            for ref in $refs; do echo "- child: $ref"; done
           } | tee -a "$GITHUB_STEP_SUMMARY"

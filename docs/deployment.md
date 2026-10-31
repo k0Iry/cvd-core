@@ -2,9 +2,11 @@
 
 [简体中文](deployment.zh-CN.md) · [README](../README.md)
 
-You need a Linux **x86-64 (amd64)** server with **Docker Compose v2**. The app
+You need a Linux **amd64 or arm64** server with **Docker Compose v2**. The app
 runs from the prebuilt image `ghcr.io/k0iry/cvd-core` (published by CI from
-`master`: tags `latest` and `sha-<full commit>`). Nothing is compiled on the
+`master`: tags `latest` and `sha-<full commit>`). Each tag is one multi-arch
+image, natively built and tested for `linux/amd64` and `linux/arm64`; Docker
+picks the matching one automatically (no `platform:` setting or login needed). Nothing is compiled on the
 server; indicators are imported in the browser later.
 
 Always keep your `.env`, `artifacts/cvd.toml` and Docker volumes (PostgreSQL

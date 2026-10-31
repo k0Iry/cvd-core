@@ -10,8 +10,8 @@ indicators that run in your browser.
 
 ## What you need
 
-A Linux x86-64 (amd64) server with **Docker** (Compose v2). The server pulls a
-prebuilt image from `ghcr.io/k0iry/cvd-core`; no Git, Rust, Node or browser is
+A Linux **amd64 or arm64** server with **Docker** (Compose v2). The server pulls a
+prebuilt multi-arch image from `ghcr.io/k0iry/cvd-core`; no Git, Rust, Node or browser is
 needed there.
 
 ## Deploy or upgrade

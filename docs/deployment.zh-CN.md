@@ -2,9 +2,10 @@
 
 [English](deployment.md) · [README](../README.md)
 
-服务器需要 **x86-64（amd64）Linux** 和 **Docker Compose v2**。应用直接运行预构建镜像
+服务器需要 **amd64 或 arm64 Linux** 和 **Docker Compose v2**。应用直接运行预构建镜像
 `ghcr.io/k0iry/cvd-core`（由 CI 从 `master` 发布，标签为 `latest` 和
-`sha-<完整提交>`）。服务器上不编译任何东西；指标之后在浏览器里导入。
+`sha-<完整提交>`）。每个标签都是同一个多架构镜像，`linux/amd64` 与 `linux/arm64`
+均为原生构建并测试；Docker 会自动选择匹配架构（无需 `platform:` 设置或登录）。服务器上不编译任何东西；指标之后在浏览器里导入。
 
 始终保留 `.env`、`artifacts/cvd.toml` 和 Docker 卷（PostgreSQL 数据与
 `/app/data` 中的 outbox）。切勿使用 `docker compose down -v`——它会删除数据。
