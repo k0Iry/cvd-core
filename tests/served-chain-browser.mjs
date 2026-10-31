@@ -57,7 +57,7 @@ function verifyManifest(m, files) {
 }
 
 let exit = 1, chrome, profile, oracle, ws, info, seq = 0
-let id = 0; const pending = new Map(); const exceptions = []; const external = []
+let id = 0; const pending = new Map(); const exceptions = []; const external = []; const seen = []
 async function mailbox(cmd) {
   const n = seq++
   fs.writeFileSync(path.join(DIR, `cmd.${n}.tmp`), JSON.stringify(cmd)); fs.renameSync(path.join(DIR, `cmd.${n}.tmp`), path.join(DIR, `cmd.${n}`))
@@ -141,12 +141,21 @@ try {
   await bounded(new Promise(r => ws.addEventListener('open', r, { once: true })), 10000, 'cdp open')
   ws.addEventListener('message', ev => { const m = JSON.parse(ev.data); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id) }
     if (m.method === 'Runtime.exceptionThrown') exceptions.push(JSON.stringify(m.params.exceptionDetails).slice(0, 300))
-    if (m.method === 'Network.requestWillBeSent') { const u = new URL(m.params.request.url); if (/^(https?|wss?):$/.test(u.protocol) && u.host !== `127.0.0.1:${info.port}`) external.push({ url: u.href, method: m.params.request.method, type: m.params.type }) } })
+    if (m.method === 'Network.requestWillBeSent') { const u = new URL(m.params.request.url); if (/^(https?|wss?):$/.test(u.protocol)) seen.push(u.href); if (/^(https?|wss?):$/.test(u.protocol) && u.host !== `127.0.0.1:${info.port}`) external.push({ url: u.href, method: m.params.request.method, type: m.params.type }) }
+    if (m.method === 'Network.webSocketCreated') seen.push(m.params.url) })
   await call('Runtime.enable'); await call('Network.enable'); await call('DOM.enable'); await call('Page.enable')
   await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
   const open = async () => { await call('Page.navigate', { url: `${BASE}/?exchange=binance&market=spot&symbol=BTC&tf=1m` }); await waitFor(`!!window.__cvdLocal && !!window.__cvdLocal.host() && !!window.__cvdSrv`, 30000) }
   await open()
   const L = 'window.__cvdLocal'
+  // Live access is public: a legacy stored access key is neither restored,
+  // re-saved nor transmitted; other preferences survive.
+  const LEGACY = 'dummy-legacy-key'
+  await evaluate(`localStorage.setItem('cvd_prefs_v1', JSON.stringify({exchange:'binance',market:'spot',symbol:'BTC',tf:'1m',accessKey:${JSON.stringify(LEGACY)},showAgg:false})); true`)
+  seen.length = 0
+  await open()
+  check('no_access_key_control', await evaluate(`!document.getElementById('access-key') && !document.querySelector('input[type=password]')`))
+  check('legacy_key_not_resaved', await evaluate(`(() => { const p = JSON.parse(localStorage.getItem('cvd_prefs_v1') || '{}'); return !Object.hasOwn(p, 'accessKey') && p.tf === '1m' && p.showAgg === false })()`))
   const values = (k, mode) => evaluate(`Object.fromEntries([...(${L}.values().get(${JSON.stringify(k + '|' + mode)}) ?? new Map())])`)
   const idle = `${L}.compute() && ${L}.compute().idle()`
   async function importFile(file) {
@@ -245,6 +254,9 @@ try {
   r = await compare('peer_failure_isolated', 'source', '1m', { expectTime: liveBar.time })
   check('peer_failure_live_value_changed', !Object.is(r.got[liveBar.time], prevLive), `${prevLive} -> ${r.got[liveBar.time]}`)
   check('no_page_exceptions', exceptions.length === 0, exceptions.join('\n'))
+  const keyed = seen.filter(u => { try { return new URL(u).searchParams.has('key') || u.includes(LEGACY) } catch { return true } })
+  check('no_legacy_key_transmitted', keyed.length === 0 && seen.some(u => u.includes('/history?')) && seen.some(u => /^wss?:.*\/ws\?/.test(u)), JSON.stringify(keyed))
+  check('fresh_local_wasm_9_urls', seen.some(u => u.includes('v=local-wasm-9')) && !seen.some(u => u.includes('local-wasm-8')))
   // Narrow allowlist: only the existing product Google Fonts stylesheet/font GETs.
   const allowed = e => e.method === 'GET' && ((e.url.startsWith('https://fonts.googleapis.com/css2?') && e.type === 'Stylesheet') || (e.url.startsWith('https://fonts.gstatic.com/') && e.type === 'Font'))
   const ext = external.filter(e => !allowed(e))

@@ -13,6 +13,8 @@ mod retirement_tests;
 mod types;
 #[cfg(test)]
 mod usdc_tests;
+#[cfg(test)]
+mod live_access_tests;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
@@ -135,7 +137,6 @@ const HISTORY_CAPACITY: usize = 1600;
 const H1_HISTORY_CAPACITY: usize = 1400;
 const BROADCAST_CHANNEL_CAPACITY: usize = 256;
 const DB_CONNECTIONS: u32 = 4;
-const DELAY_SECONDS: i64 = 60 * 60;
 // ==============================
 // State / Shard
 // ==============================
@@ -281,19 +282,11 @@ pub struct AppState {
     pub outbox: Arc<persistence::Outbox>,
     pub http: reqwest::Client,
     pub ready: AtomicBool,
-    pub access_key: Option<String>,
     pub static_dir: std::path::PathBuf,
 }
 
 fn pick_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> &Shard {
     state.shards.get(&(exchange, market, symbol)).expect("shard missing")
-}
-
-fn has_realtime_access(state: &AppState, key: Option<&str>) -> bool {
-    match state.access_key.as_deref() {
-        None => true,
-        Some(expected) => key.is_some_and(|candidate| candidate == expected),
-    }
 }
 
 // Helper: Get valid (market, symbol) pairs for a given exchange
@@ -325,7 +318,6 @@ struct Params {
     series: Option<String>,
     symbol: Option<String>,
     tf: Option<String>,
-    key: Option<String>,
     limit: Option<usize>,
     before: Option<i64>,
     after: Option<i64>,
@@ -872,8 +864,6 @@ async fn load_history_page(
     limit: usize,
     before: Option<i64>,
     after: Option<i64>,
-    max_time: Option<i64>,
-    realtime_enabled: bool,
 ) -> Result<models::HistoryPayload> {
     let limit = limit.clamp(1, HISTORY_CAPACITY);
     // Server no longer computes indicators: no hidden warm-up rows. Browser
@@ -886,173 +876,86 @@ async fn load_history_page(
     }
 
     let (rows, has_more_before, has_more_after): (Vec<models::BarRow>, bool, bool) = if let Some(before_ts) = before {
-        let rows: Vec<models::BarRow> = if let Some(max_time) = max_time {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time < $5 AND time <= $6
-            ORDER BY time DESC
-            LIMIT $7
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(before_ts)
-            .bind(max_time)
-            .bind((limit + render_context + 1) as i64)
-            .fetch_all(db)
-            .await?
-        } else {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time < $5
-            ORDER BY time DESC
-            LIMIT $6
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(before_ts)
-            .bind((limit + render_context + 1) as i64)
-            .fetch_all(db)
-            .await?
-        };
+        let rows: Vec<models::BarRow> = sqlx::query_as(
+            r#"
+        SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
+        FROM bars
+        WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
+          AND time < $5
+        ORDER BY time DESC
+        LIMIT $6
+        "#,
+        )
+        .bind(exchange)
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind(before_ts)
+        .bind((limit + render_context + 1) as i64)
+        .fetch_all(db)
+        .await?;
         let has_more_before = rows.len() > limit;
-        (rows, has_more_before, after.is_some() || max_time.is_some())
+        (rows, has_more_before, false)
     } else if let Some(after_ts) = after {
-        let mut context_rows: Vec<models::BarRow> = if let Some(max_time) = max_time {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time <= $5 AND time <= $6
-            ORDER BY time DESC
-            LIMIT $7
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(after_ts)
-            .bind(max_time)
-            .bind(render_context as i64)
-            .fetch_all(db)
-            .await?
-        } else {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time <= $5
-            ORDER BY time DESC
-            LIMIT $6
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(after_ts)
-            .bind(render_context as i64)
-            .fetch_all(db)
-            .await?
-        };
+        let mut context_rows: Vec<models::BarRow> = sqlx::query_as(
+            r#"
+        SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
+        FROM bars
+        WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
+          AND time <= $5
+        ORDER BY time DESC
+        LIMIT $6
+        "#,
+        )
+        .bind(exchange)
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind(after_ts)
+        .bind(render_context as i64)
+        .fetch_all(db)
+        .await?;
         context_rows.reverse();
-        let mut newer_rows: Vec<models::BarRow> = if let Some(max_time) = max_time {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time > $5 AND time <= $6
-            ORDER BY time ASC
-            LIMIT $7
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(after_ts)
-            .bind(max_time)
-            .bind((limit + 1) as i64)
-            .fetch_all(db)
-            .await?
-        } else {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time > $5
-            ORDER BY time ASC
-            LIMIT $6
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(after_ts)
-            .bind((limit + 1) as i64)
-            .fetch_all(db)
-            .await?
-        };
+        let mut newer_rows: Vec<models::BarRow> = sqlx::query_as(
+            r#"
+        SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
+        FROM bars
+        WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
+          AND time > $5
+        ORDER BY time ASC
+        LIMIT $6
+        "#,
+        )
+        .bind(exchange)
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind(after_ts)
+        .bind((limit + 1) as i64)
+        .fetch_all(db)
+        .await?;
         let has_more_after = newer_rows.len() > limit;
         if has_more_after {
             newer_rows.pop();
         }
         (context_rows.into_iter().chain(newer_rows).collect(), true, has_more_after)
     } else {
-        let rows: Vec<models::BarRow> = if let Some(max_time) = max_time {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-              AND time <= $5
-            ORDER BY time DESC
-            LIMIT $6
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind(max_time)
-            .bind((limit + render_context + 1) as i64)
-            .fetch_all(db)
-            .await?
-        } else {
-            sqlx::query_as(
-                r#"
-            SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
-            FROM bars
-            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
-            ORDER BY time DESC
-            LIMIT $5
-            "#,
-            )
-            .bind(exchange)
-            .bind(symbol)
-            .bind(market)
-            .bind(tf)
-            .bind((limit + render_context + 1) as i64)
-            .fetch_all(db)
-            .await?
-        };
+        let rows: Vec<models::BarRow> = sqlx::query_as(
+            r#"
+        SELECT time, price_open, price_high, price_low, price_close, delta_usdt, cvd_usdt, buy_volume_base, sell_volume_base, buy_volume_usdt, sell_volume_usdt, trades
+        FROM bars
+        WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
+        ORDER BY time DESC
+        LIMIT $5
+        "#,
+        )
+        .bind(exchange)
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind((limit + render_context + 1) as i64)
+        .fetch_all(db)
+        .await?;
         let has_more_before = rows.len() > limit;
         (rows, has_more_before, false)
     };
@@ -1087,7 +990,9 @@ async fn load_history_page(
         has_more_after,
         oldest_time,
         newest_time,
-        realtime_enabled,
+        // Old open clients read this as `realtime_enabled = !!data.realtime_enabled`;
+        // keep it constant-true so they never fall into the retired delay mode.
+        realtime_enabled: true,
         invalid_times,
         coverage_from,
         coverage_to,
@@ -1141,10 +1046,9 @@ pub fn overlay_live_validity(
     marks: &std::collections::BTreeMap<i64, (u64, bool)>,
     hist: &VecDeque<Bar>,
     live: Option<&Bar>,
-    max_time: Option<i64>,
 ) {
     let lo = payload.coverage_from.unwrap_or(i64::MIN);
-    let hi = payload.coverage_to.unwrap_or(i64::MAX).min(max_time.unwrap_or(i64::MAX));
+    let hi = payload.coverage_to.unwrap_or(i64::MAX);
     if lo > hi {
         return;
     }
@@ -1403,7 +1307,6 @@ async fn main() -> Result<()> {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let db = PgPoolOptions::new().max_connections(DB_CONNECTIONS).connect(&database_url).await?;
-    let access_key = std::env::var("LIVE_ACCESS_KEY").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     init_db(&db).await?;
     let outbox_path = std::env::var("CVD_OUTBOX_PATH").unwrap_or_else(|_| "data/outbox.sqlite".into());
@@ -1425,7 +1328,6 @@ async fn main() -> Result<()> {
         outbox,
         http: market_http_client()?,
         ready: AtomicBool::new(false),
-        access_key,
         static_dir: config.server.static_dir.clone(),
     };
     let state = Arc::new(state);
@@ -1539,21 +1441,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
     let limit = p.limit.unwrap_or(800).min(limit_cap);
     let before = p.before;
     let after = p.after;
-    let realtime_enabled = has_realtime_access(&state, p.key.as_deref());
-    let max_time = if realtime_enabled { None } else { Some(Utc::now().timestamp() - DELAY_SECONDS) };
-    match load_history_page(
-        &state.db,
-        exchange,
-        symbol,
-        market,
-        tf,
-        limit,
-        before,
-        after,
-        max_time,
-        realtime_enabled,
-    )
-    .await
+    match load_history_page(&state.db, exchange, symbol, market, tf, limit, before, after).await
     {
         Ok(mut payload) => {
             let sh = pick_shard(&state, exchange_enum, market_enum, symbol_enum);
@@ -1563,7 +1451,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
                 let live = sh.live_bar_for_tf(tf_enum).read().await.clone();
                 (marks, sh.for_tf(tf_enum).0.read().await.clone(), live)
             };
-            overlay_live_validity(&mut payload, &marks, &hist, live.as_ref(), max_time);
+            overlay_live_validity(&mut payload, &marks, &hist, live.as_ref());
             Json(payload).into_response()
         }
         Err(e) => {
@@ -1616,10 +1504,6 @@ async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     Query(p): Query<Params>,
 ) -> impl IntoResponse {
-    if !has_realtime_access(&state, p.key.as_deref()) {
-        return axum::http::StatusCode::FORBIDDEN.into_response();
-    }
-
     let (exchange, market, symbol, tf) = match selection_response(&p) {
         Ok(selection) => selection,
         Err(error) => return error.into_response(),
@@ -2126,7 +2010,6 @@ mod tests {
             http: market_http_client().unwrap(),
             ready: AtomicBool::new(false),
             db: PgPoolOptions::new().connect_lazy("postgres://localhost/cvd_test").unwrap(),
-            access_key: None,
             static_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../static"),
         }
     }

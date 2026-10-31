@@ -152,7 +152,7 @@ function harness(checked = {}, options = {}) {
         focus() { document.activeElement = this },
         getBoundingClientRect: () => ({ width: 900, height: 600 }), addEventListener: (event, callback) => events.set('element:' + event, callback) })
     const elements = Object.fromEntries([
-        'exchangeSel', 'symbolSel', 'marketSel', 'tfSel', 'accessKeyInput',
+        'exchangeSel', 'symbolSel', 'marketSel', 'tfSel',
         'aggToggle', 'pluginControlsEl', 'pluginMenuEl', 'pluginStateEl',
         'screenshotBtn', 'statusEl', 'qualityStateEl', 'sourceSeriesEl', 'chartEl', 'paneLabels',
     ].map(key => [key, element()]))

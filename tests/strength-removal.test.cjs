@@ -48,7 +48,7 @@ test('frontend source has no retired indicator renderers, keys or readiness help
 
 test('changed frontend modules share one coherent import version', () => {
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...app.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-8'])
+    assert.deepEqual([...versions], ['local-wasm-9'])
 })
 
 function section(start, end) {
@@ -70,7 +70,7 @@ test('stored legacy Strength preferences are pruned without resetting useful set
         console: { warn() {} },
         exchangeSel: select(['binance', 'coinbase']), marketSel: select(['spot', 'usdm', 'usdc']),
         symbolSel: select(['BTC', 'ETH']), tfSel: select(['1m', '5m', '15m', '30m', '1h']),
-        sourceSeriesEl: { textContent: '', title: '' }, accessKeyInput: { value: '' },
+        sourceSeriesEl: { textContent: '', title: '' },
         aggToggle: { checked: false }, pluginPrefs: { enabled: {}, modes: {} },
         localStorage: { setItem: (k, v) => { saved[k] = v } },
     })
@@ -82,6 +82,6 @@ test('stored legacy Strength preferences are pruned without resetting useful set
         showFd: false, showHd: true, showLevels: false, showAgg: true, flowMode: 'buy-sell' }
     run(`updateOptionsForExchange(); applyPrefs(${JSON.stringify(legacy)}); prefsHydrated = true; savePrefs()`)
     const stored = JSON.parse(saved.cvd_prefs_v1)
-    assert.deepEqual(stored, { exchange: 'coinbase', symbol: 'ETH', market: 'usdc', tf: '5m', accessKey: 'k',
+    assert.deepEqual(stored, { exchange: 'coinbase', symbol: 'ETH', market: 'usdc', tf: '5m',
         showAgg: true, plugins: { enabled: { levels: false }, modes: { 'flow:flow': 'flow/buy_sell' } } })
 })

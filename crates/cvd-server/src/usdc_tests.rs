@@ -189,8 +189,6 @@ async fn postgres_usdc_rows_have_independent_seeds_history_and_outbox_delivery()
             1,
             None,
             None,
-            None,
-            true,
         )
         .await
         .unwrap();
@@ -220,8 +218,6 @@ async fn postgres_usdc_rows_have_independent_seeds_history_and_outbox_delivery()
         10,
         None,
         None,
-        None,
-        true,
     )
     .await
     .unwrap();

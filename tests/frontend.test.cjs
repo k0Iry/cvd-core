@@ -20,7 +20,7 @@ function prefsHarness(metaPayload, failMeta = false) {
         fetch: async () => { if (failMeta) throw new Error('offline'); return { ok: true, json: async () => metaPayload } },
         exchangeSel: select(['binance','coinbase','bybit']),
         marketSel: select(['spot','usdm']), symbolSel: select(['BTC','ETH']), tfSel: select(['1m','5m','15m','30m','1h']),
-        sourceSeriesEl: {textContent: '', title: ''}, accessKeyInput: {value: ''}, aggToggle: {},
+        sourceSeriesEl: {textContent: '', title: ''}, aggToggle: {},
         pluginPrefs: { enabled: {}, modes: {} },
         localStorage: {setItem: (k,v) => saved[k] = v},
     });
@@ -45,7 +45,7 @@ test('explicit exchange changes preserve derivative intent without reinterpretin
 test('retired exchange cannot reappear from stale metadata or fallback configuration', async () => {
     const payload = {exchanges: ['bybit','binance','coinbase'].map(exchange => ({exchange, markets:['spot','usdm'], symbols:['BTC','ETH']}))};
     for (const failMeta of [false,true]) {
-        const {run} = prefsHarness(payload,failMeta);
+        const {run, saved} = prefsHarness(payload,failMeta);
         await run('loadMeta()');
         assert.equal(run('Object.keys(exchangeMeta).includes("bybit")'),false);
         run('applyPrefs({exchange:"bybit",market:"usdm",symbol:"ETH",tf:"1h",accessKey:"test-key",showAgg:true})');
@@ -53,9 +53,10 @@ test('retired exchange cannot reappear from stale metadata or fallback configura
         assert.equal(run('marketSel.value'),'usdm');
         assert.equal(run('symbolSel.value'),'ETH');
         assert.equal(run('tfSel.value'),'1h');
-        assert.equal(run('accessKeyInput.value'),'test-key');
+        assert.equal(run('typeof accessKeyInput'),'undefined','no access-key control exists');
         assert.equal(run('aggToggle.checked'),true);
         run('prefsHydrated=true; savePrefs()');
+        assert.equal(Object.hasOwn(JSON.parse(saved.cvd_prefs_v1),'accessKey'),false,'legacy key is not re-saved');
     }
 });
 
@@ -98,7 +99,7 @@ test('one-time legacy migration keeps old Buy-Sell mode and LEVELS visibility, t
     run('applyPrefs({exchange:"binance",market:"spot",symbol:"ETH",tf:"15m",accessKey:"k",showLevels:false,showAgg:true,flowMode:"buy-sell"}); prefsHydrated=true; savePrefs()');
     const prefs = JSON.parse(saved.cvd_prefs_v1);
     assert.deepEqual(prefs.plugins, {enabled:{levels:false}, modes:{'flow:flow':'flow/buy_sell'}});
-    assert.equal(prefs.tf, '15m'); assert.equal(prefs.symbol, 'ETH'); assert.equal(prefs.showAgg, true); assert.equal(prefs.accessKey, 'k');
+    assert.equal(prefs.tf, '15m'); assert.equal(prefs.symbol, 'ETH');    assert.equal(prefs.showAgg, true); assert.equal(Object.hasOwn(prefs, 'accessKey'), false, 'legacy access key dropped');
     assert.equal(Object.hasOwn(prefs, 'flowMode') || Object.hasOwn(prefs, 'showLevels'), false);
     run('applyPrefs(' + JSON.stringify({...prefs, plugins:{enabled:{levels:true},modes:{}}}) + '); savePrefs()');
     assert.deepEqual(JSON.parse(saved.cvd_prefs_v1).plugins, {enabled:{levels:true}, modes:{}}, 'later user choices are not overwritten');
@@ -137,7 +138,7 @@ function harness() {
         setInterval: (callback, delay) => { timers.set(++nextTimer, { callback, delay }); return nextTimer },
         clearInterval: timer => timers.delete(timer), setTimeout: noop, WebSocket: MockSocket,
         exchangeSel: { value: 'binance' }, symbolSel: { value: 'BTC' }, marketSel: { value: 'spot' }, tfSel: { value: '1m' },
-        statusEl: {}, currentAccessKey: () => '', historyPageSize: () => 2,
+        statusEl: {}, historyPageSize: () => 2,
         chart: { timeScale: () => ({ getVisibleLogicalRange: () => null }) },
         updateDocumentTitle: noop, resetViewport: noop, syncPaneLayout: noop,
         clearScheduledSegmentedRefresh: noop, scheduleSegmentedRefresh: noop, applyHistoryIndicators: noop, noteDataChanged: noop, invalidateLocalAt: noop,
@@ -147,16 +148,16 @@ function harness() {
         updatePluginPoint: bar => { series.update(bar); series.update(bar) },
         priceSeries: series, backboneSeries: series,
         pricePointForBar: bar => bar, updateFlowReadout: () => context.readoutWrites++, useAggregateMode: () => false,
-        CONFIG: { FETCH_COOLDOWN: 0, DELAY_POLL_MS: 1000 }, warmupPrepending: false, localOlderPages: [],
+        CONFIG: { FETCH_COOLDOWN: 0, LIVE_RECONCILE_MS: 1000 }, warmupPrepending: false, localOlderPages: [],
     })
     vm.runInContext(chartSource, context)
     const config = section('const CONFIG = {', 'const elements =');
-    vm.runInContext(config + '\nCONFIG.DELAY_POLL_MS=1000; CONFIG.FETCH_COOLDOWN=0;\n' + section('const fallbackInstruments', 'function savePrefs') + '\n' + section('let programmaticRangeChange', 'function currentAccessKey')
+    vm.runInContext(config + '\nCONFIG.LIVE_RECONCILE_MS=1000; CONFIG.FETCH_COOLDOWN=0;\n' + section('const fallbackInstruments', 'function savePrefs') + '\n' + section('let programmaticRangeChange', 'function useAggregateMode')
         + '\n' + section('function assertSourceSeries', 'function updateOptionsForExchange')
         + '\n' + section('let timelineTimes', 'function selectRenderWindow')
         + '\nfunction setBars(bars) { fullWrites++; page.bars = bars; renderedWindow.bars = bars.slice(); page.oldestTime = bars[0]?.time ?? null; page.newestTime = bars.at(-1)?.time ?? null }\n'
         + section('async function fetchHistory', 'chart.timeScale().subscribeVisibleLogicalRangeChange')
-        + section('function stopDelayedPolling', 'async function resumeUpdates')
+        + section('function stopRealtimeSocket', 'async function resumeUpdates')
         + '\nensureModeConnections = () => {};', context)
     return { context, requests, timers, sockets, updates, run: code => vm.runInContext(code, context) }
 }
@@ -269,20 +270,25 @@ test('forward pagination merges missing bars even when realtime advances during 
     assert.equal(run('page.confirmedTime'), 180)
 })
 
-test('empty delayed history can fill on a later poll', async () => {
+test('empty live history can fill on a later live catch-up', async () => {
     const { run, requests } = harness()
-    run('applyHistoryPage({bars: [], realtime_enabled: false})')
-    const pending = run('pollDelayedUpdates()')
-    respond(requests[0], [{ time: 60 }], { realtime_enabled: false })
-    await pending
+    run('applyHistoryPage({bars: [], realtime_enabled: true})')
+    assert.equal(run('statusEl.textContent'), 'live')
+    const pending = run('catchUpHistory(wsGeneration, new Map())')
+    assert.equal(requests[0].url.searchParams.has('after'), false)
+    assert.equal(requests[0].url.searchParams.has('key'), false)
+    respond(requests[0], [{ time: 60 }])
+    assert.equal(await pending, true)
     assert.equal(run('page.newestTime'), 60)
-    assert.equal(run('page.loadingNewer'), false)
+    assert.equal(run('page.confirmedTime'), 60)
 })
 
 test('live sockets periodically reconcile history and release timers on stop', async () => {
     const { run, requests, timers, sockets } = harness()
     run('applyHistoryPage({bars: [{time: 60}], realtime_enabled: true}); connectWs()')
+    assert.equal(new URL(String(sockets[0].url)).searchParams.has('key'), false, 'live socket is anonymous')
     const opened = sockets[0].onopen()
+    assert.equal(requests[0].url.searchParams.has('key'), false, 'catch-up HTTP is anonymous')
     respond(requests[0], [{ time: 60 }])
     await opened
     const reconcile = [...timers.values()].find(timer => timer.delay === 1000)
@@ -391,12 +397,13 @@ test('USDT→USDC switch fences late same-series history and old socket frames; 
     oldSocket.onmessage({data:JSON.stringify({series:'spot-v1',bar:{time:120,cvd_usdt:999}})});
     assert.equal(run('page.bars[0].cvd_usdt'),7);
     assert.equal(run('page.bars.length'),1);
-    run('realtimeEnabled=false');
-    const poll=run('pollDelayedUpdates()');
+    run('page.reachedEnd=false');
+    const forward=run('loadMoreAfter()');
     assert.equal(requests[2].url.searchParams.get('market'),'spot_usdc');
     assert.equal(requests[2].url.searchParams.get('series'),'spot-v1');
-    respond(requests[2],[],{series:'spot-v1',realtime_enabled:false});
-    await poll;
+    respond(requests[2],[],{series:'spot-v1'});
+    await forward;
+    assert.equal(run('page.bars[0].cvd_usdt'),7);
 });
 
 test('unsupported venue/market pair is refused before opening HTTP or WS', async () => {
@@ -706,7 +713,7 @@ test('withdrawal B1: invalidateLocalAt applies the Rust withdrawal diff synchron
 })
 
 const flush = () => new Promise(resolve => setImmediate(resolve))
-test('validity P1 cursors: all-invalid pages advance by truthful coverage in loadMoreBefore/loadMoreAfter/pollDelayedUpdates without false exhaustion', async () => {
+test('validity P1 cursors: all-invalid pages advance by truthful coverage in loadMoreBefore/loadMoreAfter/catchUpHistory without false exhaustion', async () => {
     const { run, requests } = harness()
     run('setBars([{time:600},{time:660}]); page.confirmedTime = 660')
     // older: all-invalid page [480,540] with more before -> next request before=480 -> valid row 420
@@ -733,9 +740,9 @@ test('validity P1 cursors: all-invalid pages advance by truthful coverage in loa
     respond(requests[4], [{ time: 840 }], { has_more_after: false })
     await pending
     assert.ok(times(run).includes(840))
-    // delayed poll: all-invalid tail with has_more_after -> continues; persistent cursor stays at the bar edge
-    pending = run('pollDelayedUpdates()')
-    assert.match(String(requests[5].url), /after=840/)
+    // live catch-up: all-invalid tail with has_more_after -> continues; persistent cursor stays at the bar edge
+    pending = run('catchUpHistory(wsGeneration, new Map())')
+    assert.match(String(requests[5].url), /after=839/)
     respond(requests[5], [], { has_more_after: true, invalid_times: [900], coverage_to: 900 })
     await flush()
     assert.match(String(requests[6].url), /after=900/)

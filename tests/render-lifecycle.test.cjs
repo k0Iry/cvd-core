@@ -323,15 +323,15 @@ test('hidden mode changes defer chart writes and restore latest summary in one r
     assert.equal(h.run('flowModeSel.value'), 'flow/buy_sell')
 })
 
-test('pending prepend viewport survives subsequent hidden polling', async () => {
+test('pending prepend viewport survives subsequent hidden live catch-up', async () => {
     const h = harness(); seed(h)
     h.run('chart.timeScale().setVisibleLogicalRange({from:0,to:1})')
     h.document.hidden = true; h.emit('document', 'visibilitychange')
-    h.run(`fetch = async () => ({ok:true,json:async()=>({bars:${JSON.stringify([bar(30)])},has_more_before:true,has_more_after:false,realtime_enabled:false})})`)
+    h.run(`fetch = async () => ({ok:true,json:async()=>({bars:${JSON.stringify([bar(30)])},has_more_before:true,has_more_after:false,realtime_enabled:true})})`)
     await h.run('loadMoreBefore()')
     assert.equal(h.run('JSON.stringify(pendingChartRange)'), '{"from":1,"to":2}')
-    h.run(`fetch = async () => ({ok:true,json:async()=>({bars:${JSON.stringify([bar(180)])},has_more_before:true,has_more_after:false,realtime_enabled:false})})`)
-    await h.run('pollDelayedUpdates()')
+    h.run(`fetch = async () => ({ok:true,json:async()=>({bars:${JSON.stringify([bar(180)])},has_more_before:true,has_more_after:false,realtime_enabled:true})})`)
+    await h.run('catchUpHistory(wsGeneration, new Map())')
     assert.equal(h.run('JSON.stringify(pendingChartRange)'), '{"from":1,"to":2}')
     h.document.hidden = false; h.emit('document', 'visibilitychange'); h.flushFrames()
     assert.equal(h.run('JSON.stringify(chart.timeScale().getVisibleLogicalRange())'), '{"from":1,"to":2}')
@@ -541,7 +541,7 @@ test('loadMoreAfter interior insert keeps the timestamp anchor captured at respo
     assert.deepEqual(times(h, 'deltaZeroSeries.data'), [60, 120, 180, 240])
 })
 
-test('catchUpHistory and hidden polling reanchor current/pending ranges for interior inserts', async () => {
+test('catchUpHistory visible and hidden reanchor current/pending ranges for interior inserts', async () => {
     const h = harness(); startAt(h, [60, 180, 240], { from: 1, to: 2 })
     h.run('page.confirmedTime = 60')
     h.run(`fetch = async () => ${respond([bar(120)])}`)
@@ -554,7 +554,7 @@ test('catchUpHistory and hidden polling reanchor current/pending ranges for inte
     g.document.hidden = true; g.emit('document', 'visibilitychange')
     g.run('pendingChartRange = {from:1.5,to:2.75}')
     g.run(`fetch = async () => ${respond([bar(120), bar(360)])}`)
-    await g.run('pollDelayedUpdates()')
+    await g.run('catchUpHistory(wsGeneration, new Map())')
     assert.equal(g.run('JSON.stringify(pendingChartRange)'), '{"from":2.5,"to":3.75}')
     g.document.hidden = false; g.emit('document', 'visibilitychange'); g.flushFrames()
     assert.equal(g.run('JSON.stringify(chart.timeScale().getVisibleLogicalRange())'), '{"from":2.5,"to":3.75}')

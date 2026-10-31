@@ -5,8 +5,8 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-8"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-8"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-9"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-9"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -22,7 +22,8 @@ const CONFIG = {
     SEGMENTED_REALTIME_REFRESH_MS: 2000,
     EDGE_TRIGGER: 30,
     FETCH_COOLDOWN: 300,
-    DELAY_POLL_MS: 30000,
+    // Periodic live catch-up: reconciles the open socket against stored history.
+    LIVE_RECONCILE_MS: 30000,
 }
 
 const THEMES = {
@@ -91,8 +92,8 @@ const STORAGE_KEY = "cvd_prefs_v1"
 const DEFAULT_TITLE = "CVD"
 
 // ============================================================ DOM controls
-const elements = Object.fromEntries(Object.entries({ exchangeSel: "exchange", symbolSel: "symbol", marketSel: "market", tfSel: "tf", accessKeyInput: "access-key", aggToggle: "toggle-agg", pluginControlsEl: "plugin-controls", pluginMenuEl: "plugin-menu", pluginStateEl: "plugin-state", screenshotBtn: "screenshot-btn", statusEl: "status", qualityStateEl: "quality-state", sourceSeriesEl: "source-series", chartEl: "chart", paneLabels: "pane-labels" }).map(([key, id]) => [key, document.getElementById(id)]))
-const { exchangeSel, symbolSel, marketSel, tfSel, accessKeyInput, aggToggle, pluginControlsEl, pluginMenuEl, pluginStateEl, screenshotBtn, statusEl, qualityStateEl, sourceSeriesEl, chartEl, paneLabels } = elements
+const elements = Object.fromEntries(Object.entries({ exchangeSel: "exchange", symbolSel: "symbol", marketSel: "market", tfSel: "tf", aggToggle: "toggle-agg", pluginControlsEl: "plugin-controls", pluginMenuEl: "plugin-menu", pluginStateEl: "plugin-state", screenshotBtn: "screenshot-btn", statusEl: "status", qualityStateEl: "quality-state", sourceSeriesEl: "source-series", chartEl: "chart", paneLabels: "pane-labels" }).map(([key, id]) => [key, document.getElementById(id)]))
+const { exchangeSel, symbolSel, marketSel, tfSel, aggToggle, pluginControlsEl, pluginMenuEl, pluginStateEl, screenshotBtn, statusEl, qualityStateEl, sourceSeriesEl, chartEl, paneLabels } = elements
 
 // ============================================================ preferences
 // One-time migration of pre-plugin preferences (cvd_prefs_v1 written by the
@@ -396,7 +397,6 @@ function savePrefs() {
         symbol: symbolSel.value,
         market: marketSel.value,
         tf: tfSel.value,
-        accessKey: accessKeyInput.value,
         showAgg: aggToggle.checked,
         plugins: { enabled: { ...pluginPrefs.enabled }, modes: { ...pluginPrefs.modes } },
     }
@@ -503,7 +503,6 @@ function applyPrefs(prefs) {
     setSelectOptions(marketSel, availableMarkets(exchangeSel.value, symbolSel.value), preferredMarket)
     updateOptionsForMarket()
     tfSel.value = ["1m", "5m", "15m", "30m", "1h"].includes(prefs.tf) ? prefs.tf : "1m"
-    if (typeof prefs.accessKey === "string") accessKeyInput.value = prefs.accessKey
     if (typeof prefs.showAgg === "boolean") aggToggle.checked = prefs.showAgg
     pluginPrefs = sanitizePluginPrefs(prefs.plugins)
     updateOptionsForExchange()
@@ -1501,11 +1500,9 @@ let lastBeforeFetchAt = 0
 let lastAfterFetchAt = 0
 let ws = null
 let pingTimer = null
-let delayedPollTimer = null
 let wsGeneration = 0
 let historyGeneration = 0
 let historyController = new AbortController()
-let realtimeEnabled = true
 let updatesSuspended = false
 let modeConnectionsReady = false
 const page = {
@@ -1517,10 +1514,6 @@ const page = {
     loadingNewer: false,
     reachedStart: false,
     reachedEnd: false
-}
-
-function currentAccessKey() {
-    return accessKeyInput.value.trim()
 }
 
 function useAggregateMode() {
@@ -1673,8 +1666,7 @@ function updateDocumentTitle() {
             : lastClose < prevClose
                 ? "▼"
                 : "•"
-    const mode = realtimeEnabled ? "live" : "delay"
-    document.title = `${symbolSel.value} ${arrow} ${lastClose.toFixed(2)} · ${tfSel.value} · ${mode}`
+    document.title = `${symbolSel.value} ${arrow} ${lastClose.toFixed(2)} · ${tfSel.value} · live`
 }
 
 function downloadChartScreenshot() {
@@ -1769,8 +1761,6 @@ async function fetchHistory(limit, before = null, after = null) {
     u.searchParams.set("market", requestedMarket)
     u.searchParams.set("tf", tfSel.value)
     u.searchParams.set("limit", limit)
-    const key = currentAccessKey()
-    if (key) u.searchParams.set("key", key)
     // Legacy USDT spot omits series for older servers; new spot is explicit.
     if (requestedMarket !== "spot") u.searchParams.set("series", sourceSeries(requestedMarket))
     if (before != null) u.searchParams.set("before", before)
@@ -2030,9 +2020,8 @@ function applyHistoryPage(data, keepRange = null, confirmedBars = data.bars || [
     page.reachedEnd = !data.has_more_after
     setMergedBars(data.bars || [], keepRange)
     recordConfirmedHistory(confirmedBars)
-    realtimeEnabled = !!data.realtime_enabled
     statusEl.textContent = !page.bars.length && ["spot_usdc", "usdm_usdc"].includes(marketSel.value)
-        ? "no stored history yet" : realtimeEnabled ? "live" : "delay 1h"
+        ? "no stored history yet" : "live"
     updateDocumentTitle()
 }
 
@@ -2251,13 +2240,6 @@ chart.subscribeCrosshairMove(param => {
     updateFlowReadout()
 })
 
-function stopDelayedPolling() {
-    if (delayedPollTimer) {
-        clearInterval(delayedPollTimer)
-        delayedPollTimer = null
-    }
-}
-
 function stopRealtimeSocket() {
     wsGeneration += 1
     if (pingTimer) {
@@ -2268,30 +2250,6 @@ function stopRealtimeSocket() {
         const socket = ws
         ws = null
         socket.close()
-    }
-}
-
-async function pollDelayedUpdates() {
-    if (page.loadingNewer) return
-
-    page.loadingNewer = true
-    const generation = historyGeneration
-    try {
-        const data = await fetchHistorySkippingInvalid(historyPageSize(), null, page.newestTime)
-        const newer = data.bars || []
-        if (!newer.length) {
-            page.reachedEnd = !data.has_more_after && !data.stalled
-            return
-        }
-
-        const merged = mergeHistoryBars(newer)
-        const reachedStart = page.reachedStart
-        applyHistoryPage({ ...data, bars: merged }, currentChartRange(), newer)
-        page.reachedStart = reachedStart
-    } catch (error) {
-        reportHistoryError(error)
-    } finally {
-        if (generation === historyGeneration) page.loadingNewer = false
     }
 }
 
@@ -2329,19 +2287,8 @@ async function catchUpHistory(generation, buffered) {
 function ensureModeConnections() {
     if (updatesSuspended || !modeConnectionsReady) return
 
-    if (realtimeEnabled) {
-        stopDelayedPolling()
-        if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
-            connectWs()
-        }
-        return
-    }
-
-    stopRealtimeSocket()
-    if (!delayedPollTimer) {
-        delayedPollTimer = setInterval(() => {
-            pollDelayedUpdates().catch(err => console.warn("delayed poll failed", err))
-        }, CONFIG.DELAY_POLL_MS)
+    if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+        connectWs()
     }
 }
 
@@ -2358,8 +2305,6 @@ function connectWs() {
     url.searchParams.set("market", requestedMarket)
     url.searchParams.set("tf", tfSel.value)
     if (requestedMarket !== "spot") url.searchParams.set("series", sourceSeries(requestedMarket))
-    const key = currentAccessKey()
-    if (key) url.searchParams.set("key", key)
 
     const generation = ++wsGeneration
     // Live fences are per connection; results already stored stay valid.
@@ -2406,7 +2351,7 @@ function connectWs() {
         if (generation !== wsGeneration || syncing) return
         historySyncTimer = setInterval(() => {
             if (!syncing) syncHistory()
-        }, CONFIG.DELAY_POLL_MS)
+        }, CONFIG.LIVE_RECONCILE_MS)
     }
 
     socket.onmessage = ev => {
@@ -2439,11 +2384,9 @@ function connectWs() {
         statusEl.textContent = "reconnecting"
         if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
         ws = null
-        if (realtimeEnabled) {
-            setTimeout(() => {
-                if (reconnectGeneration === wsGeneration && realtimeEnabled && !updatesSuspended) connectWs()
-            }, 3000)
-        }
+        setTimeout(() => {
+            if (reconnectGeneration === wsGeneration && !updatesSuspended) connectWs()
+        }, 3000)
     }
 }
 
@@ -2459,7 +2402,6 @@ async function reload() {
     historyController.abort()
     historyController = new AbortController()
     const generation = ++historyGeneration
-    stopDelayedPolling()
     stopRealtimeSocket()
     cancelVisualWork()
     pendingChartRange = null
@@ -2510,8 +2452,6 @@ exchangeSel.onchange = () => {
 symbolSel.onchange = () => { updateOptionsForSymbol(); persistAndReload() }
 marketSel.onchange = () => { updateOptionsForMarket(); persistAndReload() }
 tfSel.onchange = () => persistAndReload()
-accessKeyInput.oninput = () => savePrefs()
-accessKeyInput.onchange = () => persistAndReload()
 aggToggle.onchange = () => {
     refreshModeData()
 }

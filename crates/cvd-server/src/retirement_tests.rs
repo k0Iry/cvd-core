@@ -152,8 +152,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
                 2,
                 before_time,
                 after_time,
-                None,
-                true,
             )
             .await
             .unwrap();
@@ -175,8 +173,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
             2,
             None,
             None,
-            None,
-            true,
         )
         .await
         .unwrap();
@@ -217,9 +213,7 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
         assert_eq!(current.aggregate_delta_usdt, 4.0);
         assert_eq!(current.aggregate_price_close, 400.0 / 3.0);
     }
-    for (before_time, after_time, max_time) in
-        [(None, None, None), (Some(180), None, None), (None, Some(59), None), (None, None, Some(120))]
-    {
+    for (before_time, after_time) in [(None, None), (Some(180), None), (None, Some(59))] {
         let page = load_history_page(
             &db,
             "binance",
@@ -229,8 +223,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
             2,
             before_time,
             after_time,
-            max_time,
-            max_time.is_none(),
         )
         .await
         .unwrap();
@@ -300,7 +292,6 @@ async fn postgres_retirement_preserves_sources_and_excludes_legacy_rows() {
             series: series.map(str::to_owned),
             symbol: Some("BTC".into()),
             tf: Some("1m".into()),
-            key: None,
             limit: Some(2),
             before: None,
             after: None,

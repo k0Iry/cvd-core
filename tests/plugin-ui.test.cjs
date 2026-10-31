@@ -135,7 +135,7 @@ test('base rev fence: same-epoch lower rev ignored, rev 0 kept, reconnect accept
     assert.equal(h.run(`baseSuperseded(${t}, 5)`), false)
     assert.equal(h.run(`noteBaseRev({ bar: { time: ${t} }, rev: -1 }); noteBaseRev({ bar: { time: ${t} }, rev: 2.5 }); baseRevs.get(${t}).rev`), 5, 'negative/non-integer revs never recorded')
     const epoch = h.run('baseEpoch')
-    h.run('globalThis.WebSocket = class { constructor() { WebSocket.last = this; this.readyState = 1 } send() {} close() { this.closed = true } }; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3; realtimeEnabled = true; connectWs()')
+    h.run('globalThis.WebSocket = class { constructor() { WebSocket.last = this; this.readyState = 1 } send() {} close() { this.closed = true } }; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3; connectWs()')
     assert.equal(h.run('baseEpoch'), epoch + 1, 'reconnect starts a new connection epoch')
     assert.equal(h.run(`baseSuperseded(${t}, 1)`), false)
     // The base fence restarts per connection; the separate producer-epoch
@@ -153,7 +153,7 @@ test('base rev fence: same-epoch lower rev ignored, rev 0 kept, reconnect accept
 
 test('valid and malformed indicator* WS frames are ignored; base and non-indicator frames still reach source checks', async () => {
     const h = await realHarness()
-    h.run('globalThis.WebSocket = class { constructor() { WebSocket.last = this; this.readyState = 1 } send() {} close() { this.closed = true } }; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3; realtimeEnabled = true; connectWs()')
+    h.run('globalThis.WebSocket = class { constructor() { WebSocket.last = this; this.readyState = 1 } send() {} close() { this.closed = true } }; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3; connectWs()')
     h.run('globalThis.__checks = 0; const real = assertSourceSeries; assertSourceSeries = (...a) => { __checks++; return real(...a) }')
     const send = m => h.run(`WebSocket.last.onmessage({ data: ${JSON.stringify(JSON.stringify(m))} })`)
     const before = plain(h.run('page.bars'))
