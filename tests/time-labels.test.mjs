@@ -60,7 +60,7 @@ test('formatter reads the timeframe live (no stale tf capture)', () => {
 
 test('app wires formatters without touching data timestamps; module ships in assembled static', () => {
     const app = fs.readFileSync(path.join(ROOT, 'static/js/app.js'), 'utf8')
-    assert.match(app, /import \{[^}]*\bcreateTimeLabelFormatters\b[^}]*\} from "\.\/chart\.js\?v=local-wasm-7"/)
+    assert.match(app, /import \{[^}]*\bcreateTimeLabelFormatters\b[^}]*\} from "\.\/chart\.js\?v=local-wasm-8"/)
     assert.match(app, /localization: \{ timeFormatter: timeLabels\.timeFormatter \}/)
     assert.match(app, /tickMarkFormatter: timeLabels\.tickMarkFormatter/)
     assert.match(app, /timelineTimes = bars\.map\(b => b\.time\)/)

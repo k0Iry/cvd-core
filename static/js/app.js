@@ -5,8 +5,8 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-7"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-7"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-8"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-8"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -799,7 +799,10 @@ function noteDataChanged(kind = "history") {
 }
 function publishLocalDemand(scope = scopeNow(), scopeKey = JSON.stringify(scope)) {
     if (!localCompute) return
-    localCompute.setDemand({ scope, scopeKey, revision: dataRevision, historyRevision, bars: page.bars,
+    // stablePrefix: within one historyRevision page.bars changes only via
+    // applyTailBars (replace newest / append); every other mutation (older
+    // correction, prepend, removal, reset, merge) bumps historyRevision.
+    localCompute.setDemand({ scope, scopeKey, revision: dataRevision, historyRevision, bars: page.bars, stablePrefix: true,
         invalidTimes: [...invalidPoison.keys()].sort((a, b) => a - b),
         exhausted: !!page.reachedStart, ...canonicalRequestedRange(page.bars) })
 }

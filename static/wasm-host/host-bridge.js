@@ -298,7 +298,7 @@ const SLICE = 8
 export function createLocalCompute({ host, coord, onResult, onStatus, onInvalid, onView, log = () => {}, schedule = f => setTimeout(f, 0) }) {
     const io = new Map()          // id -> { bytes, params } (Worker inputs only)
     const running = new Set()
-    let sent = null               // last demand basis sent to Rust (tail diff)
+    let sent = null               // {scopeKey, historyRevision, len} of the last accepted demand
 
     const wantOf = w => ({ scopeKey: w.scope_key, revision: w.revision, historyRevision: w.history_revision, mode: w.mode })
     // Deliver every event; a callback exception never interrupts the rest
@@ -368,25 +368,28 @@ export function createLocalCompute({ host, coord, onResult, onStatus, onInvalid,
         kickAll()
     }
 
-    // Send only the bars that changed since the last demand of the same
-    // scope + history basis (identity scan, no serialization); Rust patches
-    // its mirror, or asks for the full cache when the tail cannot apply.
+    // Bars transport. `stablePrefix: true` is the caller's contract that, for
+    // the same scope + history basis, rows before the previously ACCEPTED last
+    // row are unchanged and the array never shrinks (only the last row may be
+    // replaced and rows appended). Then only the suffix from that last row is
+    // sent (conservative: it may repeat one unchanged row); Rust patches its
+    // mirror by time, or asks for the full cache. Anything else (no opt-in,
+    // new basis, shrink, uncertain prior demand) sends the full cache. Only
+    // scalars of the last accepted demand are kept (no bar snapshot).
     function setDemand(next) {
         const base = { scope: next.scope, scope_key: next.scopeKey, revision: next.revision, history_revision: next.historyRevision,
             exhausted: !!next.exhausted, want_from_index: next.wantFromIndex ?? 0, want_to_index: next.wantToIndex ?? next.bars.length,
             older_ranges: (next.olderRanges ?? []).map(r => ({ from_index: r.fromIndex, to_index: r.toIndex, from: r.from, to: r.to })),
             invalid_times: next.invalidTimes ?? [] }
+        const prior = sent, bars = next.bars
+        sent = null   // uncertain until a demand is accepted: a throw below forces full next time
         let r = null
-        if (sent && sent.scopeKey === next.scopeKey && sent.historyRevision === next.historyRevision) {
-            const old = sent.bars, bars = next.bars, n = Math.min(old.length, bars.length)
-            let i = 0
-            while (i < n && old[i] === bars[i]) i++
-            r = coord.demand({ ...base, tail: bars.slice(i), len: bars.length })
-        }
-        if (!r || r.need_full) r = coord.demand({ ...base, bars: next.bars })
-        // The app mutates page.bars in place (replace/push of new bar
-        // objects): keep a reference snapshot (pointer copy, no serialization).
-        sent = { scopeKey: next.scopeKey, historyRevision: next.historyRevision, bars: next.bars.slice() }
+        if (next.stablePrefix === true && prior && prior.scopeKey === next.scopeKey &&
+            prior.historyRevision === next.historyRevision && bars.length >= prior.len)
+            r = coord.demand({ ...base, tail: bars.slice(Math.max(0, prior.len - 1)), len: bars.length })
+        if (!r || r.need_full) r = coord.demand({ ...base, bars })
+        // Only an accepted reply is a checkpoint (a full demand can still answer need_full).
+        if (!r.need_full) sent = { scopeKey: next.scopeKey, historyRevision: next.historyRevision, len: bars.length }
         if (r.view?.clear) onView?.(null, r.view)
         for (const s of r.supersede ?? []) {
             try { if (host.supersede(s.inst, next.scopeKey, next.revision) > 0) coord.superseded(s.id) } catch (_) { coord.superseded(s.id) }
