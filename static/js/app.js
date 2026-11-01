@@ -5,8 +5,8 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-10"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-10"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-11"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-11"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -161,7 +161,8 @@ function createIndicatorMenu({ container, popup, onToggle, onImport = null, onUn
     if (onImport) {
         fileInput = make("input")
         fileInput.type = "file"
-        fileInput.accept = ".wasm,application/wasm"
+        // No `accept` filter: iOS Files greys out unknown types like .wasm.
+        // checkImportFile + module validation run after selection instead.
         fileInput.className = "plugin-import-input"
         fileInput.setAttribute("aria-label", "Import local .wasm indicator")
         fileInput.onchange = () => { const f = fileInput.files?.[0]; fileInput.value = ""; if (f) onImport(f) }

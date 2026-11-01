@@ -768,3 +768,36 @@ test('validity: reload resets poison state (scope-bound)', () => {
     run('resetValidity()')
     assert.deepEqual(poison(run), [])
 })
+
+test('import picker imposes no accept filter (iOS greys out .wasm) and keeps click/single-file/reset/cancel/reselect semantics', () => {
+    const from = source.indexOf('function createIndicatorMenu'), fn = source.slice(from, source.indexOf('\n}\n', from) + 3)
+    const all = []
+    const el = tag => {
+        const e = { tagName: tag, className: '', attrs: {}, children: [], dataset: {}, style: {}, clicks: 0,
+            setAttribute(k, v) { this.attrs[k] = String(v) }, getAttribute(k) { return this.attrs[k] ?? null },
+            append(...c) { this.children.push(...c) }, replaceChildren(...c) { this.children = c },
+            addEventListener() {}, querySelector() { return null }, querySelectorAll() { return [] },
+            click() { this.clicks++ }, focus() {}, contains() { return false }, getBoundingClientRect() { return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 } } }
+        all.push(e); return e
+    }
+    const ctx = { document: { createElement: el, addEventListener() {}, querySelectorAll() { return [] } }, window: {} }
+    vm.createContext(ctx)
+    vm.runInContext(`${fn}; this.createIndicatorMenu = createIndicatorMenu`, ctx)
+    const imported = [], seen = []
+    ctx.createIndicatorMenu({ container: el('div'), popup: Object.assign(el('div'), { id: 'm' }), onToggle() {}, onImport: f => { seen.push(input.value); imported.push(f) } })
+    const input = all.find(e => e.type === 'file'), btn = all.find(e => /plugin-import-btn/.test(e.className))
+    assert.ok(input && btn)
+    assert.ok(!input.accept, `no accept filter, got ${JSON.stringify(input.accept)}`)
+    assert.equal(input.getAttribute('accept'), null)                     // fake DOM does not reflect attr→prop
+    assert.equal(input.multiple, undefined)
+    assert.match(input.getAttribute('aria-label'), /\.wasm/); assert.match(btn.textContent, /\.wasm/)
+    btn.onclick(); assert.equal(input.clicks, 1)                           // synchronous gesture → picker
+    input.files = []; input.value = ''; input.onchange(); assert.deepEqual(imported, [])   // cancel: nothing
+    const f = { name: 'x.wasm', type: '', size: 8 }
+    for (let i = 0; i < 2; i++) {                                           // same file reselected twice
+        input.files = [f]; input.value = 'C:\\fakepath\\x.wasm'; input.onchange()
+        assert.equal(input.value, '')
+    }
+    assert.equal(imported.length, 2); assert.ok(imported.every(x => x === f))
+    assert.deepEqual(seen, ["", ""])                                         // callback sees the reset (empty) value
+})

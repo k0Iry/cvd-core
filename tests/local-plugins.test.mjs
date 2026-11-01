@@ -70,6 +70,8 @@ test('import file checks and duplicate/version decisions', () => {
   assert.throws(() => checkImportFile({ name: 'x.js', size: 10 }), e => e.code === 'bad_file_type')
   assert.throws(() => checkImportFile({ name: 'x.wasm', size: 0 }), e => e.code === 'bad_magic')
   assert.throws(() => checkImportFile({ name: 'x.wasm', size: (16 << 20) + 1 }), e => e.code === 'module_too_large')
+  // Unfiltered picker (iOS): MIME may be empty/generic; it is not a reject criterion.
+  for (const type of ['', 'application/octet-stream', 'application/wasm']) checkImportFile({ name: 'x.wasm', type, size: 8 })
   const recs = [{ id: 'a', sha256: '1' }]
   assert.equal(classifyImport(recs, { id: 'a', sha256: '1' }).action, 'same')
   assert.equal(classifyImport(recs, { id: 'a', sha256: '2' }).action, 'replace')

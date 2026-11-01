@@ -316,6 +316,7 @@ const errors = []
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 let seq = 0
 const pending = new Map()
+let fileChooserHook = null // indicator_menu import-picker check (Page.fileChooserOpened)
 function call(method, params = {}) {
     return new Promise((resolve, reject) => {
         const id = ++seq
@@ -1210,6 +1211,23 @@ const scenarios = {
                 group: !!g, groupLabel: g && document.getElementById(g.getAttribute('aria-labelledby'))?.textContent, boxes: p.querySelectorAll('input[type=checkbox]').length } })()`)
         check('disclosure_semantics', sem.haspopup === null && sem.menuRoles === 0 && sem.group && sem.groupLabel === 'Indicators' && sem.boxes === realIds.length, sem)
         check('tooltip_says_selected', /indicators selected/.test(sem.title) && !/shown/.test(sem.title), sem.title)
+        // Import picker DOM config in the real app: no accept filter (iOS greys out .wasm
+        // for accept=".wasm,application/wasm"), single file; then a trusted click on the
+        // visible import button must request a native chooser (intercepted, cancelled).
+        const pick = await evaluate(`(() => { const i = document.querySelector('.plugin-import-input'), b = document.querySelector('.plugin-import-btn')
+            return i && { type: i.type, acceptProp: i.accept, acceptAttr: i.getAttribute('accept'), multiple: i.multiple, label: i.getAttribute('aria-label'), btn: b && b.textContent } })()`)
+        check('import_picker_no_accept_single', !!pick && pick.type === 'file' && pick.acceptProp === '' && pick.acceptAttr === null && pick.multiple === false && /\.wasm/.test(pick.label ?? '') && /\.wasm/.test(pick.btn ?? ''), pick)
+        {
+            if (!(await state()).open) await click(S)
+            const chooser = new Promise(res => { const t = setTimeout(() => res(null), 3000); fileChooserHook = e => { clearTimeout(t); res(e) } })
+            await call('Page.setInterceptFileChooserDialog', { enabled: true })
+            let ev = null
+            try { await click(`document.querySelector('.plugin-import-btn')`); ev = await chooser }
+            finally { fileChooserHook = null; await call('Page.setInterceptFileChooserDialog', { enabled: false }) }
+            check('import_click_requests_single_chooser', !!ev && ev.mode === 'selectSingle', ev && { mode: ev.mode })
+            x.details.importPicker = { dom: pick, chooser: ev && { mode: ev.mode } }
+            if ((await state()).open) await key('Escape', 'Escape', 27)
+        }
         // NORMAL state with REAL ready plugin rows only (before any synthetic rows).
         for (const scheme of ['dark', 'light']) {
             await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] }); await frames(4)
@@ -1532,6 +1550,7 @@ try {
             if (p) { clearTimeout(p.timer); pending.delete(msg.id); msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result) }
         } else if (msg.method === 'Runtime.exceptionThrown') errors.push(msg.params.exceptionDetails)
         else if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') errors.push(msg.params.args.map(a => a.value ?? a.description).join(' '))
+        else if (msg.method === 'Page.fileChooserOpened' && fileChooserHook) fileChooserHook(msg.params)
     })
     await call('Page.enable'); await call('Runtime.enable')
     await call('Emulation.setDeviceMetricsOverride', { width: VIEW.width, height: VIEW.height, deviceScaleFactor: VIEW.deviceScaleFactor, mobile: false })
