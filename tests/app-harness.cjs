@@ -6,7 +6,7 @@ const vm = require('node:vm')
 // Synthetic discovery entries in the real host shape ({id, status,
 // descriptor}) with SDK v1 descriptors. `bands` is a generic segmented_lines
 // test plugin with arbitrary synthetic values, not any real algorithm. Real
-// cdylib output under the real runner is covered by tests/fixtures/plugin-web.json.
+// plugin WASM numerics are exercised only by the Chromium gates.
 const entry = descriptor => ({ id: descriptor.id, status: 'ready', descriptor: { abi: 1, context: { bars: 0 }, params: [], inputs: [], live: true, ...descriptor } })
 const out = (key, label, pane, pane_group, colors, type, extra = {}) => ({ key, label, pane, pane_group, colors, widths: [], readout_only: false, type, ...extra })
 const TEST_DESCRIPTORS = [

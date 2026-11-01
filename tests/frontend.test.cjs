@@ -96,8 +96,12 @@ test('plugin mode/enable preferences persist generically; invalid entries are dr
 test('one-time legacy migration keeps old Buy-Sell mode and LEVELS visibility, then never re-applies', async () => {
     const {run, saved} = prefsHarness({exchanges:[]});
     await run('loadMeta()');
-    run('applyPrefs({exchange:"binance",market:"spot",symbol:"ETH",tf:"15m",accessKey:"k",showLevels:false,showAgg:true,flowMode:"buy-sell"}); prefsHydrated=true; savePrefs()');
+    run('applyPrefs({exchange:"binance",market:"spot",symbol:"ETH",tf:"15m",accessKey:"k",showRd:true,showKd:true,showFd:false,showHd:true,showLevels:false,showAgg:true,flowMode:"buy-sell"}); prefsHydrated=true; savePrefs()');
     const prefs = JSON.parse(saved.cvd_prefs_v1);
+    // Exact stored shape: retired Strength (showRd/Kd/Fd/Hd), access key and
+    // fixed-pane keys are pruned while useful settings survive.
+    assert.deepEqual(prefs, {exchange:'binance', symbol:'ETH', market:'spot', tf:'15m', showAgg:true,
+        plugins:{enabled:{levels:false}, modes:{'flow:flow':'flow/buy_sell'}}});
     assert.deepEqual(prefs.plugins, {enabled:{levels:false}, modes:{'flow:flow':'flow/buy_sell'}});
     assert.equal(prefs.tf, '15m'); assert.equal(prefs.symbol, 'ETH');    assert.equal(prefs.showAgg, true); assert.equal(Object.hasOwn(prefs, 'accessKey'), false, 'legacy access key dropped');
     assert.equal(Object.hasOwn(prefs, 'flowMode') || Object.hasOwn(prefs, 'showLevels'), false);
@@ -106,6 +110,12 @@ test('one-time legacy migration keeps old Buy-Sell mode and LEVELS visibility, t
 });
 
 const source = fs.readFileSync(require('node:path').join(__dirname, '../static/js/app.js'), 'utf8')
+
+test('changed frontend modules share one coherent import version', () => {
+    const html = fs.readFileSync(require('node:path').join(__dirname, '../static/index.html'), 'utf8')
+    const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...source.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
+    assert.deepEqual([...versions], ['local-wasm-11'])
+})
 const chartSource = fs.readFileSync(require('node:path').join(__dirname, '../static/js/chart.js'), 'utf8').replace(/^export /gm, '')
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }
 function harness() {

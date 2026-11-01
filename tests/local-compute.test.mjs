@@ -182,3 +182,53 @@ test('delayed live output on an older basis is not painted', async () => {
   answer(init); await tick()
   assert.equal(results.filter(r => r.kind === 'live').length, 0)
 })
+
+// Scope/source change through the real compiled coordinator into the ACTUAL
+// app.js projection (applyLocalView, extracted verbatim; onLocalView/onLocalResult
+// both feed it). Replaces the former plugin-ui "source reload" check, which only
+// compared an empty projection with an empty projection. Same-scope reloads are
+// NOT required to clear (see the delayed-output/invalidation tests above); only
+// a genuine scopeKey change must drop the old source's accepted values before
+// the new source paints. `suppressClear` is the in-memory fault control.
+import vm from 'node:vm'
+const APP = fs.readFileSync(new URL('../static/js/app.js', import.meta.url), 'utf8')
+function appProjection() {
+  const from = APP.indexOf('let localValues = new Map()'), to = APP.indexOf('const storeValue', from)
+  assert.ok(from >= 0 && to > from, 'applyLocalView section present in app.js')
+  const ctx = vm.createContext({ forEachRenderer: () => {} })
+  vm.runInContext(APP.slice(from, to) + '\nglobalThis.__p = { apply: applyLocalView, values: () => localValues }', ctx)
+  return ctx.__p
+}
+async function scopeChange({ suppressClear = false } = {}) {
+  const app = appProjection(); const accepted = []; const order = []
+  const valuesFor = b => b.bars.slice(b.output_from).map(x => x.price_close + 1000)
+  const host = { load: async () => ({ descriptor: { live: false, context: { bars: 2 } } }),
+    compute: async (inst, sk, rev, op, body) => { const b = JSON.parse(body); return JSON.stringify({ times: b.bars.slice(b.output_from).map(x => x.time), series: { x: { type: 'line', values: valuesFor(b) } } }) },
+    supersede: () => 0, disable: () => {} }
+  const coord = await createCoordinator(COORD)
+  const c = createLocalCompute({ host, coord,
+    onResult: (id, m, view, want) => { order.push(['result', want.scopeKey]); accepted.push(view); app.apply(view) },
+    onView: (id, view) => { order.push(['view', !!view?.clear]); if (!(suppressClear && view?.clear)) app.apply(view) } })
+  const count = () => [...app.values().values()].reduce((n, col) => n + col.size, 0)
+  const at = t => [...app.values().values()].map(col => col.get(t)).find(v => v !== undefined)
+  c.setPlugins([{ id: 'a', bytes: new ArrayBuffer(1), params: {}, loadKey: 'k' }])
+  c.setDemand({ scope, scopeKey: 'binance|spot|BTCUSDT|1m|source', revision: 1, historyRevision: 1, bars: bars(30) }); await tick(20)
+  const before = { accepted: accepted.flatMap(v => Object.values(v.cols ?? {})).reduce((n, c) => n + c.set.length, 0), projected: count(), value: at(20 * 60) }
+  // Same timestamps, different source; the new source's compute never resolves
+  // (has not painted), so anything still projected is carried over from the old scope.
+  host.compute = async () => new Promise(() => {})
+  c.setDemand({ scope: { ...scope, exchange: 'coinbase' }, scopeKey: 'coinbase|spot|BTCUSDT|1m|source', revision: 2, historyRevision: 2, bars: bars(30) }); await tick(20)
+  return { before, afterCount: count(), afterValue: at(20 * 60), order }
+}
+
+test('scope/source change: real coordinator clear reaches the app projection before the new source paints', async () => {
+  const r = await scopeChange()
+  assert.ok(r.before.accepted > 0, 'coordinator accepted nonempty values for the old scope')
+  assert.ok(r.before.projected > 0 && r.before.value !== undefined, 'app projection held old-scope values')
+  assert.ok(r.order.some(([e, clear]) => e === 'view' && clear), 'coordinator emitted a scope clear')
+  assert.equal(r.afterCount, 0, 'old-scope values gone before any new-source result')
+  assert.equal(r.afterValue, undefined, 'same timestamp on the new source reads nothing old')
+  // Fault control: suppressing that clear delivery is caught by the same checks.
+  const f = await scopeChange({ suppressClear: true })
+  assert.ok(f.afterCount > 0 && f.afterValue !== undefined, 'suppressed clear leaves stale values (assertions above are non-vacuous)')
+})

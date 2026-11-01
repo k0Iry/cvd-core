@@ -15,11 +15,12 @@
 //
 // Everything is loopback: a synthetic /meta, /history and /ws fixture plus the
 // served static files and the pinned vendored Lightweight Charts. Indicator
-// results are REAL: the browser computes them from the imported public .wasm;
-// the harness's independent NUMERICAL ORACLE runs the same .wasm through the
-// shipped trusted plugin-worker.js + cvd_browser_host.wasm in Node
-// (tests/wasm-oracle-client.mjs; successor of the retired native runner).
-// Oracle envelopes are never displayed. No production
+// results are REAL: the browser computes them from the imported public .wasm.
+// The harness loads the same .wasm through tests/wasm-oracle-client.mjs in
+// Node ONLY to obtain host-validated descriptors (expected plugin ids/panes);
+// it does not generate indicator envelopes and is not an independent numerical
+// golden (same module, same shipped host). The fixture serves base bars only:
+// no server-format indicator history or WS frames. No production
 // host, database or market feed is contacted. Input is real CDP pointer/wheel
 // input (trusted DOM events), not programmatic range setters; setup-only
 // positioning uses the chart API and is excluded from measurements.
@@ -33,7 +34,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { WasmOracleClient, inputBar } from './wasm-oracle-client.mjs'
+import { WasmOracleClient } from './wasm-oracle-client.mjs'
 import { teardown } from './harness-teardown.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -75,7 +76,7 @@ function resetDataset() { dataset = Array.from({ length: TOTAL }, (_, i) => make
 globalThis.__dataset = () => dataset
 // assetFault: test-only fault on ONE served static asset (indicator_menu reload
 // controls): { path, delayMs } delays it, { path, status } fails it.
-const control = { tfGrid: false, beforeDelayMs: 0, requests: [], discovery: null, wsUpgrades: 0, assetFault: null, livePushes: 0 }
+const control = { tfGrid: false, beforeDelayMs: 0, requests: [], wsUpgrades: 0, assetFault: null, livePushes: 0 }
 
 // ------------------------------------------------------------ real indicators
 const ORACLE_WASM = (process.env.CVD_LOCAL_WASM || '').split(',').filter(Boolean)
@@ -84,35 +85,9 @@ const runners = []
 for (const lib of ORACLE_WASM) runners.push(await WasmOracleClient.spawn(lib))
 const discovery = { api_version: 1, indicators: runners.map(r => ({ id: r.descriptor.id, status: 'ready', modes: ['source', 'aggregate'],
     version: r.descriptor.version, descriptor: JSON.parse(r.descriptorJson), error: null, restarts: 0 })) }
-// Coherent scope identity: the scope of the most recent request (exchange /
-// market / symbol / tf), never a hard-coded tf.
-const currentScope = { exchange: 'binance', market: 'spot', symbol: 'BTC', tf: '1m' }
-function noteScope(params) {
-    for (const k of ['exchange', 'market', 'symbol', 'tf']) if (params.get(k)) currentScope[k] = params.get(k)
-}
-const scopeOf = (mode, scope = currentScope) => ({ ...scope, mode })
 // Base-bar revisions per time (host shard rev semantics: increments on each
-// base frame for this source); indicator frames carry as_of_rev = rev of the
-// exact snapshot they were computed from.
+// base frame for this source).
 let baseRev = 0
-// Host behaviour: warm-up rows (declared context) are used, then trimmed so
-// output.times == page bars exactly. The bar window is frozen (copied) and
-// the scope fixed BEFORE deriving outputs from that exact snapshot.
-async function indicatorsFor(start, end, snapshot = dataset.slice(), scope = { ...currentScope }) {
-    const out = {}
-    for (const r of runners) {
-        const ctx = Math.min(start, r.descriptor.context?.bars ?? 0)
-        const bars = snapshot.slice(start - ctx, end).map(inputBar)
-        const modes = {}
-        for (const mode of ['source', 'aggregate']) {
-            const res = await r.history(scopeOf(mode, scope), ctx, bars)
-            modes[mode] = res.ok ? { status: 'ok', output: res.output } : { status: 'unavailable', error: { code: res.error.code, message: res.error.message } }
-        }
-        out[r.descriptor.id] = { version: r.descriptor.version, modes }
-    }
-    return out
-}
-const liveIndicator = { generation: Date.now(), session: 1, seq: new Map() }
 
 async function historyPage(params) {
     const limit = Math.min(5000, Number(params.get('limit') || 1600))
@@ -134,10 +109,9 @@ async function historyPage(params) {
         moreBefore = start > 0
         moreAfter = end < dataset.length
     }
-    const first = rows.length ? dataset.indexOf(rows[0]) : 0
     return { series: 'spot-v1', bars: rows, has_more_before: moreBefore, has_more_after: moreAfter,
-        oldest_time: rows[0]?.time ?? null, newest_time: rows.at(-1)?.time ?? null, realtime_enabled: true,
-        indicator_api_version: 1, indicators: rows.length ? await indicatorsFor(first, first + rows.length, dataset.slice()) : {} }
+        oldest_time: rows[0]?.time ?? null, newest_time: rows.at(-1)?.time ?? null, realtime_enabled: true
+    }
 }
 
 // ------------------------------------------------------------ test bridge
@@ -200,9 +174,7 @@ globalThis.__cvd = {
     localHost: () => localHost, localRecords: () => localRecords, localValues: () => localValues, localCompute: () => localCompute,
     faults: () => Object.fromEntries([...localRecords.keys()].map(id => [id, localCompute?.fault(id)]).filter(([, f]) => f)),
     registry: () => ({ plugins: registry.plugins.map(p => p.id), pending: registry.pending.map(p => ({ id: p.id, status: p.status })) }),
-    resync: async () => {}, // server indicator resync retired (browser computes locally)
     epoch: () => baseEpoch,
-    loadIndicators: async () => {}, // server discovery retired: rows come only from local imports
     // Actual LWC series state per plugin (not app-level prefs).
     pluginSeries: id => [...renderers.values()].filter(r => r.output.pluginId === id).map(r => { const s = r.seriesHandle?.(); return { key: r.output.key, visible: !!s && s.options().visible !== false, points: s ? s.data().length : 0 } }),
 }
@@ -233,22 +205,7 @@ function pushLive(bar) {
     else dataset.push(bar)
     const rev = ++baseRev
     for (const socket of sockets) wsSend(socket, JSON.stringify({ series: 'spot-v1', action: 'append', rev, bar }))
-    // Separate, non-blocking indicator frames (as the host's live hub does).
-    const at = index >= 0 ? index : dataset.length - 1
-    const snapshot = dataset.slice(), scope = { ...currentScope }
-    liveFrames = liveFrames.then(() => indicatorsFor(at, at + 1, snapshot, scope)).then(results => {
-        for (const [id, entry] of Object.entries(results)) {
-            const output = entry.modes.source.output
-            if (!output) continue
-            const seq = (liveIndicator.seq.get(id) ?? -1) + 1
-            liveIndicator.seq.set(id, seq)
-            const frame = JSON.stringify({ type: 'indicator', api_version: 1, id, version: entry.version, mode: 'source',
-                generation: liveIndicator.generation, session: liveIndicator.session, seq, as_of_rev: rev, output })
-            for (const socket of sockets) wsSend(socket, frame)
-        }
-    }).catch(error => console.warn('live indicator', error))
 }
-let liveFrames = Promise.resolve()
 
 const html = fs.readFileSync(path.join(SRC, 'index.html'), 'utf8').replace(/<link[^>]*fonts\.(googleapis|gstatic)[^>]*>/g, '')
 const appSource = loadApp()
@@ -259,19 +216,12 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ contract_series: 'contracts-drb-v1', exchanges: [{ exchange: 'binance', markets: ['spot'], symbols: ['BTC'] }] }))
         return
     }
-    if (url.pathname === '/indicators') {
-        if (control.discovery === 'error') { res.writeHead(503); res.end(); return }
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(control.discovery ?? discovery))
-        return
-    }
     if (url.pathname === '/history') {
         const entry = { at: Date.now(), before: url.searchParams.get('before'), after: url.searchParams.get('after'), limit: url.searchParams.get('limit'), tf: url.searchParams.get('tf') }
         control.requests.push(entry)
         if (entry.before && control.beforeDelayMs) await new Promise(r => setTimeout(r, control.beforeDelayMs))
         entry.answeredAt = Date.now()
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
-        noteScope(url.searchParams)
         res.end(JSON.stringify(await historyPage(url.searchParams)))
         return
     }
@@ -364,8 +314,8 @@ async function wheel(deltaY, count, stepMs = 16) {
 
 // ------------------------------------------------------------ scenario setup
 // Browser-local WASM (lane B): the app computes indicators itself from
-// locally imported modules; the oracle envelopes above (shipped worker+host in Node) remain only as
-// the native NUMERICAL ORACLE (and must never be displayed). The REAL public
+// locally imported modules; the Node-side client above only supplies validated
+// descriptors (expected ids/panes) and never produces displayed values. The REAL public
 // CVD/Flow .wasm are imported once per profile through the trusted file input
 // (DOM.setFileInputFiles) and enabled with trusted clicks; IndexedDB keeps
 // them across navigations exactly like a user's browser.
@@ -399,7 +349,6 @@ const EXPECTED_PANES = 1 + new Set(runners.flatMap(r => r.descriptor.outputs.fil
 async function openPage() {
     resetDataset()
     control.beforeDelayMs = 0
-    control.discovery = null
     control.assetFault = null
     control.requests.length = 0
     await call('Page.navigate', { url: `http://127.0.0.1:${PORT}/` })
@@ -936,241 +885,15 @@ const scenarios = {
             tail_rendered: x.tail === last.time + STEP * 5,
         } }
     },
-    async lifecycle_fences() {
-        // Real-browser availability / fencing gate. Frames are hand-sequenced
-        // (generation/session/seq/as_of_rev) but every output VALUE is computed
-        // by the WASM oracle (same public .wasm, shipped host) for the exact bar.
-        const plugin = runners[0].descriptor
-        const outKey = plugin.outputs.find(o => !o.readout_only).key
-        const key = `${plugin.id}/${outKey}`
-        const G = liveIndicator.generation
-        const send = obj => { for (const s of sockets) wsSend(s, JSON.stringify(obj)) }
-        const realOutput = async (at, snapshot = dataset.slice()) => (await indicatorsFor(at, at + 1, snapshot))[plugin.id].modes.source.output
-        const frame = (session, seq, rev, output) => send({ type: 'indicator', api_version: 1, id: plugin.id, version: plugin.version, mode: 'source', generation: G, session, seq, as_of_rev: rev, output })
-        const status = (session, ok) => send({ type: 'indicator_status', id: plugin.id, mode: 'source', generation: G, session, status: ok ? 'ok' : 'unavailable', ...(ok ? {} : { error: { code: 'crashed', message: 'x' } }) })
-        const base = (bar, rev) => send({ series: 'spot-v1', action: 'append', rev, bar })
-        const val = time => evaluate(`__cvd.value(${JSON.stringify(key)}, 'source', ${time})`)
-        const settle = () => sleep(150).then(() => frames(3))
-        const m = await measure(async () => {
-            const x = {}
-            const at = dataset.length - 1, last = dataset[at]
-            const out = await realOutput(at)
-            const v = out.series[outKey].values[0]
-            const R = ++baseRev
-            base(last, R); await settle()
-            x.history_pending_on_newer_base = (await val(last.time)) === undefined
-            frame(10, 0, R - 1, out); await settle()
-            x.stale_rev_pending = (await val(last.time)) === undefined
-            frame(10, 1, R, out); await settle()
-            x.current = await val(last.time); x.expected = v
-            // Real HTTP history overlap (same tuple) must not erase the live value.
-            await evaluate('__cvd.resync()'); await settle()
-            x.after_overlap = await val(last.time)
-            // Changed tuple in a late overlapping response: live stays current.
-            const altered = { ...out, series: { ...out.series, [outKey]: { ...out.series[outKey], values: [v + 12345] } } }
-            // Terminal error, then stale sessions must not revive.
-            status(10, false); await settle()
-            x.err_cleared = (await val(last.time)) === undefined
-            x.err_fault = (await evaluate('__cvd.faults()'))[`${plugin.id}:source`]?.state ?? null
-            frame(9, 99, R, altered); await settle()
-            x.old_session_rejected = (await val(last.time)) === undefined
-            frame(10, 2, R, altered); await settle()
-            x.failed_session_rejected = (await val(last.time)) === undefined
-            // Recovery on a newer session.
-            status(11, true); frame(11, 0, R, out); await settle()
-            x.recovered = await val(last.time)
-            x.fault_cleared = !(await evaluate('__cvd.faults()'))[`${plugin.id}:source`]
-            frame(11, 1, R - 1, altered); await settle()
-            x.older_rev_ignored = await val(last.time)
-            // Output-before-bar: indicator result for a bar the host lacks.
-            const nb = { ...makeBar(dataset.length), time: last.time + STEP }
-            const snap = [...dataset, nb]
-            const nout = await realOutput(snap.length - 1, snap)
-            const before = await evaluate('({ n: __cvd.page.bars.length, last: __cvd.page.bars.at(-1).time, foreign: __cvd.seriesData().some(s => s.data.some(p => p.time === ' + nb.time + ')) })')
-            frame(11, 2, R + 1, nout); await settle()
-            x.buffer_axis = await evaluate('({ n: __cvd.page.bars.length, last: __cvd.page.bars.at(-1).time, foreign: __cvd.seriesData().some(s => s.data.some(p => p.time === ' + nb.time + ')) })')
-            x.buffer_before = before
-            dataset.push(nb); const R2 = ++baseRev; base(nb, R2); await settle()
-            x.buffer_merged = await val(nb.time); x.buffer_expected = nout.series[outKey].values[0]
-            // Hidden: live frames are stored but no chart writes happen.
-            await evaluate('__cvd.setHidden(true)')
-            const hb = await evaluate('JSON.stringify(__cvd.snapshot().calls)')
-            frame(11, 3, R2, nout); await settle()
-            x.hidden_zero_writes = hb === await evaluate('JSON.stringify(__cvd.snapshot().calls)')
-            await evaluate('__cvd.setHidden(false)'); await settle()
-            // Whole-server restart: drop sockets; counters restart low.
-            const epoch0 = await evaluate('__cvd.epoch()')
-            for (const s of [...sockets]) s.destroy()
-            await waitFor('__cvd.epoch() > ' + epoch0 + " && document.getElementById('status').textContent === 'live'", 20000)
-            await sleep(300)
-            send({ series: 'spot-v1', action: 'append', rev: 1, bar: nb }); await settle()
-            send({ type: 'indicator', api_version: 1, id: plugin.id, version: plugin.version, mode: 'source', generation: 1, session: 0, seq: 0, as_of_rev: 1, output: nout }); await settle()
-            x.reconnect_value = await val(nb.time)
-            return x
-        })
-        const x = m.extra
-        return { m, checks: {
-            history_pending_on_newer_base: x.history_pending_on_newer_base,
-            stale_rev_pending: x.stale_rev_pending,
-            current_real_value: x.current === x.expected && Number.isFinite(x.expected),
-            http_overlap_keeps_live: x.after_overlap === x.expected,
-            error_clears: x.err_cleared && x.err_fault === 'unavailable',
-            old_session_cannot_revive: x.old_session_rejected,
-            failed_session_terminal: x.failed_session_rejected,
-            newer_session_recovers: x.recovered === x.expected && x.fault_cleared,
-            older_rev_ignored: x.older_rev_ignored === x.expected,
-            output_before_bar_no_axis_growth: x.buffer_axis.n === x.buffer_before.n && x.buffer_axis.last === x.buffer_before.last && !x.buffer_axis.foreign,
-            buffered_merge_on_bar: x.buffer_merged === x.buffer_expected,
-            hidden_zero_writes: x.hidden_zero_writes,
-            reconnect_counters_restart: x.reconnect_value === x.buffer_expected,
-        } }
-    },
-    async history_coherence() {
-        // Base bar and derived result are ONE admission decision: whenever the
-        // public CVD result is shown it must equal the DISPLAYED canonical
-        // cvd_usdt. Values come from the WASM oracle (same public .wasm) via
-        // the real /history path (resync) and real typed WS frames.
-        const cvd = runners.find(r => r.descriptor.id === 'cvd')
-        if (!cvd) return { m: null, checks: { cvd_library_loaded: false } }
-        const G = liveIndicator.generation
-        const send = obj => { for (const s of sockets) wsSend(s, JSON.stringify(obj)) }
-        const realOutput = async (at, snapshot) => (await indicatorsFor(at, at + 1, snapshot))[cvd.descriptor.id].modes.source.output
-        let seq = 0
-        const SESSION = 50
-        const frame = (rev, output) => send({ type: 'indicator', api_version: 1, id: 'cvd', version: cvd.descriptor.version, mode: 'source', generation: G, session: SESSION, seq: seq++, as_of_rev: rev, output })
-        const base = (bar, rev) => send({ series: 'spot-v1', action: 'append', rev, bar })
-        const settle = () => sleep(150).then(() => frames(3))
-        const state = time => evaluate(`(() => { const b = __cvd.page.bars.find(b => b.time === ${time}); const s = __cvd.seriesData().flatMap(x => x.data).filter(p => p.time === ${time}); return { base: b?.cvd_usdt, indicator: __cvd.value('cvd/cvd', 'source', ${time}) } })()`)
-        const coherent = s => s.indicator === undefined || s.indicator === s.base
-        const m = await measure(async () => {
-            const x = {}
-            const at = dataset.length - 1, orig = { ...dataset[at] }, t = orig.time
-            // live proof at rev R
-            const R = ++baseRev
-            base(orig, R); frame(R, await realOutput(at, dataset.slice())); await settle()
-            x.live = await state(t)
-            // same tuple HTTP overlap keeps live
-            await evaluate('__cvd.resync()'); await settle()
-            x.same = await state(t)
-            // revised canonical tuple accepted from history (parent repro)
-            dataset[at] = { ...orig, cvd_usdt: orig.cvd_usdt + 100 }
-            await evaluate('__cvd.resync()'); await settle()
-            x.revised = await state(t); x.revised_expected = orig.cvd_usdt + 100
-            // delayed stale live base + result (rev <= superseded) cannot revive
-            base(orig, R); frame(R, await realOutput(at, [...dataset.slice(0, at), orig])); await settle()
-            x.delayed = await state(t)
-            // output-before-base: newer result pending until its base displays
-            const newer = { ...orig, cvd_usdt: orig.cvd_usdt + 300 }
-            const R2 = ++baseRev
-            frame(R2, await realOutput(at, [...dataset.slice(0, at), newer])); await settle()
-            x.out_before_base = await state(t)
-            base(newer, R2); await settle()
-            x.restored = await state(t); x.restored_expected = newer.cvd_usdt
-            // history response after newer live (dataset still +100 tuple)
-            await evaluate('__cvd.resync()'); await settle()
-            x.late_history = await state(t)
-            // metadata-only: same-value result before base, then identical base at newer rev
-            const shownBar = await evaluate(`({ ...__cvd.page.bars.find(b => b.time === ${t}) })`)
-            const R3 = ++baseRev
-            frame(R3, await realOutput(at, [...dataset.slice(0, at), shownBar])); await settle()
-            const rendered = () => evaluate(`__cvd.seriesHandle('cvd/cvd').data().some(p => p.time === ${t} && p.value === ${shownBar.cvd_usdt})`)
-            x.meta_pending = await state(t)
-            base(shownBar, R3); await settle()
-            x.meta_after = await state(t); x.meta_expected = shownBar.cvd_usdt; x.meta_rendered = await rendered()
-            // ORDINARY live -> future result -> base (no historical supersede):
-            // as_of_rev above every observed base rev stays pending.
-            const shownVal = v => evaluate(`__cvd.seriesData().flatMap(x => x.data).filter(p => p.time === ${t}).map(p => p.value)`)
-            const fut = { ...shownBar, cvd_usdt: shownBar.cvd_usdt + 500 }
-            const R4 = ++baseRev
-            frame(R4, await realOutput(at, [...dataset.slice(0, at), fut])); await settle()
-            x.future_pending = await state(t); x.future_rendered = await shownVal(t)
-            base(fut, R4); await settle()
-            x.future_after = await state(t); x.future_expected = fut.cvd_usdt; x.future_rendered_after = await shownVal(t)
-            // same again while HIDDEN: zero-write hide, repaint on restore
-            const fut2 = { ...fut, cvd_usdt: fut.cvd_usdt + 50 }
-            const R5 = ++baseRev
-            await evaluate('__cvd.setHidden(true)')
-            frame(R5, await realOutput(at, [...dataset.slice(0, at), fut2])); await settle()
-            x.hidden_pending = await state(t)
-            base(fut2, R5); await settle()
-            await evaluate('__cvd.setHidden(false)'); await settle()
-            x.hidden_after = await state(t); x.hidden_expected = fut2.cvd_usdt; x.hidden_rendered = await shownVal(t)
-            dataset[at] = orig
-            return x
-        })
-        const x = m.extra
-        return { m, checks: {
-            live_coherent: x.live.indicator === x.live.base && Number.isFinite(x.live.base),
-            same_tuple_keeps_live: x.same.indicator === x.same.base && x.same.base === x.live.base,
-            revised_tuple_coherent: x.revised.base === x.revised_expected && x.revised.indicator === x.revised_expected,
-            delayed_stale_rejected: x.delayed.base === x.revised_expected && coherent(x.delayed),
-            output_before_base_pending: x.out_before_base.base === x.revised_expected && coherent(x.out_before_base),
-            matching_base_restores: x.restored.base === x.restored_expected && x.restored.indicator === x.restored_expected,
-            late_history_coherent: coherent(x.late_history) && x.late_history.indicator !== undefined,
-            future_result_pending: x.future_pending.indicator === undefined && x.future_pending.base === x.meta_expected && !x.future_rendered.includes(x.future_expected),
-            future_matching_base_repaints: x.future_after.base === x.future_expected && x.future_after.indicator === x.future_expected && x.future_rendered_after.includes(x.future_expected),
-            hidden_future_pending: x.hidden_pending.indicator === undefined,
-            hidden_restore_coherent: x.hidden_after.base === x.hidden_expected && x.hidden_after.indicator === x.hidden_expected && x.hidden_rendered.includes(x.hidden_expected),
-            metadata_only_base_repaints: x.meta_pending.indicator === undefined && x.meta_after.indicator === x.meta_expected && x.meta_rendered,
-        }, extra: x }
-    },
-    async discovery_states() {
-        // starting -> ready, failed (error) and a missing/unknown plugin id.
-        const id = runners[0].descriptor.id
-        const entry = discovery.indicators.find(i => i.id === id)
-        const nav = async () => {
-            await call('Page.navigate', { url: `http://127.0.0.1:${PORT}/` })
-            await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
-            await frames(3)
-        }
-        // Navigation replaces the page, so the RAF recorder of measure() cannot
-        // span this scenario; collect state directly.
-        const m = { calls: {}, requests: [], setBarsMs: [], longTasks: [], frames: [], coverageMisses: 0, wallMs: 0, input: {}, extra: await (async () => {
-            const x = {}
-            control.discovery = { ...discovery, indicators: discovery.indicators.map(i => i.id === id ? { id, status: 'starting', modes: i.modes, version: null, descriptor: null, error: null, restarts: 0 } : i) }
-            await nav()
-            x.starting = await evaluate('__cvd.registry()')
-            x.startingPanes = await evaluate('__cvd.chart.panes().length')
-            control.discovery = null
-            await waitFor(`__cvd.registry().plugins.includes(${JSON.stringify(id)})`, 15000)
-            await sleep(500); await frames(3)
-            x.readyPanes = await evaluate('__cvd.chart.panes().length')
-            x.readyValue = await evaluate(`__cvd.value(${JSON.stringify(`${id}/${entry.descriptor.outputs.find(o => !o.readout_only).key}`)}, 'source', __cvd.page.bars.at(-1).time)`)
-            control.discovery = { ...discovery, indicators: discovery.indicators.map(i => i.id === id ? { ...i, status: 'failed', descriptor: null, error: { code: 'load_failed', message: 'x' } } : i) }
-            await nav()
-            x.failed = await evaluate('__cvd.registry()')
-            x.failedPanes = await evaluate('__cvd.chart.panes().length')
-            control.discovery = { ...discovery, indicators: discovery.indicators.filter(i => i.id !== id) }
-            await nav()
-            for (const s of sockets) wsSend(s, JSON.stringify({ type: 'indicator', api_version: 1, id: 'not.installed', version: '1', mode: 'source', generation: liveIndicator.generation, session: 1, seq: 0, as_of_rev: 0, output: { times: [], series: {} } }))
-            await sleep(300); await frames(3)
-            x.missing = await evaluate('__cvd.registry()')
-            x.missingStatus = await evaluate(`document.getElementById('status').textContent`)
-            control.discovery = null
-            return x
-        })() }
-        const x = m.extra
-        return { m, checks: {
-            starting_pending: x.starting.pending.some(p => p.id === id && p.status === 'starting') && !x.starting.plugins.includes(id),
-            starting_to_ready: x.readyPanes > x.startingPanes && x.readyPanes === EXPECTED_PANES && Number.isFinite(x.readyValue),
-            failed_pending_price_kept: x.failed.pending.some(p => p.id === id && p.status === 'failed') && x.failedPanes < EXPECTED_PANES && x.failedPanes >= 1,
-            missing_plugin_harmless: !x.missing.plugins.includes(id) && !x.missing.plugins.includes('not.installed') && x.missingStatus === 'live',
-        } }
-    },
     async indicator_menu() {
         // Compact indicator multiselect, driven ONLY by trusted CDP pointer
-        // and key input. Rows for 'cvd'/'flow' etc. come from REAL public
-        // plugin descriptors validated by the shipped host; rows named synthetic.* are
-        // SYNTHETIC discovery entries (pending/failed/overflow) served by the
-        // loopback /indicators fixture and never computed.
+        // and key input. Rows come only from REAL public plugin .wasm imported
+        // locally and validated by the shipped host (no server discovery).
         const shots = path.join(OUT, 'indicator-menu')
         fs.mkdirSync(shots, { recursive: true })
         const shot = async name => { const r = await call('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(shots, name + '.png'), Buffer.from(r.data, 'base64')); return name + '.png' }
         const failures = []
-        // Checks whose fixture was the retired SERVER discovery (reordered/pending/failed/error rows, 40 synthetic
-        // descriptor-less rows): no such rows can exist for local packages. Recorded as retired, never as passed.
-        const RETIRED_CHECKS = /^(kb_reordered_uses_rendered_order|kb_all_disabled_leaves_trigger|kb_empty_leaves_trigger|pending_failed_rows_disabled|error_empty_understandable|.*_scrollable_bounded)$/
-        const check = (name, ok, detail) => { if (RETIRED_CHECKS.test(name)) { (x.details.retired ??= []).push(name); return } x.checks[name] = !!ok; if (!ok) failures.push(name + ' ' + JSON.stringify(detail ?? null).slice(0, 400)) }
+        const check = (name, ok, detail) => { x.checks[name] = !!ok; if (!ok) failures.push(name + ' ' + JSON.stringify(detail ?? null).slice(0, 400)) }
         const x = { checks: {}, screenshots: [], details: {} }
         const S = `document.querySelector('#plugin-controls > button')`
         const state = () => evaluate(`(() => { const t = ${S}, p = document.getElementById('plugin-menu'), r = p.getBoundingClientRect()
@@ -1228,7 +951,7 @@ const scenarios = {
             x.details.importPicker = { dom: pick, chooser: ev && { mode: ev.mode } }
             if ((await state()).open) await key('Escape', 'Escape', 27)
         }
-        // NORMAL state with REAL ready plugin rows only (before any synthetic rows).
+        // NORMAL state with REAL ready plugin rows.
         for (const scheme of ['dark', 'light']) {
             await call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] }); await frames(4)
             await shot(`normal-closed-${scheme}`); x.screenshots.push(`normal-closed-${scheme}.png`)
@@ -1321,23 +1044,7 @@ const scenarios = {
             r.backward = { b0, b1, b2 }
             // pure keyboard traversal ends here: no fetch/WS/range change allowed
             r.end = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades }
-            // (the discovery fixture swaps below deliberately refetch /indicators; excluded from the no-reload check)
-            // reordered discovery (real rows reversed): first/last follow rendered order
-            control.discovery = { ...discovery, indicators: [...discovery.indicators].reverse() }
-            await evaluate('__cvd.loadIndicators()'); await frames(3)
-            r.reorderedRows = (await state()).rows.map(q => q.id)
-            r.reordered = await travel()
-            // all-disabled (synthetic pending only) and empty (discovery error)
-            control.discovery = { api_version: 1, indicators: [{ id: 'synthetic.pending', status: 'starting', descriptor: null, error: null }] }
-            await evaluate('__cvd.loadIndicators()'); await frames(3)
-            r.allDisabled = await travel()
-            control.discovery = 'error'
-            await evaluate('__cvd.loadIndicators()'); await frames(3)
-            r.empty = await travel()
-            control.discovery = null
-            await evaluate('__cvd.loadIndicators()'); await frames(3)
             r.enabledIds = enabledIds
-            r.afterFixtures = { time: await evaluate('__cvd.timeRange()'), logical: await evaluate('__cvd.range()'), requests: control.requests.length, ws: control.wsUpgrades }
             r.before = before
             return r
         })
@@ -1347,11 +1054,7 @@ const scenarios = {
         check('kb_neighbours_known', !!nbr.prev && !!nbr.next, nbr)
         check('kb_forward_rows_then_next_control', JSON.stringify(path_(kb.forward).filter((v, i, a) => v !== a[i - 1])) === JSON.stringify(['trigger', ...kb.enabledIds, 'BUTTON', nbr.next]) /* each row: checkbox + its Remove/Params actions (same row id), then Import .wasm, then next control */ && kb.forward[0].open && !kb.forward.at(-1).open && kb.forward.slice(0, -1).every(q => q.open), kb.forward)
         check('kb_backward_first_to_trigger_to_prev', kb.backward.b0 === kb.enabledIds[0] && kb.backward.b1.at === 'trigger' && kb.backward.b1.open && kb.backward.b2.at === nbr.prev && !kb.backward.b2.open, kb.backward)
-        check('kb_reordered_uses_rendered_order', JSON.stringify(kb.reorderedRows) === JSON.stringify([...realIds].reverse()) && JSON.stringify(path_(kb.reordered)) === JSON.stringify(['trigger', ...[...realIds].reverse(), nbr.next]) && !kb.reordered.at(-1).open, { rows: kb.reorderedRows, path: kb.reordered })
-        check('kb_all_disabled_leaves_trigger', JSON.stringify(path_(kb.allDisabled)) === JSON.stringify(['trigger', nbr.next]) && kb.allDisabled[0].open && !kb.allDisabled.at(-1).open, kb.allDisabled)
-        check('kb_empty_leaves_trigger', JSON.stringify(path_(kb.empty)) === JSON.stringify(['trigger', nbr.next]) && kb.empty[0].open && !kb.empty.at(-1).open, kb.empty)
         check('kb_no_reload_range_kept', JSON.stringify(kb.before.time) === JSON.stringify(kb.end.time) && JSON.stringify(kb.before.logical) === JSON.stringify(kb.end.logical) && kb.end.requests === kb.before.requests && kb.end.ws === kb.before.ws, { before: kb.before, end: kb.end })
-        check('kb_fixture_swaps_keep_range', JSON.stringify(kb.before.time) === JSON.stringify(kb.afterFixtures.time) && !(kbm.calls.setVisibleLogicalRange > 0) && kb.afterFixtures.ws === kb.before.ws, { calls: kbm.calls, afterFixtures: kb.afterFixtures })
 
         // 5. persistence across reload (prefs as left: only realIds[0] on)
         const expected = (await state()).rows.map(r => [r.id, r.checked])
@@ -1407,34 +1110,14 @@ const scenarios = {
         await evaluate(`sessionStorage.removeItem('cvd_keep_prefs')`)
         await evaluate(`__menuTrusted = { n: 0, untrusted: 0 }; for (const t of ['pointerdown', 'click', 'keydown', 'change']) document.addEventListener(t, e => { __menuTrusted.n++; if (!e.isTrusted) __menuTrusted.untrusted++ }, true)`)
 
-        // 6. pending / failed / error / recovered while open, focus preserved
+        // 6. focused real row: Escape still closes and returns focus to the trigger
         await click(S)
         await click(row(realIds[0])); await click(row(realIds[0])) // focus a real row, state unchanged
-        const real = discovery.indicators
-        control.discovery = { api_version: 1, indicators: [...real,
-            { id: 'synthetic.pending', status: 'starting', descriptor: null, error: null },
-            { id: 'synthetic.failed', status: 'failed', descriptor: null, error: { code: 'incompatible', message: '/srv/private/lib.so' } }] }
-        await evaluate('__cvd.loadIndicators()'); await frames(3)
-        const pend = await state()
-        check('pending_failed_rows_disabled', ['synthetic.pending', 'synthetic.failed'].every(id => pend.rows.find(r => r.id === id)?.disabled) && /starting/.test(pend.rows.find(r => r.id === 'synthetic.pending').meta) && /failed incompatible/.test(pend.rows.find(r => r.id === 'synthetic.failed').meta) && !JSON.stringify(pend.rows).includes('/srv/private'), pend.rows)
-        check('rerender_keeps_open_and_focus', pend.open && pend.active === realIds[0], { open: pend.open, active: pend.active })
-        await shot('pending-failed-open'); x.screenshots.push('pending-failed-open.png')
-        control.discovery = 'error'
-        await evaluate('__cvd.loadIndicators()'); await frames(3)
-        const err = await state()
-        check('error_empty_understandable', err.open && err.rows.length === 0 && /No indicators available/.test(err.empty ?? '') && err.label.includes('Indicators · 0'), err)
-        await shot('discovery-error-open'); x.screenshots.push('discovery-error-open.png')
-        control.discovery = null
-        await evaluate('__cvd.loadIndicators()'); await frames(3)
-        const rec = await state()
-        check('recovered_rows_back_open', rec.open && JSON.stringify(rec.rows.map(r => r.id)) === JSON.stringify(realIds) && rec.empty === null, rec)
         await key('Escape', 'Escape', 27)
         const recClosed = await state()
-        check('escape_closes_after_focused_row_removed', !recClosed.open && recClosed.active === 'trigger', recClosed.active)
+        check('escape_closes_from_focused_row', !recClosed.open && recClosed.active === 'trigger', recClosed.active)
 
-        // 7. many / long SYNTHETIC rows: bounded + scrollable, per viewport/theme
-        control.discovery = { api_version: 1, indicators: [...real, ...Array.from({ length: 40 }, (_, i) => ({ id: `synthetic.overflow-long-descriptor-label-for-wrap-check-${String(i).padStart(2, '0')}`, status: 'starting', descriptor: null, error: null }))] }
-        await evaluate('__cvd.loadIndicators()'); await frames(3)
+        // 7. real rows per viewport/theme: in viewport, on top, legible, toolbar overflow kept
         const views = [['desktop', 1440, 900], ['narrow', 390, 844], ['short', 900, 420]]
         for (const [vname, w, h] of views) {
             await call('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false })
@@ -1452,16 +1135,10 @@ const scenarios = {
                     return { scrollable: l.scrollHeight > l.clientHeight, onTop: p.contains(hit), contrast: (a + 0.05) / (b + 0.05), fg, bg,
                         barOverflow: getComputedStyle(document.querySelector('.bar')).overflow, barMax: getComputedStyle(document.querySelector('.bar')).maxHeight } })()`)
                 const inView = st.rect.left >= 0 && st.rect.top >= 0 && st.rect.right <= st.vw && st.rect.bottom <= st.vh && st.rect.height > 60
-                // trusted wheel scroll inside the list
-                const lc = await evaluate(`(() => { const r = document.querySelector('#plugin-menu .plugin-menu-list').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 } })()`)
-                for (let i = 0; i < 4; i++) await call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: lc.x, y: lc.y, deltaX: 0, deltaY: 200 })
-                await sleep(150); await frames(3)
-                const scrolled = await evaluate(`document.querySelector('#plugin-menu .plugin-menu-list').scrollTop`)
                 const name = `${vname}-${scheme}`
-                x.details[name] = { rect: st.rect, vw: st.vw, vh: st.vh, ...geo, scrolled, open: st.open }
+                x.details[name] = { rect: st.rect, vw: st.vw, vh: st.vh, ...geo, open: st.open }
                 check(`${name}_open_in_viewport`, st.open && inView, x.details[name])
                 check(`${name}_not_clipped_on_top`, geo.onTop, x.details[name])
-                check(`${name}_scrollable_bounded`, geo.scrollable && scrolled > 0, x.details[name])
                 check(`${name}_legible_contrast`, geo.contrast >= 4.5, x.details[name])
                 check(`${name}_toolbar_overflow_kept`, geo.barOverflow === 'auto' && geo.barMax !== 'none', x.details[name])
                 await shot(name); x.screenshots.push(name + '.png')
@@ -1482,11 +1159,80 @@ const scenarios = {
         check('toolbar_scroll_reposition_in_viewport', post.open && post.rect.top >= 0 && post.rect.bottom <= post.vh && (scrollRes.moved === 0 || Math.abs(post.rect.top - pre.rect.top) > 0 || Math.abs(post.rect.bottom - pre.rect.bottom) > 0), x.details.toolbar_scroll)
         await shot('short-toolbar-scrolled'); x.screenshots.push('short-toolbar-scrolled.png')
         await key('Escape', 'Escape', 27)
+        // Current-layout guards (successor of tests/browser-toolbar-layout.py).
+        // Old intent -> assertion here (see review mapping):
+        //  root never scrolls/overflows (x,y,sw,sh)        -> short/tiny_document_never_scrolls
+        //  toolbar top visible, chart below toolbar        -> short_toolbar_and_chart_order
+        //  chart >= CSS min height (derived, not literal)  -> short/tiny_chart_min_height
+        //  chart inside #wrap, canvases inside chart       -> short_chart_contained
+        //  panes readable >= pane control height + 16      -> short_panes_readable (panes from descriptors)
+        //  trusted wheel at toolbar/chart gutter           -> short_wheel_never_scrolls_root
+        //  every toolbar control reachable/hit             -> short_toolbar_controls_reachable
+        //  every pane control reachable/hit (via #wrap)    -> short/tiny_pane_controls_reachable
+        //  below combined minimum only #wrap scrolls       -> tiny_wrap_scrolls_internally
+        const geom = `(() => { const r = e => { const b = e.getBoundingClientRect(); return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, width: b.width, height: b.height } }
+            const de = document.documentElement, bar = document.querySelector('.bar'), wrap = document.getElementById('wrap'), chart = document.getElementById('chart')
+            const paneCtl = [...document.querySelectorAll('#pane-labels select, #pane-labels button, #pane-labels input')].filter(e => e.getClientRects().length)
+            return { doc: { x: scrollX, y: scrollY, sw: de.scrollWidth, sh: de.scrollHeight, vw: innerWidth, vh: innerHeight },
+                bar: r(bar), wrap: { ...r(wrap), scrollTop: wrap.scrollTop, sh: wrap.scrollHeight, ch: wrap.clientHeight }, chart: r(chart),
+                chartMin: parseFloat(getComputedStyle(chart).minHeight), cssVar: getComputedStyle(de).getPropertyValue('--chart-min-height').trim(),
+                canvases: [...chart.querySelectorAll('canvas')].filter(c => c.width > 0 && c.height > 0).map(r),
+                panes: __cvd.chart.panes().map(p => p.getHeight()),
+                paneCtlMax: Math.max(0, ...paneCtl.map(e => e.getBoundingClientRect().height)), paneCtl: paneCtl.length } })()`
+        const docStill = d => Math.abs(d.x) <= 1 && Math.abs(d.y) <= 1 && d.sw <= d.vw + 1 && d.sh <= d.vh + 1
+        // Pane controls (rendered from descriptors) reachable by #wrap-internal scrolling only.
+        const paneReach = `(() => { const bad = []; let rootMoved = false
+            for (const c of document.querySelectorAll('#pane-labels select, #pane-labels button, #pane-labels input')) { if (!c.getClientRects().length) continue
+                c.scrollIntoView({ block: 'nearest', inline: 'nearest' }); const b = c.getBoundingClientRect(), h = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2)
+                if (Math.abs(scrollX) > 1 || Math.abs(scrollY) > 1) rootMoved = true
+                if (b.top < 0 || b.bottom > innerHeight || b.left < 0 || b.right > innerWidth || !(h && (h === c || c.contains(h)))) bad.push(c.dataset.group || c.id || c.tagName) }
+            const wrapTop = document.getElementById('wrap').scrollTop; document.getElementById('wrap').scrollTop = 0
+            return { bad, rootMoved, wrapTop } })()`
+        const layout = await evaluate(`(() => { const b = document.querySelector('.bar'), out = { unreachable: [] }
+            for (const c of b.querySelectorAll('button,select,input:not([type=file]),label.toggle')) { if (!c.offsetParent) continue
+                c.scrollIntoView({ block: 'nearest', inline: 'nearest' }); const r = c.getBoundingClientRect(), br = b.getBoundingClientRect()
+                const h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)
+                if (r.bottom > innerHeight || r.top < Math.max(0, br.top) - 1 || r.left < 0 || r.right > innerWidth + 1 || !(h && (c === h || c.contains(h) || h.contains(c) || c.closest('label')?.contains(h)))) out.unreachable.push(c.id || c.className || c.tagName) }
+            out.rootAfterToolbar = { x: scrollX, y: scrollY }; b.scrollTop = 0
+            return out })()`)
+        await frames(2)
+        const g = await evaluate(geom)
+        const paneShort = await evaluate(paneReach)
+        // Trusted wheel at the toolbar gutter and chart edge must not move the root (chart range restored after).
+        const range0 = await evaluate(`__cvd.range()`)
+        for (const [wx, wy] of [[g.doc.vw - 3, Math.min(g.doc.vh - 2, g.bar.top + 3)], [g.doc.vw - 3, Math.min(g.doc.vh - 2, g.chart.top + 10)]]) {
+            await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: wx, y: wy })
+            await call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: wx, y: wy, deltaX: 0, deltaY: 600 }); await sleep(60) }
+        const wheelRoot = await evaluate(`({ x: scrollX, y: scrollY, sw: document.documentElement.scrollWidth, sh: document.documentElement.scrollHeight, vw: innerWidth, vh: innerHeight })`)
+        await evaluate(`(() => { document.querySelector('.bar').scrollTop = 0; document.getElementById('wrap').scrollTop = 0; scrollTo(0, 0); __cvd.setRange(${JSON.stringify(range0)}) })()`)
+        x.details.short_layout = { ...layout, geometry: g, paneReach: paneShort, wheelRoot }
+        check('short_document_never_scrolls', docStill(g.doc) && Math.abs(layout.rootAfterToolbar.x) <= 1 && Math.abs(layout.rootAfterToolbar.y) <= 1, { doc: g.doc, after: layout.rootAfterToolbar })
+        check('short_toolbar_controls_reachable', layout.unreachable.length === 0, layout.unreachable)
+        check('short_toolbar_and_chart_order', g.bar.top >= -1 && g.chart.top >= g.bar.bottom - 1, { bar: g.bar, chart: g.chart })
+        check('short_chart_min_height', g.chartMin > 0 && g.cssVar === `${g.chartMin}px` && g.chart.height >= g.chartMin - 1, { min: g.chartMin, cssVar: g.cssVar, h: g.chart.height })
+        check('short_chart_contained', g.canvases.length > 0 && g.chart.left >= g.wrap.left - 1 && g.chart.right <= g.wrap.right + 1 && g.chart.right <= g.doc.vw + 1
+            && g.canvases.every(c => c.left >= g.chart.left - 1 && c.right <= g.chart.right + 1 && c.top >= g.chart.top - 1 && c.bottom <= g.chart.bottom + 1), { chart: g.chart, wrap: g.wrap, canvases: g.canvases })
+        check('short_panes_readable', g.panes.length === EXPECTED_PANES && g.paneCtl > 0 && g.panes.every(h => h >= g.paneCtlMax + 16), { panes: g.panes, ctl: g.paneCtlMax, n: g.paneCtl })
+        check('short_pane_controls_reachable', paneShort.bad.length === 0 && !paneShort.rootMoved, paneShort)
+        check('short_wheel_never_scrolls_root', docStill(wheelRoot), wheelRoot)
+        // Below the combined minimum only #wrap may scroll (chart keeps its minimum).
+        await call('Emulation.setDeviceMetricsOverride', { width: 520, height: 240, deviceScaleFactor: 1, mobile: false })
+        await frames(4)
+        const tg = await evaluate(geom)
+        const paneTiny = await evaluate(paneReach)
+        await evaluate(`(() => { document.querySelector('.bar').scrollTop = 0; document.getElementById('wrap').scrollTop = 0; scrollTo(0, 0) })()`)
+        x.details.tiny_layout = { geometry: tg, paneReach: paneTiny }
+        check('tiny_document_never_scrolls', docStill(tg.doc) && tg.bar.top >= -1, tg.doc)
+        check('tiny_chart_min_height', tg.chart.height >= tg.chartMin - 1, { min: tg.chartMin, h: tg.chart.height })
+        check('tiny_wrap_scrolls_internally', tg.wrap.sh > tg.wrap.ch + 1 && paneTiny.wrapTop > 0, { wrap: tg.wrap, wrapTop: paneTiny.wrapTop })
+        check('tiny_pane_controls_reachable', paneTiny.bad.length === 0 && !paneTiny.rootMoved, paneTiny)
+        await call('Emulation.setDeviceMetricsOverride', { width: 520, height: 360, deviceScaleFactor: 1, mobile: false })
+        await frames(4)
         // Visual viewport (Chromium pinch-zoom via trusted CDP gesture): the
         // open popup must lie inside the VISIBLE region incl. its offset.
         // Real browser coverage in headless Chromium only (not Safari/iOS).
         await call('Emulation.setDeviceMetricsOverride', { width: 1000, height: 700, deviceScaleFactor: 1, mobile: false })
-        control.discovery = null; await evaluate('__cvd.loadIndicators()'); await frames(4)
+        await frames(4)
         await click(S)
         const tr0 = await evaluate(`(() => { const r = ${S}.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.bottom + 120 } })()`)
         // Zoom the visual viewport (page scale) and pan it with trusted wheel
@@ -1506,11 +1252,10 @@ const scenarios = {
         await call('Emulation.resetPageScaleFactor', {}).catch(() => {}); await frames(3)
         await call('Emulation.setDeviceMetricsOverride', { width: VIEW.width, height: VIEW.height, deviceScaleFactor: VIEW.deviceScaleFactor, mobile: false })
         await call('Emulation.setEmulatedMedia', { features: [] })
-        control.discovery = null
         const tr = await evaluate('__menuTrusted')
         check('all_menu_input_trusted', trusted && tr.n > 0 && tr.untrusted === 0, tr)
         x.failures = failures
-        fs.writeFileSync(path.join(shots, 'indicator-menu-results.json'), JSON.stringify({ label: 'Headless Chromium (not Safari). Rows cvd/flow-style ids come from REAL public .wasm validated by the shipped host; synthetic.* rows are SYNTHETIC loopback discovery entries.', real_ids: realIds, ...x, toggle_measure: { requests: m.requests.length, calls: m.calls, before: t.before, end: t.end } }, null, 1))
+        fs.writeFileSync(path.join(shots, 'indicator-menu-results.json'), JSON.stringify({ label: 'Headless Chromium (not Safari). Rows cvd/flow-style ids come from REAL public .wasm validated by the shipped host; no synthetic discovery rows.', real_ids: realIds, ...x, toggle_measure: { requests: m.requests.length, calls: m.calls, before: t.before, end: t.end } }, null, 1))
         if (failures.length) console.log('indicator_menu failures:\n  ' + failures.join('\n  '))
         return { m, checks: x.checks }
     },
@@ -1557,21 +1302,15 @@ try {
     await call('Page.addScriptToEvaluateOnNewDocument', { source: `if (!sessionStorage.getItem('cvd_keep_prefs')) localStorage.setItem('cvd_prefs_v1', JSON.stringify({ exchange: 'binance', symbol: 'BTC', market: 'spot', tf: '1m', showRd: true, showKd: true, showFd: true, showHd: true, showLevels: true, showAgg: false, flowMode: 'delta' }))` })
     const unknown = [...(ONLY ?? [])].filter(name => !(name in scenarios))
     if (unknown.length) throw new Error(`unknown CVD_SCENARIOS: ${unknown.join(',')}`)
-    // Scenarios whose subject was the SERVER indicator transport (typed WS
-    // indicator frames, as_of_rev/session fences, /indicators discovery
-    // states). The browser no longer consumes those envelopes, so they are
-    // explicitly RETIRED (listed in results, never silently skipped). Their
-    // invariants moved to the browser boundary: scope/revision/instance fences,
-    // stale-result rejection, fault isolation and no-stale-paint are asserted by
-    // tests/local-plugins.test.mjs and tests/local-wasm-browser.mjs.
-    const RETIRED = { lifecycle_fences: 'server indicator frame fences', history_coherence: 'server history/live indicator coherence', discovery_states: 'server /indicators discovery states' }
-    results.retired = RETIRED
+    // The former server-transport scenarios (lifecycle_fences, history_coherence,
+    // discovery_states) were removed; their names are now unknown and fail above.
+    // Browser-boundary fences are asserted by tests/local-plugins.test.mjs and
+    // tests/local-wasm-browser.mjs.
     // A requested scenario that does not exist (e.g. coverage without the
     // ctxdemo fixture) is a failure, never a silent skip.
-    for (const name of ONLY ?? []) if (!scenarios[name] && !RETIRED[name]) { failed = true; console.log(`${name}: MISSING (not defined in this run)`) }
+    for (const name of ONLY ?? []) if (!scenarios[name]) { failed = true; console.log(`${name}: MISSING (not defined in this run)`) }
     for (const [name, run] of Object.entries(scenarios)) {
         if (ONLY && !ONLY.has(name)) continue
-        if (RETIRED[name]) { console.log(`${name}: RETIRED (${RETIRED[name]}; see B-browser.md)`); continue }
         const reps = []
         for (let rep = 0; rep < REPS; rep++) {
             if (COVERAGE.includes(name)) await openFresh(); else { control.tfGrid = false; await openPage() }

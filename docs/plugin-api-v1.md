@@ -222,9 +222,9 @@ bytes and never contain host paths, stderr, or raw OS errors.
 | hang | killed at deadline | `timeout`, same as crash |
 | bad ABI / missing symbol / bad descriptor | handshake `Error`, exits | `incompatible`, indicator marked failed |
 
-## 9. Testing
+## 9. Testing (historical)
 
-`cargo test -p cvd-indicator-host` builds the real runner, the sample library,
-the fault-injection fixture (`tests/fixtures/plugins/fault-indicator`: error,
-panic, abort, segfault, hang, bad output, stdout noise, create failure) and a
-wrong-ABI library, then exercises them as real processes.
+The native runner, its `cvd-indicator-host` crate and the fault-injection
+fixture no longer exist, so the former `cargo test -p cvd-indicator-host`
+command cannot be run. Current coverage of the WASM contract lives with
+[`plugin-wasm-v1.md`](plugin-wasm-v1.md) and the browser-host tests.

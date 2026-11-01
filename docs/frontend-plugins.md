@@ -76,8 +76,9 @@ Push/PR CI is browser-free; real-browser checks (`*.browser.mjs`, the foundation
 Worker smoke, `core-app-gate.sh`) run locally and on manual `workflow_dispatch`.
 
 `tests/browser-interaction.mjs` imports real `.wasm` through the app's file
-input (`CVD_LOCAL_WASM`) and checks numbers against `tests/wasm-oracle-client.mjs`
-(the shipped `plugin-worker.js` + host wasm in Node; no native runner):
+input (`CVD_LOCAL_WASM`); the loopback fixture serves base bars only, and
+`tests/wasm-oracle-client.mjs` (the shipped `plugin-worker.js` + host wasm in
+Node) only supplies host-validated descriptors for the expected plugins/panes:
 
 ```sh
 # clean core (own builds, TEST-ONLY cvd/flow fixtures):

@@ -1,8 +1,8 @@
-// Generic plugin UI behaviour against the ACTUAL host envelopes. Cases marked
-// "real fixture" consume tests/fixtures/plugin-web.json, produced by
-// cvd-indicators/conformance/src/bin/web-fixture.rs: real public cdylib output
-// (retired) computed by the former native runner, wrapped in the host's
-// /indicators, /history and typed /ws envelopes.
+// Generic plugin UI behaviour on the real app.js. tests/fixtures/plugin-web.json
+// holds small hand-made host envelopes (/indicators discovery shape, /history
+// base bars, one live append, one legacy server indicator frame that must be
+// ignored); its values are synthetic, not an independent numerical oracle.
+// Scope-change clearing of local results is covered in tests/local-compute.test.mjs.
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
@@ -62,14 +62,6 @@ test('backbone regression: hidden numerical-zero scaffolding (not whitespace), e
     assert.deepEqual(plain(h.run('backboneSeries.data')).at(-1), { time: FIXTURE.live.append_bar.bar.time, value: 0 })
     const opts = h.run('backboneSeries.options')
     assert.equal(opts.visible, false); assert.equal(opts.autoscaleInfoProvider(), null)
-})
-
-test('source reload resets indicator results and status; old results never attach to new bars', async () => {
-    const h = await realHarness()
-    h.run(`fetch = ${respond({ ...FIXTURE.history, indicators: {} })}`)
-    await h.run('reload()'); h.flushFrames()
-    assert.equal(h.run('[...localValues.values()].reduce((n, c) => n + c.size, 0)'), 0)
-    assert.ok(plain(h.run('cvdSeries.data')).every(p => p.value === undefined), 'same timestamps, new source: no carried-over values')
 })
 
 test('descriptor change (plugin removed/upgraded) destroys its series; same signature keeps renderers', () => {
