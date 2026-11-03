@@ -1,13 +1,9 @@
-//! Safe Rust authoring interface and the `export_indicator!` macro.
-//!
-//! Authors implement [`Indicator`]; the SDK owns all unsafe ABI glue, panic
-//! containment, parameter validation, live window bookkeeping and output
-//! validation.
+//! Bar-domain runtime: [`Instance`] owns history/live window bookkeeping and
+//! output validation for an [`crate::Indicator`] with `type Domain = Bars`.
 
-use crate::abi::*;
+use crate::abi::{OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE};
 use crate::model::*;
-use std::ffi::c_void;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use crate::plugin::{Bars, BarsInput, Indicator};
 
 /// Extra bars retained in a live window beyond the declared context so that
 /// recent corrections (`Replace`) can still be applied.
@@ -45,26 +41,6 @@ pub struct ComputeContext<'a> {
 /// Columns for `bars[output_from..]`, keyed by descriptor output key.
 pub type SeriesSet = std::collections::BTreeMap<String, SeriesValues>;
 
-/// Implement this trait and call `export_indicator!(MyType)`.
-pub trait Indicator: Sized + Send + 'static {
-    /// Static self-description. Must be deterministic.
-    fn descriptor() -> Descriptor;
-
-    /// Construct an instance from validated parameters.
-    fn new(params: &ParamValues) -> Result<Self, PluginError>;
-
-    /// Compute output columns for `bars[output_from..]`; earlier bars are
-    /// warm-up. Each returned column must have `bars.len() - output_from`
-    /// entries. Called for history windows and, in live mode, on the bounded
-    /// live window after each delta (only touched bars are requested).
-    fn compute(
-        &mut self,
-        ctx: &ComputeContext<'_>,
-        bars: &[InputBar],
-        output_from: usize,
-    ) -> Result<SeriesSet, PluginError>;
-}
-
 struct LiveState {
     scope: Scope,
     revision: u64,
@@ -74,10 +50,10 @@ struct LiveState {
 }
 
 /// Opaque per-handle state (boxed behind the ABI handle).
-pub struct Instance<T: Indicator> {
+pub struct Instance<P: Indicator<Domain = Bars>> {
     desc: Descriptor,
     params: ParamValues,
-    inner: T,
+    inner: P,
     live: Option<LiveState>,
 }
 
@@ -93,11 +69,11 @@ pub fn check_bars(bars: &[InputBar]) -> Result<(), PluginError> {
     Ok(())
 }
 
-impl<T: Indicator> Instance<T> {
+impl<P: Indicator<Domain = Bars>> Instance<P> {
     pub fn create(params_json: &[u8]) -> Result<Self, PluginError> {
-        let desc = T::descriptor();
+        let desc = P::descriptor();
         let params = resolve_params(&desc, params_json)?;
-        let inner = T::new(&params)?;
+        let inner = P::new(&params)?;
         Ok(Self { desc, params, inner, live: None })
     }
 
@@ -116,7 +92,7 @@ impl<T: Indicator> Instance<T> {
             context_bars: self.desc.context.bars_for(&scope.tf) as usize,
             phase,
         };
-        let series = self.inner.compute(&ctx, bars, from)?;
+        let series = self.inner.compute(BarsInput { ctx: &ctx, bars, output_from: from })?;
         let out = Output { times: bars[from..].iter().map(|b| b.time).collect(), series };
         out.validate(&self.desc, None)?;
         Ok(out)
@@ -194,20 +170,7 @@ impl<T: Indicator> Instance<T> {
         };
         let scope = st.scope.clone();
         let revision = st.revision;
-        let out = {
-            let ctx_bars = self.desc.context.bars_for(&scope.tf) as usize;
-            let ctx = ComputeContext {
-                scope: &scope,
-                revision,
-                params: &self.params,
-                context_bars: ctx_bars,
-                phase: ComputePhase::LiveUpdate,
-            };
-            let series = self.inner.compute(&ctx, &window, from)?;
-            let out = Output { times: window[from..].iter().map(|b| b.time).collect(), series };
-            out.validate(&self.desc, None)?;
-            out
-        };
+        let out = self.run(ComputePhase::LiveUpdate, &scope, revision, &window, from)?;
         let st = self.live.as_mut().expect("live state");
         st.window = window;
         st.seq = upd.seq;
@@ -223,166 +186,4 @@ impl<T: Indicator> Instance<T> {
             _ => Err(PluginError::invalid_input("unknown operation")),
         }
     }
-}
-
-// ---------------------------------------------------------------- ABI glue
-
-fn panic_error() -> Vec<u8> {
-    serde_json::to_vec(&PluginError::new(codes::PANIC, "indicator panicked")).unwrap_or_default()
-}
-
-unsafe fn write_out(out: *mut CvdBuffer, bytes: Vec<u8>) {
-    if !out.is_null() {
-        out.write(CvdBuffer::from_vec(bytes));
-    }
-}
-
-unsafe fn input_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
-    if len == 0 {
-        Some(&[])
-    } else if ptr.is_null() {
-        None
-    } else {
-        Some(std::slice::from_raw_parts(ptr, len))
-    }
-}
-
-#[doc(hidden)]
-pub unsafe extern "C" fn describe<T: Indicator>(out: *mut CvdBuffer) -> i32 {
-    if out.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    match catch_unwind(|| serde_json::to_vec(&T::descriptor())) {
-        Ok(Ok(v)) => {
-            write_out(out, v);
-            STATUS_OK
-        }
-        Ok(Err(_)) => STATUS_ERROR,
-        Err(_) => {
-            write_out(out, panic_error());
-            STATUS_PANIC
-        }
-    }
-}
-
-#[doc(hidden)]
-pub unsafe extern "C" fn create<T: Indicator>(
-    params: *const u8,
-    len: usize,
-    out_handle: *mut *mut c_void,
-    out_err: *mut CvdBuffer,
-) -> i32 {
-    if out_handle.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    out_handle.write(std::ptr::null_mut());
-    let Some(params) = input_slice(params, len) else { return STATUS_INVALID_ARGUMENT };
-    match catch_unwind(|| Instance::<T>::create(params)) {
-        Ok(Ok(inst)) => {
-            out_handle.write(Box::into_raw(Box::new(inst)) as *mut c_void);
-            STATUS_OK
-        }
-        Ok(Err(e)) => {
-            write_out(out_err, serde_json::to_vec(&e).unwrap_or_default());
-            STATUS_ERROR
-        }
-        Err(_) => {
-            write_out(out_err, panic_error());
-            STATUS_PANIC
-        }
-    }
-}
-
-#[doc(hidden)]
-pub unsafe extern "C" fn invoke<T: Indicator>(
-    handle: *mut c_void,
-    op: u32,
-    input: *const u8,
-    len: usize,
-    out: *mut CvdBuffer,
-) -> i32 {
-    if handle.is_null() || out.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    let Some(input) = input_slice(input, len) else { return STATUS_INVALID_ARGUMENT };
-    let inst = &mut *(handle as *mut Instance<T>);
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        inst.invoke(op, input).and_then(|o| {
-            serde_json::to_vec(&o).map_err(|_| PluginError::new(codes::INVALID_OUTPUT, "output serialisation failed"))
-        })
-    }));
-    match r {
-        Ok(Ok(v)) => {
-            write_out(out, v);
-            STATUS_OK
-        }
-        Ok(Err(e)) => {
-            write_out(out, serde_json::to_vec(&e).unwrap_or_default());
-            STATUS_ERROR
-        }
-        Err(_) => {
-            // State may be inconsistent after a panic; drop live window so the
-            // host must re-open the session.
-            inst.live = None;
-            write_out(out, panic_error());
-            STATUS_PANIC
-        }
-    }
-}
-
-#[doc(hidden)]
-pub unsafe extern "C" fn destroy<T: Indicator>(handle: *mut c_void) {
-    if !handle.is_null() {
-        let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(handle as *mut Instance<T>))));
-    }
-}
-
-#[doc(hidden)]
-pub unsafe extern "C" fn free_buffer(buf: CvdBuffer) {
-    let _ = catch_unwind(AssertUnwindSafe(|| drop(buf.into_vec())));
-}
-
-/// Export an [`Indicator`] implementation as `cvd_plugin_entry_v1`.
-///
-/// ```ignore
-/// cvd_indicator_sdk::export_indicator!(MyIndicator);
-/// ```
-#[macro_export]
-macro_rules! export_indicator {
-    ($ty:ty) => {
-        #[cfg(target_arch = "wasm32")]
-        $crate::export_wasm_indicator!($ty);
-        #[cfg(not(target_arch = "wasm32"))]
-        $crate::export_native_indicator!($ty);
-    };
-}
-
-/// Native C ABI v1 entry (`cvd_plugin_entry_v1`): the numerical-oracle path
-/// kept until the server runner is retired. Wasm32 uses
-/// [`crate::export_wasm_indicator!`] instead.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! export_native_indicator {
-    ($ty:ty) => {
-        #[doc(hidden)]
-        static __CVD_PLUGIN_API_V1: $crate::abi::CvdPluginApiV1 = $crate::abi::CvdPluginApiV1 {
-            abi_version: $crate::abi::ABI_VERSION,
-            struct_size: $crate::abi::API_V1_SIZE,
-            describe: $crate::author::describe::<$ty>,
-            create: $crate::author::create::<$ty>,
-            invoke: $crate::author::invoke::<$ty>,
-            destroy: $crate::author::destroy::<$ty>,
-            free_buffer: $crate::author::free_buffer,
-        };
-
-        /// # Safety
-        /// Called by the CVD indicator runner only.
-        #[no_mangle]
-        pub unsafe extern "C" fn cvd_plugin_entry_v1(host_abi_version: u32) -> *const $crate::abi::CvdPluginApiV1 {
-            if host_abi_version != $crate::abi::ABI_VERSION {
-                return ::std::ptr::null();
-            }
-            &__CVD_PLUGIN_API_V1
-        }
-    };
 }

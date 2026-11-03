@@ -20,6 +20,8 @@ pub struct PluginError {
 }
 
 pub const MAX_ERROR_MESSAGE: usize = 512;
+/// Maximum declared warm-up (context) bars for any timeframe.
+pub const MAX_CONTEXT_BARS: u32 = 8192;
 
 impl PluginError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -626,7 +628,7 @@ impl Descriptor {
                 }
             }
         }
-        if self.context.max_bars() > crate::protocol::Limits::default().max_context_bars {
+        if self.context.max_bars() > MAX_CONTEXT_BARS {
             return Err(PluginError::new(codes::INCOMPATIBLE, "declared context exceeds host maximum"));
         }
         let mut pkeys = std::collections::BTreeSet::new();

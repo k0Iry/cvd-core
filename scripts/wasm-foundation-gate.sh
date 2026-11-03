@@ -26,9 +26,9 @@ cargo build --locked --target-dir "$T" --profile wasm-release --target wasm32-un
 echo "== hostile fixture: low 4 MiB declared max for the memory-grow control"
 # RUSTFLAGS replaces (not appends to) the config rustflags for this one package build.
 RUSTFLAGS="-C link-arg=--max-memory=4194304" cargo build --locked --target-dir "$T" --profile wasm-release --target wasm32-unknown-unknown -p hostile-wasm-plugin
-echo "== owned fixtures + native C-ABI oracles"
+echo "== owned fixtures + native Rust oracles"
 cargo run --locked -q --target-dir "$T" -p cvd-browser-host --example native_oracle -- --fixtures "$F"
-echo "== native workspace tests (incl. original native compatibility tests)"
+echo "== native workspace tests"
 CVD_WASM_DIR="$W" cargo test --locked --target-dir "$T" --workspace
 if [ "$MODE" = full ]; then
   echo "== real Chromium launch readiness (explicit browser entry)"

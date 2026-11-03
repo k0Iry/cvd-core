@@ -1,16 +1,19 @@
 //! Standalone browser WASM ABI (`cvd-wasm` v1) for indicator modules.
 //!
 //! See `docs/plugin-wasm-v1.md`. Only `i32` scalars cross the
-//! module boundary: no function pointers, no Rust types, no imports. JSON
-//! bodies are byte-identical to the native C ABI v1.
+//! module boundary: no function pointers, no Rust types, no imports.
 //!
-//! The pure glue state ([`WasmGlue`]) is target independent so its behaviour
-//! is unit-tested natively; [`crate::export_indicator!`] only emits the
-//! `extern "C"` exports on `target_arch = "wasm32"`.
+//! One runtime ([`WasmGlue`]) serves every [`Indicator`] domain; the domain's
+//! [`WasmSession`] ([`BarSession`], [`BookSession`]) supplies request
+//! semantics. The glue is target independent so its behaviour is unit-tested
+//! natively; [`crate::export_indicator!`] only emits the `extern "C"` exports on
+//! `target_arch = "wasm32"`.
 
-use crate::abi::{OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE, STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK};
-use crate::author::{Indicator, Instance};
-use crate::model::{codes, PluginError};
+use crate::abi::{OP_BOOK, OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE, STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK};
+use crate::author::Instance;
+use crate::book::BookSnapshot;
+use crate::model::{codes, resolve_params, Descriptor, PluginError};
+use crate::plugin::{Bars, Book, Domain, Indicator};
 
 /// WASM ABI version returned by `cvd_wasm_abi_version`.
 pub const WASM_ABI_VERSION: u32 = 1;
@@ -46,20 +49,89 @@ pub const REQUIRED_FUNCS: &[(&str, usize, usize)] = &[
 /// Optional linker-generated global exports that are tolerated.
 pub const OPTIONAL_GLOBALS: &[&str] = &["__data_end", "__heap_base"];
 
-/// Per-module-instantiation glue state: at most one indicator instance plus the
-/// plugin-owned result slot.
-///
-/// Item 8 semantics (mirror of the native runner): `OP_HISTORY` always runs on
-/// a FRESH `Instance` built from the stored create-params and dropped after
-/// the call; `OP_LIVE_*` run on the one persistent live instance, which a
-/// History request never touches.
-pub struct WasmGlue<T: Indicator> {
-    inst: Option<Instance<T>>,
+/// Domain session adapter behind [`WasmGlue`]: one created plugin instance
+/// plus its domain request semantics. Errors are the exact `PluginError` the
+/// module reports; the glue owns statuses, caps and the result slot.
+pub trait WasmSession: Sized {
+    /// Domain admission of the descriptor at `cvd_describe`.
+    /// Descriptor/domain agreement, enforced by both `describe` and `create`.
+    fn descriptor_ok(d: &Descriptor) -> bool;
+    fn create(params: &[u8]) -> Result<Self, PluginError>;
+    /// Ops handled by this domain; anything else is `STATUS_INVALID_ARGUMENT`.
+    fn accepts(op: u32) -> bool;
+    /// Run one accepted op, returning the serialised result.
+    fn invoke(&mut self, op: u32, input: &[u8]) -> Result<Vec<u8>, PluginError>;
+}
+
+/// Bar session. Item 8 semantics (mirror of the native runner): `OP_HISTORY`
+/// always runs on a FRESH `Instance` built from the stored create-params and
+/// dropped after the call; `OP_LIVE_*` run on the one persistent live
+/// instance, which a History request never touches.
+pub struct BarSession<P: Indicator<Domain = Bars>> {
+    live: Instance<P>,
     params: Vec<u8>,
+}
+
+impl<P: Indicator<Domain = Bars>> WasmSession for BarSession<P> {
+    fn descriptor_ok(d: &Descriptor) -> bool {
+        !d.is_book()
+    }
+    fn create(params: &[u8]) -> Result<Self, PluginError> {
+        Ok(Self { live: Instance::<P>::create(params)?, params: params.to_vec() })
+    }
+    fn accepts(op: u32) -> bool {
+        matches!(op, OP_HISTORY | OP_LIVE_INIT | OP_LIVE_UPDATE)
+    }
+    fn invoke(&mut self, op: u32, input: &[u8]) -> Result<Vec<u8>, PluginError> {
+        let r = if op == OP_HISTORY {
+            // Stateless: fresh instance per request, live instance untouched.
+            Instance::<P>::create(&self.params).and_then(|mut fresh| fresh.invoke(op, input))
+        } else {
+            self.live.invoke(op, input)
+        };
+        r.and_then(|o| {
+            serde_json::to_vec(&o).map_err(|_| PluginError::new(codes::INVALID_OUTPUT, "output serialisation failed"))
+        })
+    }
+}
+
+/// Book session: one plugin instance persisting across `OP_BOOK` snapshots.
+pub struct BookSession<P: Indicator<Domain = Book>> {
+    inst: P,
+}
+
+impl<P: Indicator<Domain = Book>> WasmSession for BookSession<P> {
+    fn descriptor_ok(d: &Descriptor) -> bool {
+        d.is_book()
+    }
+    fn create(params: &[u8]) -> Result<Self, PluginError> {
+        let d = P::descriptor();
+        d.validate()?;
+        Ok(Self { inst: P::new(&resolve_params(&d, params)?)? })
+    }
+    fn accepts(op: u32) -> bool {
+        op == OP_BOOK
+    }
+    fn invoke(&mut self, _op: u32, input: &[u8]) -> Result<Vec<u8>, PluginError> {
+        let b = serde_json::from_slice::<BookSnapshot>(input)
+            .map_err(|_| PluginError::invalid_input("malformed book body"))?;
+        b.check()?;
+        let out = self.inst.compute(&b)?;
+        out.validate(&b)?;
+        serde_json::to_vec(&out).map_err(|_| PluginError::new(codes::INVALID_OUTPUT, "serialisation failed"))
+    }
+}
+
+type SessionOf<P> = <<P as Indicator>::Domain as Domain>::Session<P>;
+
+/// Per-module-instantiation glue for any [`Indicator`]: at most one session plus
+/// the plugin-owned result slot.
+pub struct WasmGlue<P: Indicator> {
+    inst: Option<SessionOf<P>>,
     result: Vec<u8>,
 }
 
-impl<T: Indicator> Default for WasmGlue<T> {
+impl<P: Indicator> Default for WasmGlue<P> {
     fn default() -> Self {
         Self::new()
     }
@@ -69,9 +141,9 @@ fn err_json(e: &PluginError) -> Vec<u8> {
     serde_json::to_vec(e).unwrap_or_default()
 }
 
-impl<T: Indicator> WasmGlue<T> {
+impl<P: Indicator> WasmGlue<P> {
     pub const fn new() -> Self {
-        Self { inst: None, params: Vec::new(), result: Vec::new() }
+        Self { inst: None, result: Vec::new() }
     }
 
     pub fn result(&self) -> &[u8] {
@@ -79,8 +151,9 @@ impl<T: Indicator> WasmGlue<T> {
     }
 
     pub fn describe(&mut self) -> i32 {
-        match serde_json::to_vec(&T::descriptor()) {
-            Ok(v) if v.len() <= MAX_DESCRIPTOR_BYTES => {
+        let d = P::descriptor();
+        match serde_json::to_vec(&d) {
+            Ok(v) if v.len() <= MAX_DESCRIPTOR_BYTES && SessionOf::<P>::descriptor_ok(&d) => {
                 self.result = v;
                 STATUS_OK
             }
@@ -96,10 +169,14 @@ impl<T: Indicator> WasmGlue<T> {
         if self.inst.is_some() || params.len() > MAX_PARAMS_BYTES {
             return STATUS_INVALID_ARGUMENT;
         }
-        match Instance::<T>::create(params) {
-            Ok(i) => {
-                self.inst = Some(i);
-                self.params = params.to_vec();
+        // Same descriptor/domain admission as `describe`, before any constructor.
+        if !SessionOf::<P>::descriptor_ok(&P::descriptor()) {
+            self.result = err_json(&PluginError::new(codes::INCOMPATIBLE, "descriptor does not match domain"));
+            return STATUS_ERROR;
+        }
+        match SessionOf::<P>::create(params) {
+            Ok(s) => {
+                self.inst = Some(s);
                 STATUS_OK
             }
             Err(e) => {
@@ -111,20 +188,11 @@ impl<T: Indicator> WasmGlue<T> {
 
     pub fn invoke(&mut self, op: u32, input: &[u8]) -> i32 {
         self.result.clear();
-        if !matches!(op, OP_HISTORY | OP_LIVE_INIT | OP_LIVE_UPDATE) || input.len() > MAX_INPUT_BYTES {
+        if !SessionOf::<P>::accepts(op) || input.len() > MAX_INPUT_BYTES {
             return STATUS_INVALID_ARGUMENT;
         }
-        let Some(live) = self.inst.as_mut() else { return STATUS_INVALID_ARGUMENT };
-        let r = if op == OP_HISTORY {
-            // Stateless: fresh instance per request, live instance untouched.
-            Instance::<T>::create(&self.params).and_then(|mut fresh| fresh.invoke(op, input))
-        } else {
-            live.invoke(op, input)
-        };
-        let r = r.and_then(|o| {
-            serde_json::to_vec(&o).map_err(|_| PluginError::new(codes::INVALID_OUTPUT, "output serialisation failed"))
-        });
-        match r {
+        let Some(s) = self.inst.as_mut() else { return STATUS_INVALID_ARGUMENT };
+        match s.invoke(op, input) {
             Ok(v) => {
                 self.result = v;
                 STATUS_OK
@@ -138,7 +206,6 @@ impl<T: Indicator> WasmGlue<T> {
 
     pub fn destroy(&mut self) {
         self.inst = None;
-        self.params.clear();
         self.result.clear();
     }
 }
@@ -183,10 +250,11 @@ pub mod raw {
     }
 }
 
-/// Emits the `cvd-wasm` v1 exports for `$ty`. Used by [`crate::export_indicator!`]
-/// on wasm32; may also be invoked directly.
+/// Emits the `cvd-wasm` v1 exports for a [`Indicator`] of any domain. Internal:
+/// use [`crate::export_indicator!`].
+#[doc(hidden)]
 #[macro_export]
-macro_rules! export_wasm_indicator {
+macro_rules! __export_wasm {
     ($ty:ty) => {
         #[doc(hidden)]
         mod __cvd_wasm_exports {

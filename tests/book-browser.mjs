@@ -12,7 +12,8 @@
 //
 //   CVD_SERVED_CHAIN_DIR / CVD_SERVED_STATIC_DIR  as tests/served-chain-browser.mjs
 //   CVD_BOOK_WASM     path to cvd_indicator_orderbook.wasm (candidate)
-//   CVD_LEGACY_WASM_DIR dir with released v0.1.0 cvd_indicator_cvd.wasm + cvd_indicator_flow.wasm
+//   CVD_LEGACY_WASM_DIR dir with caller-supplied bar plugins cvd_indicator_cvd.wasm + cvd_indicator_flow.wasm
+//                       (any WASM v1 build; the env name is historical)
 //   CVD_BOOK_SHOTS    dir for screenshots
 import fs from 'node:fs'
 import path from 'node:path'
@@ -217,7 +218,7 @@ try {
   check('book_panel_hidden_without_plugins', (await dom()).hidden === true)
   check('no_book_socket_without_demand', !sockets.some(u => u.includes('/book')), sockets.join(','))
 
-  // Legacy released CVD/Flow v0.1.0 plugins (no rebuild) import and compute.
+  // Caller-supplied CVD/Flow bar plugins coexist with the book plugin: import and compute.
   if (LEGACY) {
     for (const f of ['cvd_indicator_cvd.wasm', 'cvd_indicator_flow.wasm']) check(`legacy_import_${f}`, await importFile(path.join(LEGACY, f)))
     for (const pid of ['cvd', 'flow']) await toggle(pid, true)

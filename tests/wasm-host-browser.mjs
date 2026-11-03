@@ -1,7 +1,7 @@
 // Real-browser smoke for the cvd-wasm v1 Rust host + trusted Worker bridge.
 // Serves repo static/wasm-host and wasm-release artifacts on loopback only,
 // drives installed Chromium over CDP, asserts every step and compares the
-// browser plugin output to the native C-ABI oracle bit-for-bit.
+// browser plugin output to the direct Rust (non-WASM) oracle bit-for-bit.
 //   CVD_WASM_DIR   wasm32 wasm-release dir (required)
 //   CVD_FIXTURE_DIR owned fixture dir from `native_oracle --fixtures` (request,
 //                   oracle, live-script, hostile/*.wasm + index.json)

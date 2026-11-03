@@ -23,6 +23,7 @@ pub const OUTPUT: &str = "cvd";
 pub struct Cvd;
 
 impl Indicator for Cvd {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Descriptor {
             id: ID.into(),
@@ -51,12 +52,7 @@ impl Indicator for Cvd {
         Ok(Self)
     }
 
-    fn compute(
-        &mut self,
-        ctx: &ComputeContext<'_>,
-        bars: &[InputBar],
-        from: usize,
-    ) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { ctx, bars, output_from: from }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         let aggregate = ctx.scope.mode == Mode::Aggregate;
         let values = bars[from..]
             .iter()
@@ -69,8 +65,7 @@ impl Indicator for Cvd {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-export_indicator!(Cvd);
+export_indicator!(Bars: Cvd);
 
 
 }
@@ -132,6 +127,7 @@ pub fn buy_sell(buy: f64, sell: f64, delta: f64) -> Option<(f64, f64)> {
 pub struct Flow;
 
 impl Indicator for Flow {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         let spec = |key: &str, label: &str, kind, readout_only| OutputSpec {
             key: key.into(),
@@ -177,12 +173,7 @@ impl Indicator for Flow {
         Ok(Self)
     }
 
-    fn compute(
-        &mut self,
-        ctx: &ComputeContext<'_>,
-        bars: &[InputBar],
-        from: usize,
-    ) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { ctx, bars, output_from: from }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         let aggregate = ctx.scope.mode == Mode::Aggregate;
         let n = bars.len() - from;
         let (mut delta, mut upper, mut lower, mut total) = (
@@ -214,8 +205,7 @@ impl Indicator for Flow {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-export_indicator!(Flow);
+export_indicator!(Bars: Flow);
 
 
 }

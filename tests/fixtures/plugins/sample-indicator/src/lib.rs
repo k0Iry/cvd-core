@@ -25,6 +25,7 @@ pub struct SampleChannel {
 const MAX_LEN: i64 = 500;
 
 impl Indicator for SampleChannel {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Descriptor {
             id: "sample.channel".into(),
@@ -99,7 +100,7 @@ impl Indicator for SampleChannel {
         Ok(Self { length: params.int("length").unwrap_or(20) as usize })
     }
 
-    fn compute(&mut self, ctx: &ComputeContext<'_>, bars: &[InputBar], from: usize) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { ctx, bars, output_from: from }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         let agg = ctx.scope.mode == Mode::Aggregate;
         let close = |b: &InputBar| if agg { b.apc } else { b.price_close };
         let high = |b: &InputBar| if agg { b.aph } else { b.ph };
@@ -135,4 +136,4 @@ impl Indicator for SampleChannel {
     }
 }
 
-export_indicator!(SampleChannel);
+export_indicator!(Bars: SampleChannel);

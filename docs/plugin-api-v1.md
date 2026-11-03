@@ -97,43 +97,29 @@ are limited to 512 bytes and must not expose host diagnostics. Browser-host
 revision guards and failures are specified in the
 [WASM contract](plugin-wasm-v1.md#5-history-and-live-semantics).
 
-## Native SDK compatibility
+## Authoring
 
-The SDK still exports a native C ABI for offline callers. It is not a server
-plugin deployment path; the app uses the [WASM ABI](plugin-wasm-v1.md).
+Implement `cvd_indicator_sdk::Indicator` once, choosing the data domain, and
+export it with `export_indicator!`:
 
-Export (provided by the SDK macro):
-
-```c
-const CvdPluginApiV1* cvd_plugin_entry_v1(uint32_t host_abi_version);
+```rust
+impl Indicator for MyType {
+    type Domain = Bars; // or Book
+    fn descriptor() -> Descriptor { /* ... */ }
+    fn new(params: &ParamValues) -> Result<Self, PluginError> { /* ... */ }
+    fn compute(&mut self, i: BarsInput<'_>) -> Result<SeriesSet, PluginError> { /* ... */ }
+}
+export_indicator!(Bars: MyType);
 ```
 
-Return NULL if `host_abi_version` is unsupported. The table:
+A `Book` indicator's `compute` takes `&BookSnapshot` and returns `PriceLevels`.
+The macro emits the [WASM ABI](plugin-wasm-v1.md) exports on `wasm32` only;
+there is no native C ABI. Native tests drive `author::Instance` or
+`wasm::WasmGlue` directly. A module's descriptor must match its `Domain`
+(a `Book` descriptor declares `order_book`; a `Bars` one must not): both
+`cvd_describe` and `cvd_create` reject a mismatch as `incompatible`.
 
-```c
-typedef struct { uint8_t* ptr; size_t len; size_t cap; } CvdBuffer;   // library-owned
-typedef struct {
-  uint32_t abi_version;   // must be 1
-  uint32_t struct_size;   // >= sizeof(v1 table); runner rejects smaller
-  int32_t (*describe)(CvdBuffer* out);                                   // Descriptor JSON
-  int32_t (*create)(const uint8_t* params, size_t len, void** out_handle, CvdBuffer* out_err);
-  int32_t (*invoke)(void* handle, uint32_t op, const uint8_t* in, size_t len, CvdBuffer* out);
-  void    (*destroy)(void* handle);
-  void    (*free_buffer)(CvdBuffer buf);                                 // frees any buffer above
-} CvdPluginApiV1;
-```
-
-Status codes: `0 OK`, `1 ERROR` (out = PluginError JSON), `2 PANIC`
-(caught at the boundary), `3 INVALID_ARGUMENT`.
-Operations: `1 HISTORY`, `2 LIVE_INIT`, `3 LIVE_UPDATE`.
-
-Ownership: every `CvdBuffer` written by the library is released by calling
-**that library's** `free_buffer` exactly once. Handles are opaque and
-destroyed with `destroy`. No `Vec`/`String`/trait object crosses the boundary.
-Panics never unwind across `extern "C"`: the SDK wraps every entry in
-`catch_unwind`; a panic during `invoke` also drops that instance's live state.
-
-The native ABI layout and retained frame types are documented in
-[`abi.rs`](../crates/indicator-sdk/src/abi.rs) and
-[`protocol.rs`](../crates/indicator-sdk/src/protocol.rs). Their presence in the SDK
-does not imply a running server-side plugin process or automatic restart path.
+Source written against an earlier SDK (the former `BookIndicator` trait and
+legacy macros) must migrate to this trait and rebuild to use the current SDK.
+The WASM v1 binary ABI is unchanged, so the host does not deliberately reject
+previously built modules; they are simply not a supported or tested target.

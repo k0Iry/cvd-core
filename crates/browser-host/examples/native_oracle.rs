@@ -1,6 +1,7 @@
-//! Native oracle: runs the sample fixture through the CURRENT native C ABI v1
-//! function table (`cvd_plugin_entry_v1`) on the canonical request and prints
-//! the output JSON. Also writes hostile byte modules when given a directory.
+//! Native oracle: runs the sample fixture through the SDK bar runtime
+//! (`author::Instance`, the same code compiled into the WASM modules) on the
+//! canonical request and prints the output JSON. Also writes hostile byte
+//! modules when given a directory.
 #[cfg(not(target_arch = "wasm32"))]
 use cvd_indicator_sdk::abi::*;
 use cvd_indicator_sdk::*;
@@ -87,37 +88,24 @@ fn main() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct Native {
-    api: &'static CvdPluginApiV1,
-    h: *mut std::ffi::c_void,
-}
+type Sample = cvd_indicator_sdk::author::Instance<sample_indicator::SampleChannel>;
 
+/// One SDK call rendered as the wire `(status, json)` pair the module returns.
 #[cfg(not(target_arch = "wasm32"))]
-impl Native {
-    fn new() -> Self {
-        let api = unsafe { &*sample_indicator::cvd_plugin_entry_v1(ABI_VERSION) };
-        let params = br#"{"length":14}"#;
-        let mut h = std::ptr::null_mut();
-        let mut err = CvdBuffer::empty();
-        assert_eq!(unsafe { (api.create)(params.as_ptr(), params.len(), &mut h, &mut err) }, STATUS_OK);
-        Self { api, h }
-    }
-    fn call(&mut self, op: u32, body: &[u8]) -> (i32, String) {
-        let mut out = CvdBuffer::empty();
-        let st = unsafe { (self.api.invoke)(self.h, op, body.as_ptr(), body.len(), &mut out) };
-        let bytes = unsafe { out.as_slice() }.to_vec();
-        unsafe { (self.api.free_buffer)(out) };
-        (st, String::from_utf8(bytes).unwrap())
+fn call<P: Indicator<Domain = Bars>>(i: &mut cvd_indicator_sdk::author::Instance<P>, op: u32, body: &[u8]) -> (i32, String) {
+    match i.invoke(op, body) {
+        Ok(o) => (STATUS_OK, serde_json::to_string(&o).unwrap()),
+        Err(e) => (STATUS_ERROR, serde_json::to_string(&e).unwrap()),
     }
 }
 
-/// Native C-ABI live oracle: init beyond the retention cap, 150 updates with
+/// Native live oracle: init beyond the retention cap, 150 updates with
 /// replaces, plus host-rejected controls and recovery. Each step records the
 /// expected browser outcome.
 #[cfg(not(target_arch = "wasm32"))]
 fn live_script() -> serde_json::Value {
     use serde_json::json;
-    let mut n = Native::new();
+    let mut n = Sample::create(br#"{"length":14}"#).unwrap();
     let base = canonical_request();
     let mk = |i: i64| {
         let mut b = base.bars[(i as usize) % base.bars.len()].clone();
@@ -128,7 +116,7 @@ fn live_script() -> serde_json::Value {
     let mut steps = Vec::new();
     let init = LiveInit { scope: base.scope.clone(), revision: 77, bars: (0..700).map(mk).collect() };
     let body = serde_json::to_string(&init).unwrap();
-    let (st, out) = n.call(OP_LIVE_INIT, body.as_bytes());
+    let (st, out) = call(&mut n, OP_LIVE_INIT, body.as_bytes());
     assert_eq!(st, STATUS_OK);
     steps.push(json!({"op": 2, "body": body, "ok": out}));
     let mut next = 700i64;
@@ -141,7 +129,7 @@ fn live_script() -> serde_json::Value {
         }
         next += 1;
         let body = serde_json::to_string(&LiveUpdate { revision: 77, seq, ops }).unwrap();
-        let (st, out) = n.call(OP_LIVE_UPDATE, body.as_bytes());
+        let (st, out) = call(&mut n, OP_LIVE_UPDATE, body.as_bytes());
         assert_eq!(st, STATUS_OK, "{out}");
         steps.push(json!({"op": 3, "body": body, "ok": out}));
     }
@@ -168,7 +156,7 @@ fn live_script() -> serde_json::Value {
     let body =
         serde_json::to_string(&LiveUpdate { revision: 77, seq: 151, ops: vec![LiveOp::Append { bar: mk(next) }] })
             .unwrap();
-    let (st, out) = n.call(OP_LIVE_UPDATE, body.as_bytes());
+    let (st, out) = call(&mut n, OP_LIVE_UPDATE, body.as_bytes());
     assert_eq!(st, STATUS_OK);
     steps.push(json!({"op": 3, "body": body, "ok": out}));
     json!({ "params": r#"{"length":14}"#, "scope_key": "binance:spot:BTCUSDT:1m:source", "revision": 77, "steps": steps })
@@ -176,43 +164,26 @@ fn live_script() -> serde_json::Value {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn native_history() -> Vec<u8> {
-    let api = unsafe { &*sample_indicator::cvd_plugin_entry_v1(ABI_VERSION) };
-    let params = br#"{"length":14}"#;
-    let mut h = std::ptr::null_mut();
-    let mut err = CvdBuffer::empty();
-    assert_eq!(unsafe { (api.create)(params.as_ptr(), params.len(), &mut h, &mut err) }, STATUS_OK);
-    let body = serde_json::to_vec(&canonical_request()).unwrap();
-    let mut out = CvdBuffer::empty();
-    let st = unsafe { (api.invoke)(h, OP_HISTORY, body.as_ptr(), body.len(), &mut out) };
+    let mut n = Sample::create(br#"{"length":14}"#).unwrap();
+    let (st, out) = call(&mut n, OP_HISTORY, &serde_json::to_vec(&canonical_request()).unwrap());
     assert_eq!(st, STATUS_OK);
-    let bytes = unsafe { out.as_slice() }.to_vec();
-    unsafe { (api.free_buffer)(out) };
-    unsafe { (api.destroy)(h) };
-    bytes
+    out.into_bytes()
 }
 
 /// Item 8 oracle with the mutable-state fixture, reproducing the ORIGINAL
 /// native runner (indicator-runner `FrameKind::History`): every History
-/// request runs on a FRESH C-ABI instance (create/invoke/destroy), while
+/// request runs on a FRESH instance, while
 /// LiveInit/LiveUpdate run on ONE persistent instance. Interleaved on purpose.
 #[cfg(not(target_arch = "wasm32"))]
 fn stateful_script() -> serde_json::Value {
-    use cvd_indicator_sdk::author::{create, destroy, free_buffer, invoke};
+    use cvd_indicator_sdk::author::Instance;
     use serde_json::json;
     type S = stateful_indicator::Stateful;
-    let mk = || {
-        let mut h = std::ptr::null_mut();
-        let mut e = CvdBuffer::empty();
-        assert_eq!(unsafe { create::<S>(b"{}".as_ptr(), 2, &mut h, &mut e) }, STATUS_OK);
-        h
-    };
-    let call = |h, op: u32, body: &[u8]| {
-        let mut out = CvdBuffer::empty();
-        let st = unsafe { invoke::<S>(h, op, body.as_ptr(), body.len(), &mut out) };
+    let mk = || Instance::<S>::create(b"{}").unwrap();
+    let run = |i: &mut Instance<S>, op: u32, body: &[u8]| {
+        let (st, out) = call(i, op, body);
         assert_eq!(st, STATUS_OK);
-        let s = String::from_utf8(unsafe { out.as_slice() }.to_vec()).unwrap();
-        unsafe { free_buffer(out) };
-        s
+        out
     };
     let a = canonical_request();
     let mut b = canonical_request();
@@ -239,19 +210,11 @@ fn stateful_script() -> serde_json::Value {
         (OP_HISTORY, ha.clone()),
         (OP_LIVE_UPDATE, upd(3)),
     ];
-    let live = mk();
+    let mut live = mk();
     let mut steps = Vec::new();
     for (op, body) in plan {
-        let out = if op == OP_HISTORY {
-            let h = mk();
-            let o = call(h, op, body.as_bytes());
-            unsafe { destroy::<S>(h) };
-            o
-        } else {
-            call(live, op, body.as_bytes())
-        };
+        let out = if op == OP_HISTORY { run(&mut mk(), op, body.as_bytes()) } else { run(&mut live, op, body.as_bytes()) };
         steps.push(json!({"op": op, "body": body, "ok": out}));
     }
-    unsafe { destroy::<S>(live) };
     json!({ "params": "{}", "scope_key": "binance:spot:BTCUSDT:1m:source", "revision": 42, "steps": steps })
 }

@@ -1,7 +1,7 @@
 //! Safe, self-contained mutable-state fixture. Every `compute` call increments
 //! a per-instance counter which is folded into the output, so any reuse of an
 //! instance across requests (e.g. History on the persistent live instance)
-//! becomes numerically visible. Built natively (C ABI oracle) and for wasm32.
+//! becomes numerically visible. Built natively (Rust oracle) and for wasm32.
 use cvd_indicator_sdk::*;
 use std::collections::BTreeMap;
 
@@ -10,6 +10,7 @@ pub struct Stateful {
 }
 
 impl Indicator for Stateful {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Descriptor {
             id: "fixture.stateful".into(),
@@ -36,7 +37,7 @@ impl Indicator for Stateful {
     fn new(_: &ParamValues) -> Result<Self, PluginError> {
         Ok(Stateful { calls: 0 })
     }
-    fn compute(&mut self, _: &ComputeContext<'_>, bars: &[InputBar], from: usize) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { bars, output_from: from, .. }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         self.calls += 1;
         let k = self.calls as f64 * 1000.0;
         let mut s = BTreeMap::new();
@@ -48,8 +49,4 @@ impl Indicator for Stateful {
     }
 }
 
-// wasm32: standalone cvd-wasm exports. Native: no `cvd_plugin_entry_v1`
-// symbol (avoids clashing with sample-indicator in the oracle binary); the
-// oracle drives the same generic C-ABI functions `author::{create,invoke,destroy}`.
-#[cfg(target_arch = "wasm32")]
-export_indicator!(Stateful);
+export_indicator!(Bars: Stateful);

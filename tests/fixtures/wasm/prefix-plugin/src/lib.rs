@@ -15,6 +15,7 @@ pub struct Prefix {
 }
 
 impl Indicator for Prefix {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Descriptor {
             id: "fixture.prefix".into(),
@@ -49,7 +50,7 @@ impl Indicator for Prefix {
         }
         Ok(Prefix { scale: scale as f64 })
     }
-    fn compute(&mut self, _: &ComputeContext<'_>, bars: &[InputBar], from: usize) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { bars, output_from: from, .. }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         let mut acc = 0.0f64;
         let mut out = Vec::with_capacity(bars.len() - from);
         for (i, b) in bars.iter().enumerate() {
@@ -64,5 +65,4 @@ impl Indicator for Prefix {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-export_indicator!(Prefix);
+export_indicator!(Bars: Prefix);

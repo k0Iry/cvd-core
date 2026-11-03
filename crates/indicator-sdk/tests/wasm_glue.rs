@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 struct Echo;
 impl Indicator for Echo {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Descriptor {
             id: "t.echo".into(),
@@ -32,7 +33,7 @@ impl Indicator for Echo {
     fn new(_: &ParamValues) -> Result<Self, PluginError> {
         Ok(Echo)
     }
-    fn compute(&mut self, _: &ComputeContext<'_>, bars: &[InputBar], from: usize) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { bars, output_from: from, .. }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         let mut s = BTreeMap::new();
         s.insert("c".into(), SeriesValues::Line { values: bars[from..].iter().map(|b| Some(b.price_close)).collect() });
         Ok(s)
@@ -70,6 +71,7 @@ fn glue_lifecycle_and_bounds() {
     let o: Output = serde_json::from_slice(g.result()).unwrap();
     assert_eq!(o.times, vec![120, 180]);
     assert_eq!(g.invoke(99, &req()), STATUS_INVALID_ARGUMENT);
+    assert_eq!(g.invoke(OP_BOOK, &req()), STATUS_INVALID_ARGUMENT, "wrong domain op");
     assert_eq!(g.invoke(OP_HISTORY, b"{not json"), STATUS_ERROR);
     let e: PluginError = serde_json::from_slice(g.result()).unwrap();
     assert_eq!(e.code, "invalid_input");
@@ -91,13 +93,14 @@ fn raw_alloc_bounds() {
 /// Mutable-state indicator: output folds a per-instance call counter.
 struct Counter(u64);
 impl Indicator for Counter {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Echo::descriptor()
     }
     fn new(_: &ParamValues) -> Result<Self, PluginError> {
         Ok(Counter(0))
     }
-    fn compute(&mut self, _: &ComputeContext<'_>, bars: &[InputBar], from: usize) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { bars, output_from: from, .. }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         self.0 += 1;
         let mut s = BTreeMap::new();
         let k = self.0 as f64 * 1000.0;
@@ -158,5 +161,15 @@ fn history_is_stateless_and_isolated_from_live() {
         };
         assert_eq!(g.invoke(*op, body), STATUS_OK, "step {k}");
         assert_eq!(g.result(), &want[..], "step {k} op {op}: wasm glue diverges from native runner semantics");
+        // Independent expectation: History always sees a fresh counter (k=1),
+        // live counts only its own calls (init=1, then 2, 3).
+        let o: Output = serde_json::from_slice(g.result()).unwrap();
+        let SeriesValues::Line { values } = &o.series["c"] else { panic!() };
+        let k_want = match *op {
+            OP_HISTORY => 1000.0,
+            OP_LIVE_INIT => 1000.0,
+            _ => 1000.0 * (1 + steps[..k].iter().filter(|s| s.0 == OP_LIVE_UPDATE).count() + 1) as f64,
+        };
+        assert!(values.iter().all(|v| v.unwrap() - k_want < 10.0 && v.unwrap() > k_want), "step {k}: {values:?}");
     }
 }

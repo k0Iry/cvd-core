@@ -8,6 +8,7 @@ static SEEN: Mutex<Vec<(ComputePhase, usize, usize)>> = Mutex::new(Vec::new());
 
 struct Probe;
 impl Indicator for Probe {
+    type Domain = Bars;
     fn descriptor() -> Descriptor {
         Descriptor {
             id: "probe".into(),
@@ -34,7 +35,7 @@ impl Indicator for Probe {
     fn new(_: &ParamValues) -> Result<Self, PluginError> {
         Ok(Probe)
     }
-    fn compute(&mut self, ctx: &ComputeContext<'_>, bars: &[InputBar], from: usize) -> Result<SeriesSet, PluginError> {
+    fn compute(&mut self, BarsInput { ctx, bars, output_from: from }: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
         SEEN.lock().unwrap().push((ctx.phase, bars.len(), from));
         let v = bars[from..].iter().map(|b| Some(b.price_close)).collect();
         Ok([("x".to_string(), SeriesValues::Line { values: v })].into())

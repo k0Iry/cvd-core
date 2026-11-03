@@ -64,7 +64,7 @@ All scalars are `i32`.
 | `cvd_dealloc` | `(ptr, len)` | frees a `cvd_alloc` buffer |
 | `cvd_describe` | `() -> status` | Descriptor JSON in the result slot |
 | `cvd_create` | `(ptr, len) -> status` | creates the one instance from params JSON; a second call → 3 |
-| `cvd_invoke` | `(op, ptr, len) -> status` | op 1 History, 2 LiveInit, 3 LiveUpdate; op 4 Book only for descriptors declaring the `order_book` input + `price_levels` output (§5a; bar plugins reject it). Native-only C ABI ops are unchanged |
+| `cvd_invoke` | `(op, ptr, len) -> status` | op 1 History, 2 LiveInit, 3 LiveUpdate; op 4 Book only for descriptors declaring the `order_book` input + `price_levels` output (§5a; bar plugins reject it). |
 | `cvd_destroy` | `() -> ()` | idempotent |
 | `cvd_result_ptr` / `cvd_result_len` | `() -> i32` | location of the last result |
 
@@ -118,8 +118,9 @@ Host live state changes only after a validated OK. Rejections and
 A book plugin uses the same exports and ABI version. Its descriptor declares
 `"inputs": ["order_book"]`, exactly one output with `"type": "price_levels"`
 and `"live": false`; it never receives bar operations, and bar plugins never
-receive op 4. Implement `cvd_indicator_sdk::book::BookIndicator` and call
-`export_book_indicator!(MyBook)`.
+receive op 4. Implement `cvd_indicator_sdk::Indicator` with `type Domain = Book`
+(`compute(&mut self, &BookSnapshot) -> PriceLevels`) and call
+`export_indicator!(Book: MyBook)`; the instance persists across snapshots.
 
 - **Input (`BookSnapshot`)**: one source only (`source.exchange/market/symbol`,
   `base`, `quote`), `generation`, exchange `seq`, `bids` best first and `asks`

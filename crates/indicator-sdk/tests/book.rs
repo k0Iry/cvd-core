@@ -1,7 +1,8 @@
 //! Order-book (`OP_BOOK`) SDK contract: descriptor capability rules, input
 //! admission, output validation and the target-independent wasm glue.
-use cvd_indicator_sdk::abi::{OP_BOOK, OP_HISTORY, STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK};
+use cvd_indicator_sdk::abi::{OP_BOOK, OP_HISTORY, OP_LIVE_INIT, STATUS_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK};
 use cvd_indicator_sdk::book::*;
+use cvd_indicator_sdk::wasm::WasmGlue;
 use cvd_indicator_sdk::*;
 
 pub fn book_desc() -> Descriptor {
@@ -125,14 +126,15 @@ fn output_validation() {
 }
 
 struct Echo;
-impl BookIndicator for Echo {
+impl Indicator for Echo {
+    type Domain = Book;
     fn descriptor() -> Descriptor {
         book_desc()
     }
     fn new(_: &ParamValues) -> Result<Self, PluginError> {
         Ok(Echo)
     }
-    fn compute_book(&mut self, b: &BookSnapshot) -> Result<PriceLevels, PluginError> {
+    fn compute(&mut self, b: &BookSnapshot) -> Result<PriceLevels, PluginError> {
         let rows = b
             .asks
             .iter()
@@ -146,7 +148,7 @@ impl BookIndicator for Echo {
 
 #[test]
 fn glue_lifecycle_and_op_gating() {
-    let mut g = BookGlue::<Echo>::new();
+    let mut g = WasmGlue::<Echo>::new();
     assert_eq!(g.invoke(OP_BOOK, b"{}"), STATUS_INVALID_ARGUMENT, "before create");
     assert_eq!(g.describe(), STATUS_OK);
     assert_eq!(g.create(b"{}"), STATUS_OK);
@@ -165,26 +167,165 @@ fn glue_lifecycle_and_op_gating() {
     assert_eq!(g.invoke(OP_BOOK, &body), STATUS_INVALID_ARGUMENT);
 }
 
+/// Book indicator with mutable state: the unit label encodes the
+/// per-instance call count, so instance reuse/reset is directly observable.
+struct Tally(u32);
+impl Indicator for Tally {
+    type Domain = Book;
+    fn descriptor() -> Descriptor {
+        book_desc()
+    }
+    fn new(_: &ParamValues) -> Result<Self, PluginError> {
+        Ok(Tally(0))
+    }
+    fn compute(&mut self, b: &BookSnapshot) -> Result<PriceLevels, PluginError> {
+        self.0 += 1;
+        let mut out = Echo.compute(b)?;
+        out.unit = format!("N{}", self.0);
+        Ok(out)
+    }
+}
+
 #[test]
-fn bar_glue_refuses_op_book() {
-    // Existing bar plugins never accept OP_BOOK (old modules keep their contract).
-    struct Bars;
-    impl Indicator for Bars {
+fn book_instance_persists_across_snapshots_until_destroy() {
+    let body = serde_json::to_vec(&snapshot()).unwrap();
+    let unit = |g: &WasmGlue<Tally>| serde_json::from_slice::<PriceLevels>(g.result()).unwrap().unit;
+    let mut g = WasmGlue::<Tally>::new();
+    assert_eq!(g.create(b"{}"), STATUS_OK);
+    for n in 1..=3 {
+        assert_eq!(g.invoke(OP_BOOK, &body), STATUS_OK);
+        assert_eq!(unit(&g), format!("N{n}"));
+    }
+    // A rejected snapshot never reaches compute.
+    let mut bad = snapshot();
+    bad.asks[0][0] = 99.5;
+    assert_eq!(g.invoke(OP_BOOK, &serde_json::to_vec(&bad).unwrap()), STATUS_ERROR);
+    assert_eq!(g.invoke(OP_BOOK, &body), STATUS_OK);
+    assert_eq!(unit(&g), "N4");
+    assert_eq!(g.invoke(OP_LIVE_INIT, &body), STATUS_INVALID_ARGUMENT, "wrong domain op");
+    g.destroy();
+    assert_eq!(g.create(b"{}"), STATUS_OK);
+    assert_eq!(g.invoke(OP_BOOK, &body), STATUS_OK);
+    assert_eq!(unit(&g), "N1", "recreate starts a fresh instance");
+}
+
+#[test]
+fn book_describe_requires_book_descriptor() {
+    struct NotBook;
+    impl Indicator for NotBook {
+        type Domain = Book;
         fn descriptor() -> Descriptor {
             let mut d = book_desc();
             d.inputs = vec![InputField::Price];
-            d.outputs[0].kind = OutputKind::Line;
-            d.live = true;
             d
         }
         fn new(_: &ParamValues) -> Result<Self, PluginError> {
-            Ok(Bars)
+            Ok(NotBook)
         }
-        fn compute(&mut self, _: &ComputeContext<'_>, b: &[InputBar], f: usize) -> Result<SeriesSet, PluginError> {
-            Ok([("ladder".to_string(), SeriesValues::Line { values: vec![None; b.len() - f] })].into())
+        fn compute(&mut self, b: &BookSnapshot) -> Result<PriceLevels, PluginError> {
+            Echo.compute(b)
         }
     }
-    let mut g = cvd_indicator_sdk::wasm::WasmGlue::<Bars>::new();
-    assert_eq!(g.create(b"{}"), STATUS_OK);
-    assert_eq!(g.invoke(OP_BOOK, &serde_json::to_vec(&snapshot()).unwrap()), STATUS_INVALID_ARGUMENT);
+    let mut g = WasmGlue::<NotBook>::new();
+    assert_eq!(g.describe(), STATUS_ERROR);
+    let e: PluginError = serde_json::from_slice(g.result()).unwrap();
+    assert_eq!(e.code, codes::INCOMPATIBLE);
+}
+
+/// API-01: descriptor/domain agreement at BOTH describe and create (incl.
+/// create without describe), for both domains, before any constructor runs.
+mod domain_agreement {
+    use super::*;
+    use cvd_indicator_sdk::abi::{OP_LIVE_UPDATE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn bar_desc() -> Descriptor {
+        let mut d = book_desc();
+        d.id = "test.bar".into();
+        d.inputs = vec![InputField::Price];
+        d.outputs[0].kind = OutputKind::Line;
+        d.live = true;
+        d
+    }
+
+    static BARS_NEW: AtomicUsize = AtomicUsize::new(0);
+    struct BarsWithBookDesc;
+    impl Indicator for BarsWithBookDesc {
+        type Domain = Bars;
+        fn descriptor() -> Descriptor {
+            book_desc()
+        }
+        fn new(_: &ParamValues) -> Result<Self, PluginError> {
+            BARS_NEW.fetch_add(1, Ordering::SeqCst);
+            Ok(Self)
+        }
+        fn compute(&mut self, _: BarsInput<'_>) -> Result<SeriesSet, PluginError> {
+            unreachable!("compute on domain-mismatched instance")
+        }
+    }
+
+    static BOOK_NEW: AtomicUsize = AtomicUsize::new(0);
+    struct BookWithBarDesc;
+    impl Indicator for BookWithBarDesc {
+        type Domain = Book;
+        fn descriptor() -> Descriptor {
+            bar_desc()
+        }
+        fn new(_: &ParamValues) -> Result<Self, PluginError> {
+            BOOK_NEW.fetch_add(1, Ordering::SeqCst);
+            Ok(Self)
+        }
+        fn compute(&mut self, _: &BookSnapshot) -> Result<PriceLevels, PluginError> {
+            unreachable!("compute on domain-mismatched instance")
+        }
+    }
+
+    fn incompatible<P: Indicator>(g: &WasmGlue<P>) {
+        let e: PluginError = serde_json::from_slice(g.result()).unwrap();
+        assert_eq!(e.code, codes::INCOMPATIBLE);
+    }
+
+    #[test]
+    fn fixtures_are_individually_valid() {
+        bar_desc().validate().unwrap();
+        book_desc().validate().unwrap();
+    }
+
+    #[test]
+    fn bars_domain_rejects_book_descriptor() {
+        let mut g = WasmGlue::<BarsWithBookDesc>::new();
+        assert_eq!(g.describe(), STATUS_ERROR, "describe");
+        incompatible(&g);
+        let mut g = WasmGlue::<BarsWithBookDesc>::new();
+        assert_eq!(g.create(b"{}"), STATUS_ERROR, "create without describe");
+        incompatible(&g);
+        assert_eq!(BARS_NEW.load(Ordering::SeqCst), 0, "constructor must not run");
+        for op in [OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE, OP_BOOK] {
+            assert_eq!(g.invoke(op, b"{}"), STATUS_INVALID_ARGUMENT, "no instance, op {op}");
+        }
+    }
+
+    #[test]
+    fn book_domain_rejects_bar_descriptor() {
+        let mut g = WasmGlue::<BookWithBarDesc>::new();
+        assert_eq!(g.describe(), STATUS_ERROR, "describe");
+        incompatible(&g);
+        let mut g = WasmGlue::<BookWithBarDesc>::new();
+        assert_eq!(g.create(b"{}"), STATUS_ERROR, "create without describe");
+        incompatible(&g);
+        assert_eq!(BOOK_NEW.load(Ordering::SeqCst), 0, "constructor must not run");
+        let body = serde_json::to_vec(&snapshot()).unwrap();
+        assert_eq!(g.invoke(OP_BOOK, &body), STATUS_INVALID_ARGUMENT, "no instance");
+    }
+
+    #[test]
+    fn matching_domain_create_destroy_recreate() {
+        let mut g = WasmGlue::<Echo>::new();
+        assert_eq!(g.create(b"{}"), STATUS_OK, "create without describe ok");
+        g.destroy();
+        assert_eq!(g.create(b"{}"), STATUS_OK, "recreate");
+        let body = serde_json::to_vec(&snapshot()).unwrap();
+        assert_eq!(g.invoke(OP_BOOK, &body), STATUS_OK);
+        assert_eq!(g.invoke(OP_HISTORY, b"{}"), STATUS_INVALID_ARGUMENT, "wrong-op guard");
+    }
 }
