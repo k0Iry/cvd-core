@@ -11,6 +11,9 @@ const MAX_PAGES: usize = 100;
 const MAX_TRADES: usize = 100_000;
 const DEADLINE: Duration = Duration::from_secs(30);
 const ATTEMPTS: usize = 20;
+/// A primary chunk stops paging this long before the attempt deadline and hands
+/// back its validated prefix, so slow pages still commit progress (deadline unchanged).
+const CHUNK_MARGIN: Duration = Duration::from_secs(5);
 /// Deribit's official public archive of the same matching-engine tape. The
 /// primary gateway only retains about 24 hours of sequences (observed, not a
 /// documented guarantee), so older anchors are bridged from here in bounded,
@@ -206,6 +209,8 @@ fn fatal(e: impl std::fmt::Display) -> HistoryError {
 // Sequence range is fixed to the first queued target throughout the entire episode.
 // On a closed-minute restart a predecessor before the boundary proves the start;
 // neither an empty time window nor an unbounded latest snapshot proves coverage.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn history(
     client: &reqwest::Client,
     base: &str,
@@ -216,6 +221,24 @@ pub(super) async fn history(
     target: u64,
     target_ms: i64,
     fresh: (u64, i64),
+) -> std::result::Result<Vec<Trade>, HistoryError> {
+    history_until(client, base, symbol, size, cursor, from_ms, target, target_ms, fresh, None).await
+}
+
+/// `history` whose primary paging returns the validated contiguous prefix once
+/// `soft_stop` passes (at least one page is always validated first).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn history_until(
+    client: &reqwest::Client,
+    base: &str,
+    symbol: Symbol,
+    size: f64,
+    cursor: Option<u64>,
+    from_ms: Option<i64>,
+    target: u64,
+    target_ms: i64,
+    fresh: (u64, i64),
+    soft_stop: Option<Instant>,
 ) -> std::result::Result<Vec<Trade>, HistoryError> {
     let name = product(symbol);
     // Primary coverage/identity is judged against the freshest observed sequence
@@ -263,19 +286,29 @@ pub(super) async fn history(
     let mut output = Vec::new();
     let mut previous_ms = if cursor.is_some() { from_ms } else { None };
     for _ in 0..MAX_PAGES {
-        let v = get(
-            client,
-            base,
-            "get_last_trades_by_instrument",
-            &[
-                ("instrument_name", name.into()),
-                ("start_seq", next.to_string()),
-                ("end_seq", target.to_string()),
-                ("count", PAGE.to_string()),
-                ("sorting", "asc".into()),
-            ],
-        )
-        .await?;
+        if !output.is_empty() && soft_stop.is_some_and(|t| Instant::now() >= t) {
+            return Ok(output); // bounded validated prefix before the attempt deadline
+        }
+        let params = [
+            ("instrument_name", name.into()),
+            ("start_seq", next.to_string()),
+            ("end_seq", target.to_string()),
+            ("count", PAGE.to_string()),
+            ("sorting", "asc".into()),
+        ];
+        let page = get(client, base, "get_last_trades_by_instrument", &params);
+        // An in-flight later page must not outlive the soft stop: dropping the
+        // HTTP request is cancellation-safe (nothing is ingested here), and the
+        // already validated prefix is returned instead of being lost with the
+        // whole future at the outer deadline. The first page stays unbounded
+        // here (outer deadline/client timeout bound it) since it has no prefix.
+        let v = match soft_stop.filter(|_| !output.is_empty()) {
+            Some(stop) => tokio::select! {
+                v = page => v?,
+                _ = tokio::time::sleep_until(stop) => return Ok(output),
+            },
+            None => page.await?,
+        };
         let rows = v["trades"].as_array().ok_or_else(|| fatal("missing sequence trades"))?;
         let more = v["has_more"].as_bool().ok_or_else(|| fatal("missing has_more"))?;
         if rows.len() > PAGE as usize {
@@ -690,7 +723,7 @@ pub(crate) async fn worker(
                 // Re-derive the coverage/identity basis per attempt: the freshest
                 // retained observation advances while the fixed target ages.
                 let fresh = pending.last_key_value().map_or(fresh, |(&n, t)| (n, t.timestamp_ms));
-                let request = history(
+                let request = history_until(
                     &state.http,
                     &base,
                     symbol,
@@ -700,6 +733,7 @@ pub(crate) async fn worker(
                     target,
                     first_ms,
                     fresh,
+                    deadline.checked_sub(CHUNK_MARGIN),
                 );
                 tokio::pin!(request);
                 let response = loop {
@@ -814,7 +848,8 @@ pub(crate) async fn worker(
                     market,
                     symbol,
                     format!(
-                        "DRB recovery budget exhausted after {attempts} attempts; target {target}; {}",
+                        "DRB recovery budget exhausted after {attempts} attempts without committed progress; processed cursor {}; target {target}; {}",
+                        cursor.map_or("none".into(), |c| c.to_string()),
                         diag.detail.unwrap_or_default()
                     ),
                 )
@@ -825,7 +860,9 @@ pub(crate) async fn worker(
             if pending.is_empty() {
                 budget = None;
                 crate::recovery::mark_live(&state, Exchange::Coinbase, market, symbol).await;
-            } else if long_gap && progressed {
+            } else if progressed {
+                // Any validated+ingested chunk (archive or primary) renews the work
+                // budget; retries, errors, empty REST and new WS arrivals never do.
                 budget = None;
             }
         }

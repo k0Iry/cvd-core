@@ -1199,3 +1199,162 @@ async fn real_archive_chunk_probe() {
 
 #[path = "drb_durability_tests.rs"]
 mod durability;
+
+// ---- Multi-chunk archive -> primary catch-up liveness (t_09c16261) ----
+// Production limits are exercised unchanged: primary PAGE=1000, MAX_PAGES=100,
+// MAX_TRADES=100_000, DEADLINE=30s, ATTEMPTS=20. Only page latency is controlled.
+const MC_A: u64 = 3_000; // archive-only prefix (25h before the target)
+fn mc_ms(seq: u64) -> i64 {
+    if seq <= 10 { 59_000 + seq as i64 }
+    else if seq <= MC_A { 60_000 + (seq - 11) as i64 * 10 }
+    else { 60_000 + 25 * 3_600_000 + (seq - MC_A) as i64 }
+}
+fn mc_row(seq: u64) -> Value {
+    json!({"instrument_name":drb::product(Symbol::Btc),"trade_seq":seq,"timestamp":mc_ms(seq),"price":100.0 + (seq % 7) as f64,
+        "amount":0.001,"contracts":10.0,"direction":if seq.is_multiple_of(3) {"sell"} else {"buy"},"trade_id":format!("USDC-{seq}")})
+}
+fn mc_trade(seq: u64) -> Trade { drb::parse_trade(&mc_row(seq), drb::product(Symbol::Btc), 0.0001).unwrap() }
+/// Primary retains only `top`-relative 24h (i.e. seq > MC_A) and sleeps `lag` per page;
+/// `/archive` serves the whole tape. `hole` is missing from the primary forever.
+#[allow(dead_code)]
+async fn mc_fixture(top: u64, lag: Duration, hole: Option<u64>) -> (String, Arc<AtomicUsize>) {
+    mc_fixture_with(top, Arc::new(move |_| lag), hole).await
+}
+type McLag = Arc<dyn Fn(u64) -> Duration + Send + Sync>;
+/// `lag(start_seq)` controls each primary page's latency.
+async fn mc_fixture_with(top: u64, lag: McLag, hole: Option<u64>) -> (String, Arc<AtomicUsize>) {
+    type Q = axum::extract::Query<std::collections::HashMap<String, String>>;
+    let pages = Arc::new(AtomicUsize::new(0));
+    let p2 = pages.clone();
+    let now = mc_ms(top);
+    let keep = move |n: &u64| now - mc_ms(*n) <= 86_400_000;
+    let primary = move |axum::extract::Query(q): Q| {
+        let pages = p2.clone();
+        let lag = lag.clone();
+        async move {
+            pages.fetch_add(1, Ordering::SeqCst);
+            let start = q["start_seq"].parse::<u64>().unwrap();
+            let t0 = std::time::Instant::now();
+            tokio::time::sleep(lag(start)).await;
+            eprintln!("mc_page start_seq={start} end_seq={} count={} lag={:?}", q["end_seq"], q["count"], t0.elapsed());
+            let (s, e) = (q["start_seq"].parse::<u64>().unwrap(), q["end_seq"].parse::<u64>().unwrap());
+            let rows: Vec<Value> = (s..=e.min(top)).filter(keep).filter(|n| Some(*n) != hole)
+                .take(q["count"].parse().unwrap()).map(mc_row).collect();
+            let more = rows.last().and_then(|v| v["trade_seq"].as_u64()).is_some_and(|n| n < e);
+            axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":more}}))
+        }
+    };
+    let archive = move |axum::extract::Query(q): Q| async move {
+        let (s, e) = (q["start_seq"].parse::<u64>().unwrap(), q["end_seq"].parse::<u64>().unwrap());
+        let rows: Vec<Value> = (s..=e.min(top)).take(1000).map(mc_row).collect();
+        axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":false}}))
+    };
+    let pred = |axum::extract::Query(q): Q| async move {
+        let end = q["end_timestamp"].parse::<i64>().unwrap();
+        let rows: Vec<Value> = (1..=10u64).rev().filter(|n| mc_ms(*n) <= end).take(3).map(mc_row).collect();
+        axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":true}}))
+    };
+    let instrument = json!({"jsonrpc":"2.0","result":{"instrument_name":"BTC_USDC-PERPETUAL","base_currency":"BTC","quote_currency":"USDC","counter_currency":"USDC","settlement_currency":"USDC","kind":"future","future_type":"linear","is_active":true,"contract_size":0.0001}});
+    let app = axum::Router::new()
+        .route("/get_last_trades_by_instrument", axum::routing::get(primary))
+        .route("/archive/get_instrument", axum::routing::get(move || async move { axum::Json(instrument) }))
+        .route("/archive/get_last_trades_by_instrument", axum::routing::get(archive))
+        .route("/archive/get_last_trades_by_instrument_and_time", axum::routing::get(pred));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), pages)
+}
+async fn mc_run(top: u64, lag: Duration, hole: Option<u64>, secs: u64) -> (Arc<AppState>, String, Option<u64>, usize, Duration) {
+    mc_run_with(top, Arc::new(move |_| lag), hole, secs).await
+}
+async fn mc_run_with(top: u64, lag: McLag, hole: Option<u64>, secs: u64) -> (Arc<AppState>, String, Option<u64>, usize, Duration) {
+    let (base, pages) = mc_fixture_with(top, lag, hole).await;
+    let s = Arc::new(crate::tests::state().await);
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    sh.engine.lock().await.recovery_from_ms = Some(60_000);
+    let (tx, rx) = mpsc::channel(8);
+    let start = std::time::Instant::now();
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+    tx.send(mc_trade(top)).await.unwrap();
+    let mut lied = None;
+    let state = tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            let st = sh.recovery.read().await.state.clone();
+            let c = sh.engine.lock().await.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+            if st == "live" && c != Some(top) { lied = Some(c); }
+            if st == "live" || st == "needs_backfill" { break st; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("terminal state not reached");
+    assert_eq!(lied, None, "reported live before fixed target {top}");
+    let elapsed = start.elapsed();
+    let detail = sh.recovery.read().await.detail.clone().unwrap_or_default();
+    let cursor = sh.engine.lock().await.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+    eprintln!("mc_run top={top} -> {state} cursor={cursor:?} pages={} elapsed={elapsed:?} detail={detail}", pages.load(Ordering::SeqCst));
+    drop(tx);
+    let _ = w.await;
+    (s, if state == "live" { "live".into() } else { detail }, cursor, pages.load(Ordering::SeqCst), elapsed)
+}
+
+#[tokio::test]
+async fn archive_to_multi_chunk_primary_catch_up_renews_only_on_committed_progress() {
+    // 3 full 100k primary chunks + remainder after the archive bridge; 150ms/page
+    // makes one chunk ~15s, so the healthy total (>45s) exceeds one 30s budget.
+    let top = MC_A + 320_000;
+    let (s, outcome, cursor, pages, elapsed) = mc_run(top, Duration::from_millis(150), None, 240).await;
+    assert_eq!(outcome, "live", "healthy multi-chunk catch-up must not exhaust the budget");
+    assert_eq!(cursor, Some(top));
+    assert!(pages >= 320, "production page limits: >=320 primary pages of 1000");
+    assert!(elapsed > Duration::from_secs(30), "crossed the old single-budget boundary: {elapsed:?}");
+    let reference = Arc::new(crate::tests::state().await);
+    for n in 11..=top { crate::ingestion::ingest_trade(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc, mc_trade(n)).await.unwrap(); }
+    let r = crate::pick_shard(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    assert_eq!(m1(sh).await, m1(r).await, "exact bars/volumes/CVD");
+    assert_eq!(*sh.cvd_closed_usdt.read().await, *r.cvd_closed_usdt.read().await);
+    assert_eq!(sh.engine.lock().await.sec.trades, r.engine.lock().await.sec.trades);
+}
+
+#[tokio::test]
+async fn slow_primary_pages_commit_bounded_prefix_before_deadline() {
+    // 100 pages at 400ms = 40s > 30s deadline: an all-or-nothing chunk never commits.
+    let top = MC_A + 110_000;
+    let (_, outcome, cursor, _, _) = mc_run(top, Duration::from_millis(400), None, 240).await;
+    assert_eq!(outcome, "live");
+    assert_eq!(cursor, Some(top));
+}
+
+#[tokio::test]
+async fn in_flight_slow_page_crossing_soft_stop_returns_validated_prefix() {
+    // The archive bridge commits through MC_A+610 (renewing the budget); primary
+    // pages then start at MC_A+611 (fast), +1611, +2611, +3611 (12s each, < 15s
+    // client timeout). The third slow page starts ~24s into the renewed budget,
+    // before the 25s soft stop, and would finish ~36s, after the unchanged 30s
+    // deadline. The validated prefix through MC_A+3610 must be handed back,
+    // not dropped with the in-flight future.
+    let top = MC_A + 5_000;
+    let slow: McLag = Arc::new(|s| if [MC_A + 1_611, MC_A + 2_611, MC_A + 3_611].contains(&s) { Duration::from_secs(12) } else { Duration::from_millis(1) });
+    let (s, outcome, cursor, _, _) = mc_run_with(top, slow, None, 240).await;
+    assert_eq!(outcome, "live", "in-flight slow page must not discard the validated prefix");
+    assert_eq!(cursor, Some(top));
+    let reference = Arc::new(crate::tests::state().await);
+    for n in 11..=top { crate::ingestion::ingest_trade(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc, mc_trade(n)).await.unwrap(); }
+    let (a, b) = (crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc), crate::pick_shard(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc));
+    assert_eq!(m1(a).await, m1(b).await, "exact bars/volumes/CVD");
+    assert_eq!(*a.cvd_closed_usdt.read().await, *b.cvd_closed_usdt.read().await);
+}
+
+#[tokio::test]
+async fn primary_hole_after_progress_still_ends_bounded_without_skipping() {
+    // Progress renews the budget, but a permanent hole yields retries only: terminal.
+    let top = MC_A + 20_000;
+    let hole = MC_A + 12_345;
+    let (_, outcome, cursor, _, elapsed) = mc_run(top, Duration::from_millis(1), Some(hole), 240).await;
+    assert!(outcome.contains("budget exhausted") && outcome.contains(&format!("unproven sequence {hole}")), "{outcome}");
+    assert!(cursor.is_some_and(|c| c < hole), "never past the hole");
+    // Wall time is load-dependent (each committed prefix legitimately renews); the
+    // structural bound is the unchanged 20-attempt cap once progress stops.
+    assert!(outcome.contains("after 20 attempts without committed progress"), "{outcome}");
+    let _ = elapsed;
+}

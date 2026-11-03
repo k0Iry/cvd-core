@@ -5,9 +5,9 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-13"
-import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-13"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-13"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-14"
+import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-14"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-14"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -957,6 +957,9 @@ async function initLocalPlugins() {
             onChange: () => queueMicrotask(() => renderIndicatorMenu()),
             wsUrl: src => { const u = new URL(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/book`); for (const [k, v] of Object.entries(src)) u.searchParams.set(k, v); return u } })
         localCompute = createLocalCompute({ host: localHost, coord: localCoord, onResult: onLocalResult, onStatus: onLocalStatus, onInvalid: onLocalInvalid, onView: onLocalView, log: (...a) => console.warn(...a) })
+        // Adopt the CURRENT page lifecycle before any plugin/demand admission:
+        // visibilitychange/pagehide may already have fired during the awaits above.
+        syncLocalComputeLifecycle()
     } catch (error) {
         console.warn("local plugin host unavailable", error)
         localUnavailable = "local plugin host unavailable (unsupported or failed to load)"
@@ -2525,9 +2528,19 @@ aggToggle.onchange = () => {
 }
 screenshotBtn.onclick = () => downloadChartScreenshot()
 
+// Local plugin Workers follow page visibility: hidden -> cancel in-flight
+// calls and issue none (Safari suspends Workers while the deadline timer keeps
+// wall time); visible -> rebuild from the latest demand without a new tick.
+function syncLocalComputeLifecycle() {
+    if (!localCompute) return
+    if (visualWorkSuspended()) localCompute.suspend()
+    else localCompute.resume()
+}
+
 document.addEventListener("visibilitychange", () => {
     // Keep network + title live, but cancel visual work that Safari may defer.
     keepUpdatesActive()
+    syncLocalComputeLifecycle()
     if (visualWorkSuspended()) {
         chartNeedsRender = true
         cancelVisualWork()
@@ -2538,11 +2551,13 @@ document.addEventListener("visibilitychange", () => {
 
 window.addEventListener("focus", () => {
     keepUpdatesActive()
+    syncLocalComputeLifecycle()
     resumeUpdates().catch(err => console.warn("focus resume failed", err))
 })
 
 window.addEventListener("pageshow", () => {
     pageAway = false
+    syncLocalComputeLifecycle()
     if (prefsHydrated) restartSourceStatus()
     startQualityTimer()
     updateQualityReadout()
@@ -2552,6 +2567,7 @@ window.addEventListener("pageshow", () => {
 
 window.addEventListener("pagehide", () => {
     pageAway = true
+    syncLocalComputeLifecycle()
     stopSourceStatus()
     clearInterval(qualityTimer)
     qualityTimer = null

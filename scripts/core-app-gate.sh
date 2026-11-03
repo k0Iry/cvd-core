@@ -13,7 +13,7 @@
 # CORE_APP_GATE_INJECT=<build|assemble|interaction|inventory|coverage|lwcrender> forces that step
 # to fail (control: omitted required work can never return zero).
 set -euo pipefail
-# One validator for BOTH pinned inventories (default 13 and ctxdemo coverage 2):
+# One validator for BOTH pinned inventories (default 15 and ctxdemo coverage 2):
 #   check_inventory <label> <interaction-results.json> <comma-sorted-want>
 # Nonzero unless the scenario set equals want exactly, every scenario all_ok,
 # errors empty and cleanup.ok === true. Inputs pass as argv (no interpolation).
@@ -67,12 +67,12 @@ CVD_STATIC_ROOT=$ST CVD_LOCAL_WASM=$FX/cvd_indicator_cvd.wasm,$FX/cvd_indicator_
   CVD_INTERACTION_OUT=$RES CVD_REPS=$REPS timeout 3000 node tests/browser-interaction.mjs
 echo "== scenario inventory"
 inject inventory
-# Pinned scenario inventory (13); a skipped or renamed scenario fails.
-want=cached_drag,cached_zoom,crossing_buffer,crossing_newer,hidden_resize_resume,history_prepend_delayed,indicator_menu,long_drag,pane_contract,realtime_while_history,source_reset_new_grid,source_status,wide_zoom_return
+# Pinned scenario inventory (15); a skipped or renamed scenario fails.
+want=cached_drag,cached_zoom,crossing_buffer,crossing_newer,hidden_resize_resume,history_prepend_delayed,indicator_menu,lifecycle_away_inflight_return,lifecycle_hidden_async_init,long_drag,pane_contract,realtime_while_history,source_reset_new_grid,source_status,wide_zoom_return
 check_inventory scenario "$RES/interaction-results.json" "$want"
 echo "== warm-up coverage (cvd+flow+ctxdemo; 30m drag + same-fix TF roundtrip)"
 inject coverage
-# Separate run so the 13-scenario inventory keeps its 2-plugin expectations.
+# Separate run so the 15-scenario inventory keeps its 2-plugin expectations.
 # Pinned coverage inventory (2); omission/rename/failure is nonzero.
 covwant=tf_roundtrip_pending,warmup_exposed_drag
 CVD_STATIC_ROOT=$ST CVD_LOCAL_WASM=$FX/cvd_indicator_cvd.wasm,$FX/cvd_indicator_flow.wasm,$FX/cvd_indicator_ctxdemo.wasm \

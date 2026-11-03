@@ -874,6 +874,78 @@ const scenarios = {
             tail_rendered: tail.at(-1).time === expect.time && tail.at(-1).close === expect.price_close + 1,
         } }
     },
+    // Page-lifecycle regressions (audit P). SYNTHETIC visibility injection
+    // (__cvd.setHidden / overridden document.hidden) in headless Chromium: this
+    // is NOT Safari emulation or Safari acceptance. Worker work is observed by
+    // counting real Worker.postMessage calls in the served app.
+    async lifecycle_hidden_async_init() {
+        // P-1: hidden while the trusted host wasm (async init) is still held.
+        const probe = await call('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+            const p = globalThis.__wpm = { n: 0 }; const real = Worker.prototype.postMessage
+            Worker.prototype.postMessage = function (...a) { p.n++; return real.apply(this, a) } })()` })
+        const ids = runners.map(r => r.descriptor.id)
+        await evaluate(`sessionStorage.setItem('cvd_keep_prefs', '1')`)
+        control.assetFault = { path: '/wasm-host/cvd_browser_host.wasm', delayMs: 2500 }
+        await call('Page.reload', {})
+        let x
+        try {
+            await waitFor(`!!globalThis.__cvd && !!globalThis.__wpm`)
+            const computeAtHide = await evaluate(`(__cvd.setHidden(true), __cvd.localCompute() === null)`)
+            const pushes0 = control.livePushes
+            await waitFor(`!!__cvd.localCompute() && __cvd.localRecords().size >= ${ids.length} && __cvd.page.bars.length > 0`, 20000)
+            await sleep(1500)
+            const hidden = await evaluate(`({ posts: __wpm.n, suspended: __cvd.localCompute().suspended(), faults: __cvd.faults() })`)
+            await evaluate('__cvd.setHidden(false)')
+            let filled = true
+            try { await waitFor(`__cvd.localCompute().idle() && ${JSON.stringify(ids)}.every(id => __cvd.pluginSeries(id).some(s => s.visible && s.points > 0))`, 30000) } catch { filled = false }
+            const back = await evaluate(`({ posts: __wpm.n, suspended: __cvd.localCompute().suspended(), faults: __cvd.faults() })`)
+            x = { computeAtHide, hidden, back, filled, livePushes: control.livePushes - pushes0 }
+        } finally {
+            control.assetFault = null
+            await evaluate(`sessionStorage.removeItem('cvd_keep_prefs')`).catch(() => {})
+            await call('Page.removeScriptToEvaluateOnNewDocument', { identifier: probe.identifier })
+        }
+        return { m: { calls: {}, requests: [], setBarsMs: [], longTasks: [], frames: [], coverageMisses: null, wallMs: null, input: {}, extra: x }, checks: {
+            hidden_before_driver_exists: x.computeAtHide === true,
+            no_worker_work_hidden: x.hidden.posts === 0,
+            driver_created_suspended: x.hidden.suspended === true,
+            no_fault_hidden: Object.keys(x.hidden.faults).length === 0,
+            return_fills_without_market_input: x.filled && x.back.posts > 0 && x.back.suspended === false && x.livePushes === 0,
+            no_fault_after_return: Object.keys(x.back.faults).length === 0,
+        } }
+    },
+    async lifecycle_away_inflight_return() {
+        // Away while a Worker call is in flight, stay away past the 5000 ms
+        // deadline, change scope while away, return on a quiet source.
+        const probe = await evaluate(`(() => { const p = globalThis.__wpm = { n: 0 }; const real = Worker.prototype.postMessage
+            Worker.prototype.__realPost ??= real; Worker.prototype.postMessage = function (...a) { p.n++; return Worker.prototype.__realPost.apply(this, a) }; return true })()`)
+        const ids = runners.map(r => r.descriptor.id)
+        const pushes0 = control.livePushes
+        await evaluate(`(() => { const s = __cvd.elements.tfSel; s.value = '5m'; s.dispatchEvent(new Event('change')) })()`)
+        const caught = await evaluate(`new Promise(r => { const t0 = performance.now(); const t = () => { const c = __cvd.localCompute()
+            if (!c.idle()) { __cvd.setHidden(true); r(true) } else if (performance.now() - t0 > 10000) r(false); else setTimeout(t, 0) }; t() })`)
+        const postsAtHide = await evaluate('__wpm.n')
+        await sleep(6000) // > 5000 ms Worker deadline while away
+        await evaluate(`(() => { const s = __cvd.elements.tfSel; s.value = '15m'; s.dispatchEvent(new Event('change')) })()`)
+        await sleep(1500)
+        const hidden = await evaluate(`({ posts: __wpm.n, suspended: __cvd.localCompute().suspended(), faults: __cvd.faults(), tf: __cvd.elements.tfSel.value })`)
+        await evaluate('__cvd.setHidden(false)')
+        let filled = true
+        try { await waitFor(`__cvd.localCompute().idle() && ${JSON.stringify(ids)}.every(id => __cvd.pluginSeries(id).some(s => s.visible && s.points > 0))`, 30000) } catch { filled = false }
+        await sleep(6000) // any stale deadline / late reply of the cancelled call would land here
+        const back = await evaluate(`({ posts: __wpm.n, faults: __cvd.faults(), lastTime: __cvd.page.bars.at(-1).time,
+            newest: [...__cvd.localValues().values()].filter(m => m.has(__cvd.page.bars.at(-1).time)).length })`)
+        await evaluate(`(() => { const s = __cvd.elements.tfSel; s.value = '1m'; s.dispatchEvent(new Event('change')) })()`)
+        await waitFor(`__cvd.localCompute().idle()`, 30000).catch(() => {})
+        const x = { probe, caught, postsAtHide, hidden, back, filled, livePushes: control.livePushes - pushes0 }
+        return { m: { calls: {}, requests: [], setBarsMs: [], longTasks: [], frames: [], coverageMisses: null, wallMs: null, input: {}, extra: x }, checks: {
+            hidden_with_call_in_flight: x.caught === true,
+            no_worker_work_while_away: x.hidden.posts === x.postsAtHide,
+            no_deadline_fault_while_away: Object.keys(x.hidden.faults).length === 0 && x.hidden.suspended === true,
+            newest_scope_on_quiet_return: x.filled && x.hidden.tf === '15m' && x.back.newest > 0 && x.livePushes === 0,
+            no_late_fault_after_return: Object.keys(x.back.faults).length === 0,
+        } }
+    },
     async hidden_resize_resume() {
         const cached = await evaluate('__cvd.page.bars.length')
         await position(cached - 170, 160)

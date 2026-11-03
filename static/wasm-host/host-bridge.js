@@ -99,9 +99,15 @@ export class WasmPluginHost {
         try { issued = this._fence({ cmd: "issue", instance, scope_key: scopeKey, revision, op }) } catch (e) { return Promise.reject(e) }
         const { id, generation } = issued
         return new Promise((resolve, reject) => {
+            const t0 = Date.now()
             const timer = setTimeout(() => {
                 // Bound to this exact request AND worker incarnation.
                 if (!this.waiters.has(id) || this.instances.get(instance) !== rec) return
+                // Privacy-safe lifecycle diagnostic (no plugin/market content):
+                // `lateMs` = how late this timer callback ran. Alone it does NOT
+                // prove Safari suspension (queue load or clock changes also delay it).
+                const elapsedMs = Date.now() - t0
+                this.lastDeadline = { op, limitMs: ms, elapsedMs, lateMs: elapsedMs - ms, hidden: globalThis.document?.hidden ?? null }
                 this._kill(instance, rec, "deadline")
             }, ms)
             rec.busy = true
@@ -222,7 +228,7 @@ export class WasmPluginHost {
 
     stats() {
         let timers = 0; for (const w of this.waiters.values()) if (w.timer) timers++
-        return Object.assign(this._fence({ cmd: "stats" }), { dropped: this.dropped, running: this.instances.size, waiters: this.waiters.size, timers })
+        return Object.assign(this._fence({ cmd: "stats" }), { dropped: this.dropped, running: this.instances.size, waiters: this.waiters.size, timers, lastDeadline: this.lastDeadline ?? null })
     }
 }
 
@@ -300,6 +306,15 @@ const SLICE = 8
 export function createLocalCompute({ host, coord, onResult, onStatus, onInvalid, onView, log = () => {}, schedule = f => setTimeout(f, 0) }) {
     const io = new Map()          // id -> { bytes, params } (Worker inputs only)
     const running = new Set()
+    const busy = new Map()        // id -> instance with a Worker call in flight (this driver only)
+    // Page lifecycle (tab hidden/pagehide): Safari suspends the page/Worker but
+    // the controlling-thread deadline timer keeps wall time, so an in-flight
+    // call can be reported `deadline` on return although nothing hung. While
+    // suspended no Worker work is issued; in-flight work is physically
+    // cancelled (`host.disable` terminates that exact incarnation -> `disabled`,
+    // an existing Rust RELOAD code, never a fault). resume() rebuilds from the
+    // latest demand. Active-page deadlines are unchanged.
+    let suspended = false
     let sent = null               // {scopeKey, historyRevision, len} of the last accepted demand
 
     const wantOf = w => ({ scopeKey: w.scope_key, revision: w.revision, historyRevision: w.history_revision, mode: w.mode })
@@ -336,13 +351,14 @@ export function createLocalCompute({ host, coord, onResult, onStatus, onInvalid,
         if (running.has(id)) return
         running.add(id)
         try {
-            for (let i = 0; i < SLICE && io.has(id); i++) {
+            for (let i = 0; i < SLICE && io.has(id) && !suspended; i++) {
                 const a = coord.next(id)
                 const fa = emit(a.events)
                 if (fa) { presentationFailed(fa); break }   // fault also clears any installed inflight token
                 if (a.act === "idle") break
                 if (a.act === "again") continue
                 let r
+                busy.set(id, a.inst)
                 if (a.act === "load") {
                     const p = io.get(id)
                     try { const { descriptor } = await host.load(a.inst, p.bytes, JSON.stringify(p.params ?? {})); r = coord.done(id, a.token, null, descriptor) }
@@ -352,15 +368,30 @@ export function createLocalCompute({ host, coord, onResult, onStatus, onInvalid,
                     try { raw = await host.compute(a.inst, a.scope_key, a.revision, a.op, a.body) } catch (error) { failure = code(error) }
                     r = failure ? coord.done(id, a.token, failure) : coord.doneOutput(id, a.token, raw)
                 }
+                busy.delete(id)
                 const fr = emit(r.events)
                 if (fr) { presentationFailed(fr); break }
                 if (!r.more) break
             }
         } catch (error) { log("local plugin driver error", id, error) }
-        finally { running.delete(id) }
-        if (io.has(id) && coord.pending(id)) schedule(() => run(id))
+        finally { running.delete(id); busy.delete(id) }
+        if (!suspended && io.has(id) && coord.pending(id)) schedule(() => run(id))
     }
-    function kickAll() { for (const id of io.keys()) run(id) }
+    function kickAll() { if (!suspended) for (const id of io.keys()) run(id) }
+
+    function suspend() {
+        if (suspended) return
+        suspended = true
+        for (const [id, inst] of [...busy]) {
+            log("local plugin in-flight call cancelled (page hidden)", id, "suspended")
+            try { host.disable(inst) } catch (_) {}
+        }
+    }
+    function resume() {
+        if (!suspended) return
+        suspended = false
+        kickAll()
+    }
 
     function setPlugins(list) {
         for (const id of [...io.keys()]) if (!list.some(p => p.id === id)) io.delete(id)
@@ -400,7 +431,8 @@ export function createLocalCompute({ host, coord, onResult, onStatus, onInvalid,
     }
 
     return {
-        setPlugins, setDemand,
+        setPlugins, setDemand, suspend, resume,
+        suspended: () => suspended,
         clearFault: id => coord.clearFault(id),
         // Synchronous invalidation before a canonical bar changes: returns the
         // view diff the caller must apply before any stale write/readout.
