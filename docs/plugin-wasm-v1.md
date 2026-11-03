@@ -5,59 +5,20 @@ visitor imports it locally in the browser (Indicators → Import). The server
 never loads, stores or runs plugins. It only serves base data. Plugins have no
 imports, so they cannot reach the network.
 
-This document is the normative contract for the WASM module. The JSON bodies
-(descriptor, requests, output, errors) are defined in
-[`plugin-api-v1.md`](plugin-api-v1.md). If the two disagree about module
-profile, resources, lifecycle or errors, this document wins.
+This document defines the WASM module and browser-host contract. The shared
+[JSON reference](plugin-api-v1.md) defines descriptors, bars, requests and outputs.
 
 ## 1. Quick start (Rust SDK)
 
-Most authors only need this section.
+Follow the [authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md)
+to copy the public example, configure the SDK and memory limit, build a standalone
+`wasm32-unknown-unknown` module, and import it through **Indicators → Import**.
+The SDK's `export_indicator!` supplies the exports; no wasm-bindgen or JS glue is
+needed. Host test fixtures are not author templates.
 
-1. Write the indicator with the SDK: `impl Indicator for T` and
-   `export_indicator!(T)`. Follow the public
-   [authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md)
-   and the example
-   [`examples/range`](https://github.com/k0Iry/cvd-indicators/tree/master/examples/range).
-   (`tests/fixtures/plugins/sample-indicator` is a host test fixture, not a
-   template.) [`plugin-api-v1.md`](plugin-api-v1.md) is retired as an
-   architecture document; use it only for the shared JSON model:
-   [Descriptor](plugin-api-v1.md#4-descriptor) and
-   [Canonical input](plugin-api-v1.md#5-canonical-input-inputbar).
-2. In the plugin's `Cargo.toml`, build a `cdylib`. Add the profile too; in a
-   Cargo workspace, profiles only take effect in the workspace-root
-   `Cargo.toml`:
-
-   ```toml
-   [lib]
-   crate-type = ["cdylib", "rlib"]
-
-   [profile.wasm-release]
-   inherits = "release"
-   panic = "abort"
-   ```
-
-3. In `.cargo/config.toml`, declare the memory maximum (512 MiB):
-
-   ```toml
-   [target.wasm32-unknown-unknown]
-   rustflags = ["-C", "link-arg=--max-memory=536870912"]
-   ```
-
-4. Build:
-
-   ```sh
-   rustup target add wasm32-unknown-unknown
-   cargo build --target wasm32-unknown-unknown --profile wasm-release
-   ```
-
-5. Import the `.wasm` file from
-   `target/wasm32-unknown-unknown/wasm-release/` in the browser
-   (Indicators → Import).
-
-Do not use wasm-bindgen or JS glue. The SDK emits every required export for
-you. The rest of this document matters only if you write a module without the
-SDK, or want to know exactly what the host checks.
+The reference below is for module authors and host maintainers. Shared fields:
+[Descriptor](plugin-api-v1.md#4-descriptor) ·
+[Canonical input](plugin-api-v1.md#5-canonical-input-inputbar).
 
 ## 2. Base data your plugin sees
 

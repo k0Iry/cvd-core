@@ -1,99 +1,15 @@
-> **RETIRED (server native runner).** The server no longer loads plugins and no
-> `cvd-indicator-runner` ships. The normative contract is
-> [`plugin-wasm-v1.md`](plugin-wasm-v1.md); this file is kept only as historical
-> reference for the SDK's shared data model.
+# CVD plugin JSON reference (v1)
 
-# CVD indicator plugin API v1
+Shared data types for SDK and browser-WASM indicators. For build/import steps,
+use the [authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md);
+for module exports, limits and isolation, use the [WASM contract](plugin-wasm-v1.md).
+The server does not load plugins or ship a native runner.
 
-Status: **frozen for v1** (ABI_VERSION = 1, PROTOCOL_VERSION = 1). Changes go
-through the parent maintainer; additive changes must keep v1 libraries loading.
-
-Authoritative source: `crates/indicator-sdk` (`abi.rs`, `model.rs`,
-`protocol.rs`, `author.rs`). This document explains it; if the two disagree,
-the code is a bug to report, not a fork to follow.
-
-## 1. Architecture
-
-```
-cvd-core host  ──frames(stdin/stdout)──►  cvd-indicator-runner  ──C ABI──►  lib<indicator>.so
- (ingestion,                               (one process per                (Rust cdylib built
-  persistence,                              configured library;             with the SDK)
-  HTTP/WS)                                  empty env, cwd=/)
-```
-
-* The host **never** `dlopen`s an indicator. Libraries are loaded only by the
-  runner, a separate process. Crash / abort / segfault / hang of library code
-  kills at most that runner. The host kills runners that exceed a deadline.
-* A subprocess is **not** a security sandbox: the library runs with the
-  runner's OS privileges. Only operator-owned paths from host configuration
-  are ever loaded; no path or URL is accepted from users/clients.
-* No hot unloading: the library stays mapped until the runner exits.
-
-## 2. C ABI (library side)
-
-Export (the SDK macro does this):
-
-```c
-const CvdPluginApiV1* cvd_plugin_entry_v1(uint32_t host_abi_version);
-```
-
-Return NULL if `host_abi_version` is unsupported. The table:
-
-```c
-typedef struct { uint8_t* ptr; size_t len; size_t cap; } CvdBuffer;   // library-owned
-typedef struct {
-  uint32_t abi_version;   // must be 1
-  uint32_t struct_size;   // >= sizeof(v1 table); runner rejects smaller
-  int32_t (*describe)(CvdBuffer* out);                                   // Descriptor JSON
-  int32_t (*create)(const uint8_t* params, size_t len, void** out_handle, CvdBuffer* out_err);
-  int32_t (*invoke)(void* handle, uint32_t op, const uint8_t* in, size_t len, CvdBuffer* out);
-  void    (*destroy)(void* handle);
-  void    (*free_buffer)(CvdBuffer buf);                                 // frees any buffer above
-} CvdPluginApiV1;
-```
-
-Status codes: `0 OK`, `1 ERROR` (out = PluginError JSON), `2 PANIC`
-(caught at the boundary), `3 INVALID_ARGUMENT`.
-Operations: `1 HISTORY`, `2 LIVE_INIT`, `3 LIVE_UPDATE`.
-
-Ownership: every `CvdBuffer` written by the library is released by calling
-**that library's** `free_buffer` exactly once. Handles are opaque and
-destroyed with `destroy`. No `Vec`/`String`/trait object crosses the boundary.
-Panics never unwind across `extern "C"`: the SDK wraps every entry in
-`catch_unwind`; a panic during `invoke` also drops that instance's live state.
-
-## 3. Authoring (safe Rust)
-
-```rust
-use cvd_indicator_sdk::*;
-struct MyInd { n: usize }
-impl Indicator for MyInd {
-    fn descriptor() -> Descriptor { /* id, version, context, params, outputs */ }
-    fn new(p: &ParamValues) -> Result<Self, PluginError> { Ok(Self { n: p.int("n").unwrap() as usize }) }
-    fn compute(&mut self, ctx: &ComputeContext, bars: &[InputBar], output_from: usize)
-        -> Result<SeriesSet, PluginError> { /* columns for bars[output_from..] */ }
-}
-export_indicator!(MyInd);
-```
-
-Crate type `cdylib` (plus `rlib` if you want in-process unit tests). The SDK
-handles parameter defaults/range checks, input monotonicity/finite checks,
-live window bookkeeping and output validation. Author example: public
-[`examples/range`](https://github.com/k0Iry/cvd-indicators/tree/master/examples/range)
-([authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md)).
-`tests/fixtures/plugins/sample-indicator` is a host test fixture, not an author template.
-
-`ctx.phase` (`ComputePhase`, `#[non_exhaustive]`) states which operation
-triggered the call — `History` (`OP_HISTORY`; output `bars[output_from..]`),
-`LiveInit` (`OP_LIVE_INIT`; window truncated to `context + 1 + 64`, output is
-the last bar) or `LiveUpdate` (`OP_LIVE_UPDATE`; output from the earliest
-touched bar). Do not infer the phase from call counts. Canonical `time`,
-warm-up and output extents are unchanged by this field; it is in-process only
-and not part of the wire format.
-
-Floats: the SDK, runner and host enable `serde_json/float_roundtrip`, so every
-finite `f64` crosses the JSON wire bit-exactly regardless of the plugin
-crate's own feature set (regression: `crates/indicator-sdk/tests/float_roundtrip.rs`).
+Definitions: [`model.rs`](../crates/indicator-sdk/src/model.rs) and
+[`author.rs`](../crates/indicator-sdk/src/author.rs). `ComputeContext.phase`
+explicitly distinguishes `History`, `LiveInit` and `LiveUpdate`; do not infer
+phase from call counts. It is an in-process SDK field, not a JSON field.
+The SDK enables `serde_json/float_roundtrip` for bit-exact finite `f64` values.
 
 ## 4. Descriptor
 
@@ -126,7 +42,8 @@ crate's own feature set (regression: `crates/indicator-sdk/tests/float_roundtrip
   * `readout_only: bool` (default `false`) — the output is an ordinary `line`
     column that is **not drawn**; it is shown only in readouts/legends with its
     label and pane (e.g. a quote-volume Total). Only valid with `type: line`.
-  Descriptors violating these bounds are rejected as `incompatible`.
+  Invalid descriptors are rejected; browser-host errors are defined in the
+  [WASM contract](plugin-wasm-v1.md#6-runtime-failures-and-isolation).
 
 ## 5. Canonical input (`InputBar`)
 
@@ -165,66 +82,58 @@ receive no credentials, SQL, browser or network authority.
   `replace` overwrites a bar in the window (never accumulates). A rejected
   delta leaves state unchanged. Output covers first touched bar → window end.
 
-Output (all kinds aligned to `times`, values finite or `null`):
+Output is `{times, series}`. `series` is keyed by descriptor output key; its
+set of keys must match the descriptor exactly. Each entry has a `type` and:
 
-```json
-{ "times": [1700000060, …],
-  "series": { "sma": {"type":"line","values":[null, 101.2]},
-              "channel": {"type":"dual_range","upper":[…],"lower":[…]},
-              "delta": {"type":"histogram","values":[…]},
-              "extremes": {"type":"segmented_lines","layers":[[…],[…]]} } }
+| Type | Value fields |
+|---|---|
+| `line`, `histogram` | `values` |
+| `dual_range` | `upper`, `lower` |
+| `segmented_lines` | `layers` (one array per declared layer) |
+
+Every value array aligns one-for-one with `times`; values are finite numbers
+or `null`, never NaN/Infinity. Errors use `PluginError {code, message}`; messages
+are limited to 512 bytes and must not expose host diagnostics. Browser-host
+revision guards and failures are specified in the
+[WASM contract](plugin-wasm-v1.md#5-history-and-live-semantics).
+
+## Native SDK compatibility
+
+The SDK still exports a native C ABI for offline callers. It is not a server
+plugin deployment path; the app uses the [WASM ABI](plugin-wasm-v1.md).
+
+Export (provided by the SDK macro):
+
+```c
+const CvdPluginApiV1* cvd_plugin_entry_v1(uint32_t host_abi_version);
 ```
 
-The set of series must equal the descriptor outputs exactly.
+Return NULL if `host_abi_version` is unsupported. The table:
 
-## 7. Runner frame protocol
-
-40-byte little-endian header, then `params_len` bytes params JSON, then
-`body_len` bytes body JSON:
-
+```c
+typedef struct { uint8_t* ptr; size_t len; size_t cap; } CvdBuffer;   // library-owned
+typedef struct {
+  uint32_t abi_version;   // must be 1
+  uint32_t struct_size;   // >= sizeof(v1 table); runner rejects smaller
+  int32_t (*describe)(CvdBuffer* out);                                   // Descriptor JSON
+  int32_t (*create)(const uint8_t* params, size_t len, void** out_handle, CvdBuffer* out_err);
+  int32_t (*invoke)(void* handle, uint32_t op, const uint8_t* in, size_t len, CvdBuffer* out);
+  void    (*destroy)(void* handle);
+  void    (*free_buffer)(CvdBuffer buf);                                 // frees any buffer above
+} CvdPluginApiV1;
 ```
-"CVDP" | u16 version=1 | u16 kind | u64 request_id | u64 session | u64 generation | u32 params_len | u32 body_len
-```
 
-Kinds: `1 Hello`(host→runner, body `{"protocol":1,"abi":1}`), `2 Ready` (body =
-descriptor JSON), `10 History`, `11 LiveOpen`, `12 LiveUpdate` (no params),
-`13 LiveClose`, `20 Result` (body = library output bytes verbatim), `21 Error`
-(public PluginError), `30 Shutdown`.
+Status codes: `0 OK`, `1 ERROR` (out = PluginError JSON), `2 PANIC`
+(caught at the boundary), `3 INVALID_ARGUMENT`.
+Operations: `1 HISTORY`, `2 LIVE_INIT`, `3 LIVE_UPDATE`.
 
-* The host encodes each request once; the runner forwards the params/body
-  byte ranges to the library and the library's output bytes back without
-  re-serialisation.
-* Every response echoes `request_id`, `session`, `generation`; any mismatch,
-  bad magic/version/kind or oversize frame is a protocol violation and the
-  host kills the runner.
-* `LiveUpdate` whose `generation` differs from the session's open generation is
-  rejected (`stale_generation`). Hosts bump generation on source reset so stale
-  results never attach to new data.
-* Library writes to fd 1 are redirected to stderr by the runner; only frames
-  appear on stdout. Runner stderr is captured (bounded tail) for **local**
-  diagnostics only.
+Ownership: every `CvdBuffer` written by the library is released by calling
+**that library's** `free_buffer` exactly once. Handles are opaque and
+destroyed with `destroy`. No `Vec`/`String`/trait object crosses the boundary.
+Panics never unwind across `extern "C"`: the SDK wraps every entry in
+`catch_unwind`; a panic during `invoke` also drops that instance's live state.
 
-## 8. Limits and failures
-
-Defaults (`protocol::Limits`): request 16 MiB, response 32 MiB, context ≤ 8192
-bars, ≤ 16 384 bars per request, ≤ 512 live sessions per runner. Sized from the
-canonical bar JSON (~560 B/bar): 1600-bar page + 8192 warm-up ≈ 5.5 MB.
-
-Public error codes: `invalid_input invalid_params compute_failed plugin_panic
-sequence_gap stale_generation unknown_session limit_exceeded invalid_output
-protocol_error unavailable timeout crashed incompatible`. Messages are ≤ 512
-bytes and never contain host paths, stderr, or raw OS errors.
-
-| event | runner | host |
-|---|---|---|
-| plugin error / panic / invalid output | stays up | marks that result unavailable |
-| abort / segfault / exit | dies | `crashed`, restart with backoff, sessions re-opened by replay |
-| hang | killed at deadline | `timeout`, same as crash |
-| bad ABI / missing symbol / bad descriptor | handshake `Error`, exits | `incompatible`, indicator marked failed |
-
-## 9. Testing (historical)
-
-The native runner, its `cvd-indicator-host` crate and the fault-injection
-fixture no longer exist, so the former `cargo test -p cvd-indicator-host`
-command cannot be run. Current coverage of the WASM contract lives with
-[`plugin-wasm-v1.md`](plugin-wasm-v1.md) and the browser-host tests.
+The native ABI layout and retained frame types are documented in
+[`abi.rs`](../crates/indicator-sdk/src/abi.rs) and
+[`protocol.rs`](../crates/indicator-sdk/src/protocol.rs). Their presence in the SDK
+does not imply a running server-side plugin process or automatic restart path.

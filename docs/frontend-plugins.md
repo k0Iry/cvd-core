@@ -1,32 +1,45 @@
-# Frontend: generic indicator plugins
+# Frontend indicator host
 
-> **Browser-local WASM (cvd-wasm v1).** Indicator values are computed in the
-> visitor's browser by `.wasm` modules the visitor imported locally (menu →
-> **Import .wasm…**). Nothing is uploaded; there are no accounts, author
-> privileges or special plugin ids. Legacy server indicator envelopes
-> (`/indicators`, `/history` `indicators`, typed `/ws` indicator frames) are
-> ignored by the browser and are removed from the server in lane E. There is no
-> server/native fallback: a missing host or faulted plugin is shown, not hidden.
->
-> | module | role |
-> |---|---|
-> | `static/wasm-host/host-bridge.js` | Trusted runtime: `WasmPluginHost` (one terminable Worker per plugin, Rust `host_fence` admission, deadlines/limits), the binding to the Rust coordinator (`cvd_browser_coordinator.wasm`), the per-plugin async driver (asks `next`, performs one Worker call, reports `done` with the raw output frame once) and the IndexedDB store `cvd-local-plugins/plugins` (bytes, content hash, descriptor, params, enable intent; envelope/identity checks, DOM-value coercion, import file checks, duplicate/replace decision, fixed public error texts). Descriptor and parameter approval (SDK `Descriptor::validate` + `resolve_params`; lenient on restore/replacement, strict on form edit) is the coordinator `approve` command, called only at restore/import/replace/edit. Scheduling, readiness, warm-up coverage, retry/stall, scope/revision fencing and the accepted values (merge, history/live precedence, invalidation, drop) are decided in Rust (`crates/browser-coordinator/src/sched.rs`); the app applies the returned view diffs to a read-only projection. Faults stop/release that plugin only; no automatic restart. |
-> | `static/wasm-host/plugin-worker.js` | Worker: validates (Rust) before compile, instantiates, runs one request at a time. |
->
-> Lifecycle: import = name/size check → hash → bounded Worker `load` (Rust policy check before compile, compile/instantiate/describe/create under deadlines) → displayable descriptor → add / same (byte-equal no-op) / replace (atomic; old instance released; enable intent and compatible params kept). New imports start **disabled**. Enable starts a Worker and computes; Disable terminates the Worker and drops results but keeps file/params/row; **Remove** deletes the package. Every data change (history page, prepend, live append/replace, source/TF/mode) bumps the data revision and recomputes (stateless History op over the cache; unchanged results cost no chart writes, tail-only changes use the incremental path). If a plugin declares more warm-up than the cache holds, older history is prepended through the shared history path. Tests: `tests/local-plugins.test.mjs`, `tests/local-wasm-browser.mjs` (real Chromium + real WASM) and `tests/browser-interaction.mjs` (`CVD_LOCAL_WASM`).
->
-> The sections below describe rendering/menu behaviour, which is unchanged; references to discovery/`/ws` indicator transport describe the retired server path.
+Indicators run locally as imported `.wasm` files, one Worker per enabled
+plugin. Files stay in the browser; there are no plugin accounts or special
+indicator ids. The server serves base market data, not indicator results.
+See the [WASM contract](plugin-wasm-v1.md) for plugin authoring and ABI limits.
 
-Scope: `static/js/app.js`, `static/js/chart.js` and `static/wasm-host/host-bridge.js`. The browser draws what the
-host relays from indicator libraries; it contains no indicator algorithm and no
-branch on an indicator/output id (enforced by `tests/plugin-ui.test.cjs`).
+## Responsibilities
 
-## Modules
-
-| module | role |
+| Component | Responsibility |
 |---|---|
-| `static/js/chart.js` | Presentation without DOM or policy: descriptor registry (displayable descriptors → panes/groups/readouts; pending and rejected entries), renderer adapters by output kind, segmented-line geometry (history custom series + native tail), candles, display-only time labels and the source-quality readout. LWC is injected by the app. |
-| `static/js/app.js` | Configuration, DOM controls, preferences (including the one-time migration of pre-plugin `showLevels`/`flowMode` prefs — the only place naming historical ids), the indicator menu, history/WebSocket data flow and chart orchestration. Indicator menu: one `Indicators · N` button in `#plugin-controls` plus a `#plugin-menu` popup of native checkbox rows (ready plugins, disabled pending/failed placeholders, empty state). The popup lives outside the `overflow:auto` toolbar and is placed `position:fixed` from the trigger rect, clamped to the visible region (visualViewport offset + size, layout viewport fallback), repositioned on window resize, any scroll (incl. toolbar) and visualViewport resize/scroll. The trigger is a disclosure button (`aria-expanded`/`aria-controls`, no `aria-haspopup`/menu roles) controlling a labelled checkbox `group`. Tab from the trigger enters the first enabled row; Tab past the last enabled row (current rendered order) closes and continues to the next toolbar control; Shift+Tab from the first row returns to the trigger, and from the trigger leaves backwards and closes; with no enabled rows Tab leaves the trigger normally and closes. Rows are keyed by id and updated in place, so rerenders keep it open and focused. Outside pointer / Escape close (Escape refocuses the trigger). Toggling calls `setPluginEnabled` → `applyPluginVisibility` (prefs saved; no reload, WS or viewport change). Interaction evidence: `CVD_SCENARIOS=indicator_menu node tests/browser-interaction.mjs`. |
+| `cvd-server` | Ingestion, recovery, persistence and canonical bars, including cumulative CVD. |
+| `crates/browser-host` | Module admission, ABI validation, limits and result fencing. |
+| `crates/browser-coordinator/src/sched.rs` | Scheduling, history/live precedence, warm-up, readiness, scope/revision checks and accepted values. |
+| `static/wasm-host/host-bridge.js` | Worker calls, coordinator binding and IndexedDB storage; descriptor/parameter approval is delegated to Rust. |
+| `static/wasm-host/plugin-worker.js` | Validate before compile, instantiate and execute one request at a time. |
+| `static/js/app.js` | Controls, preferences, base-data transport and application of coordinator view diffs. |
+| `static/js/chart.js` | Generic rendering by output kind, panes, readouts and display-only time labels. |
+
+No indicator algorithm or indicator-id dispatch lives in the chart. The public
+CVD plugin projects the server's cumulative CVD; it does not re-accumulate it.
+
+## Lifecycle
+
+- **Import:** check file/name/size, hash and validate in a bounded Worker.
+  A new plugin starts disabled. Identical bytes are a no-op; replacing a plugin
+  is atomic and keeps enable intent and compatible parameters.
+- **Enable / disable / remove:** enable starts computation; disable terminates
+  the Worker and clears results but retains the file and settings; remove also
+  deletes the stored package. No server restart is needed.
+- **Data changes:** the Rust coordinator selects stateless History or bounded
+  LiveInit/LiveUpdate work and accepts only current results. Source/timeframe/mode
+  changes withdraw old-scope values. Missing warm-up uses the shared history path.
+- **Faults:** stop only the affected plugin and show its status. No server/native
+  fallback or automatic restart hides failures.
+- **Display:** unchanged values cause no chart writes; tail-only updates use the
+  incremental path. Hidden pages defer painting and coalesce updates on return.
+
+The indicator popup uses native checkboxes, preserves focus during updates and
+stays inside the viewport. Tab/Shift+Tab navigate it; Escape closes it and returns
+focus to the trigger. Toggling an indicator does not reload market data or move
+the viewport.
 
 ## Rendering rules
 
@@ -50,59 +63,29 @@ branch on an indicator/output id (enforced by `tests/plugin-ui.test.cjs`).
 * Missing value (absent, `null`, non-finite) = whitespace; true zero stays
   zero. Faulted/unavailable/disabled outputs are cleared and labelled.
 
-## Lifecycle
+## Base-data fencing
 
-* Discovery at startup; bounded backoff refresh (1–30 s, 6 tries) while any
-  indicator is `starting`/`unavailable` or discovery failed, and on live frames
-  naming an unknown id. Becoming ready re-registers and refetches the newest
-  page with results.
-* `/history` results are written per page (generation-fenced with the base
-  history request); unavailable modes clear and label.
-* `/ws`: typed indicator frames are parsed before base-bar handling; a
-  malformed indicator frame triggers a results resync and never closes the
-  base feed. `indicator_reset` clears results and refetches; a seq gap
-  refetches. Fences reset per connection; results reset on source/tf reload.
-* Hidden tab / pagehide: zero native chart writes; one coalesced paint on
-  return.
+Server indicator frames are ignored. Base-bar `rev` values are fenced within a
+WebSocket connection epoch; reconnect starts a new epoch and reload clears the
+fence. These transport epochs are separate from plugin request revision/sequence
+rules. See [source identities and units](instruments.md) and
+[source selection](usdc-ui.md).
 
-## Tests
+## Local checks
+
+Run from the repository root with Rust and Node 22. The browser check also needs
+Chromium (`CVD_CHROMIUM` can select its path):
 
 ```sh
-bash scripts/node-unit-gate.sh <OUT_DIR>   # builds coordinator wasm from source, runs the browser-free node --test suite
-CVD_CHROMIUM=<chromium> node --test tests/chromium-launch.browser.mjs   # explicit real-browser launch check
+bash scripts/node-unit-gate.sh ../cvd-node-check
+bash scripts/core-app-gate.sh ../cvd-browser-check 1
 ```
 
-Push/PR CI is browser-free; real-browser checks (`*.browser.mjs`, the foundation
-Worker smoke, `core-app-gate.sh`) run locally and on manual `workflow_dispatch`.
+The first builds the coordinator and runs browser-free unit contracts. The second
+builds the host/coordinator and core-owned **TEST-ONLY** plugins, then exercises the
+real app and Worker through the file input. It does not validate an author's own
+plugin; use the [authoring guide](https://github.com/k0Iry/cvd-indicators/blob/master/docs/authoring.md#4-test)
+for that.
 
-`tests/browser-interaction.mjs` imports real `.wasm` through the app's file
-input (`CVD_LOCAL_WASM`); the loopback fixture serves base bars only, and
-`tests/wasm-oracle-client.mjs` (the shipped `plugin-worker.js` + host wasm in
-Node) only supplies host-validated descriptors for the expected plugins/panes:
-
-```sh
-# clean core (own builds, TEST-ONLY cvd/flow fixtures):
-scripts/core-app-gate.sh <OUT_DIR> 1
-# cross-repo, actual public cvd/flow release wasm:
-TMPDIR=... CVD_STATIC_ROOT=<assembled static> CVD_LOCAL_WASM=<cvd.wasm>,<flow.wasm> CVD_REPS=1 node tests/browser-interaction.mjs
-```
-
-## Responsibilities
-
-* Host (`cvd-server`) owns ingestion, recovery, persistence and the canonical
-  bars, including the fixed cumulative CVD (`cvd_usdt` / `ac`, see
-  `plugin-api-v1.md`). The default `cvd` plugin only projects those
-  established CVD values and never re-accumulates CVD in bounded-window plugin
-  state; other plugins compute derived outputs from the canonical bars.
-* Runner processes execute plugin libraries; the host relays their outputs and
-  the browser consumes and renders them (see Modules above).
-* Plugin set changes (add/remove/enable/disable) take effect on an application
-  restart. Hot reload is not implemented.
-
-## Wire compatibility
-
-* Server indicator frames (`/ws` messages whose `type` starts with
-  `indicator`) are ignored: the browser computes plugin outputs locally.
-* Base frames are fenced per bar by their `rev` within one WebSocket
-  connection epoch (`app.js` `baseRevs`): a lower rev for an already shown bar
-  is stale; reconnect starts a new epoch and reload clears the fence.
+Push/PR CI is browser-free. Real-browser checks remain available locally and on
+manual `workflow_dispatch`; these commands are not needed to deploy or use CVD.
