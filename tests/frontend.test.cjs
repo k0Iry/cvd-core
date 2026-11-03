@@ -114,7 +114,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../static/j
 test('changed frontend modules share one coherent import version', () => {
     const html = fs.readFileSync(require('node:path').join(__dirname, '../static/index.html'), 'utf8')
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...source.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-11'])
+    assert.deepEqual([...versions], ['local-wasm-12'])
 })
 const chartSource = fs.readFileSync(require('node:path').join(__dirname, '../static/js/chart.js'), 'utf8').replace(/^export /gm, '')
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }
@@ -153,7 +153,7 @@ function harness() {
         updateDocumentTitle: noop, resetViewport: noop, syncPaneLayout: noop,
         clearScheduledSegmentedRefresh: noop, scheduleSegmentedRefresh: noop, applyHistoryIndicators: noop, noteDataChanged: noop, invalidateLocalAt: noop,
         baseRevs: new Map(), baseEpoch: 0, noteBaseRev: noop, pruneBaseRevs: noop, baseSuperseded: () => false, handleIndicatorEvent: noop, resyncIndicators: noop,
-        pluginStatus: {}, renderPluginControls: noop,
+        pluginStatus: {}, renderPluginControls: noop, syncBookPanel: noop,
         // Stands in for the two default public plugin outputs (CVD line + selected Flow).
         updatePluginPoint: bar => { series.update(bar); series.update(bar) },
         priceSeries: series, backboneSeries: series,

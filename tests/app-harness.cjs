@@ -186,7 +186,7 @@ function harness(checked = {}, options = {}) {
     const strip = code => code.replace(/^import .*\n/gm, '').replaceAll('export const', 'const').replaceAll('export async function', 'async function').replaceAll('export function', 'function').replaceAll('export class', 'class').replaceAll('import.meta.url', "'http://localhost/wasm-host/host-bridge.js'")
     // The harness supplies `elements` (stub controls) instead of DOM lookups.
     const source = read('app.js').replace(/^import .*\n/gm, '').replace(/^const elements = .*\n/m, '').replace(/\ninit\(\)\s*$/, '\n')
-    const modules = ['chart.js', '../wasm-host/host-bridge.js'].map(file => strip(read(file))).join('\n')
+    const modules = ['chart.js', 'book-panel.js', '../wasm-host/host-bridge.js'].map(file => strip(read(file))).join('\n')
     vm.runInContext(modules + '\n' + source + '\nconst realEnsureModeConnections = ensureModeConnections; ensureModeConnections = () => {};\n' + (options.projection === false ? '' : PROJECTION) + TEST_BRIDGE, context)
     if (options.descriptors !== null) vm.runInContext(`applyPluginDescriptors(${JSON.stringify(options.descriptors ?? TEST_DESCRIPTORS)})`, context)
     const run = code => vm.runInContext(code, context)

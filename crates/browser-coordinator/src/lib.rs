@@ -188,6 +188,8 @@ pub struct Coordinator {
     next_revision: u64,
     /// Rust-owned plugin scheduling/result authority (see `sched`).
     sched: sched::Scheduler,
+    /// Rust-owned order-book planning/admission (see `book`).
+    pub book: book::BookSched,
 }
 
 impl Coordinator {
@@ -363,5 +365,6 @@ pub fn approve(descriptor: &Value, params: &Value, strict: bool) -> Result<Value
     Ok(serde_json::json!({ "descriptor": desc, "params": out }))
 }
 
+pub mod book;
 pub mod ffi;
 pub mod sched;

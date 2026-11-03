@@ -41,6 +41,7 @@ fn invalid_of(v: &Value) -> Result<Vec<i64>, CoordError> {
 pub fn dispatch(c: &mut Coordinator, cmd: &Value) -> Result<Value, CoordError> {
     let s = |k| field(cmd, k).and_then(|v| v.as_str().ok_or_else(|| invalid(format!("{k} not a string"))));
     match s("cmd")? {
+        c2 if c2.starts_with("book_") => c.book.dispatch(c2, cmd),
         "history" => {
             let p = plan_history_checked(&scope_of(cmd)?, field(cmd, "revision")?.as_u64().unwrap_or(0), arr(cmd, "bars")?, usize_of(cmd, "context")?,
                 usize_of(cmd, "want_from_index")?, usize_of(cmd, "want_to_index")?, field(cmd, "exhausted")?.as_bool().unwrap_or(false), &invalid_of(cmd)?)?;

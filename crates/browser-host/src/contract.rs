@@ -2,7 +2,8 @@
 //! regions, descriptor acceptance, request bookkeeping and output validation.
 
 use crate::HostError;
-use cvd_indicator_sdk::abi::{OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE, STATUS_ERROR, STATUS_OK};
+use cvd_indicator_sdk::abi::{OP_BOOK, OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE, STATUS_ERROR, STATUS_OK};
+use cvd_indicator_sdk::book::{BookSnapshot, PriceLevels};
 use cvd_indicator_sdk::wasm::{
     MAX_DESCRIPTOR_BYTES, MAX_INPUT_BYTES, MAX_MEMORY_BYTES, MAX_OUTPUT_BYTES, WASM_ABI_VERSION,
 };
@@ -25,6 +26,8 @@ pub struct LiveMirror {
 struct InFlight {
     expected: Vec<i64>,
     next_live: Option<LiveMirror>,
+    /// `OP_BOOK`: the admitted input book the result is validated against.
+    book: Option<BookSnapshot>,
 }
 
 fn admit(r: Result<(), PluginError>) -> Result<(), HostError> {
@@ -169,6 +172,17 @@ impl PluginSession {
         }
         let bad = |w: &str| HostError::new("invalid_input", format!("malformed {w} body"));
         let desc = self.desc.as_ref().expect("described");
+        // Capability negotiation: book plugins accept only OP_BOOK and bar
+        // plugins never receive it (old modules keep their exact contract).
+        if desc.is_book() != (op == OP_BOOK) {
+            return Err(HostError::new("invalid_input", "operation not supported by this indicator"));
+        }
+        if op == OP_BOOK {
+            let b: BookSnapshot = serde_json::from_slice(body).map_err(|_| bad("book"))?;
+            admit(b.check())?;
+            self.pending = Some(InFlight { expected: Vec::new(), next_live: None, book: Some(b) });
+            return Ok(());
+        }
         let (expected, next_live) = match op {
             OP_HISTORY => {
                 let r: HistoryRequest = serde_json::from_slice(body).map_err(|_| bad("history"))?;
@@ -236,7 +250,7 @@ impl PluginSession {
             }
             _ => return Err(HostError::new("invalid_input", "unknown operation")),
         };
-        self.pending = Some(InFlight { expected, next_live });
+        self.pending = Some(InFlight { expected, next_live, book: None });
         Ok(())
     }
 
@@ -244,9 +258,25 @@ impl PluginSession {
     /// validated `Output` JSON.
     pub fn accept_result(&mut self, status: i32, bytes: &[u8]) -> Result<String, HostError> {
         self.require(Stage::Created)?;
-        let Some(InFlight { expected, next_live }) = self.pending.take() else {
+        let Some(InFlight { expected, next_live, book }) = self.pending.take() else {
             return Err(HostError::new("lifecycle", "no call in flight"));
         };
+        if let Some(book) = book {
+            return match status {
+                STATUS_OK => {
+                    let out: PriceLevels = match serde_json::from_slice(bytes) {
+                        Ok(o) => o,
+                        Err(_) => return Err(self.fail(HostError::new("invalid_output", "output is not valid JSON"))),
+                    };
+                    if let Err(e) = out.validate(&book) {
+                        return Err(self.fail(HostError::new("invalid_output", e.message)));
+                    }
+                    serde_json::to_string(&out).map_err(|_| HostError::new("invalid_output", "serialisation failed"))
+                }
+                STATUS_ERROR => Err(plugin_error(bytes)),
+                _ => Err(self.fail(HostError::new("abi_violation", format!("invoke returned status {status}")))),
+            };
+        }
         match status {
             STATUS_OK => {
                 let out: Output = match serde_json::from_slice(bytes) {

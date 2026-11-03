@@ -64,7 +64,7 @@ All scalars are `i32`.
 | `cvd_dealloc` | `(ptr, len)` | frees a `cvd_alloc` buffer |
 | `cvd_describe` | `() -> status` | Descriptor JSON in the result slot |
 | `cvd_create` | `(ptr, len) -> status` | creates the one instance from params JSON; a second call → 3 |
-| `cvd_invoke` | `(op, ptr, len) -> status` | op 1 History, 2 LiveInit, 3 LiveUpdate |
+| `cvd_invoke` | `(op, ptr, len) -> status` | op 1 History, 2 LiveInit, 3 LiveUpdate; op 4 Book only for descriptors declaring the `order_book` input + `price_levels` output (§5a; bar plugins reject it). Native-only C ABI ops are unchanged |
 | `cvd_destroy` | `() -> ()` | idempotent |
 | `cvd_result_ptr` / `cvd_result_len` | `() -> i32` | location of the last result |
 
@@ -112,6 +112,33 @@ touched suffix of the live window for LiveUpdate.
 
 Host live state changes only after a validated OK. Rejections and
 `plugin_error` leave it unchanged.
+
+## 5a. Live order-book plugins (op 4)
+
+A book plugin uses the same exports and ABI version. Its descriptor declares
+`"inputs": ["order_book"]`, exactly one output with `"type": "price_levels"`
+and `"live": false`; it never receives bar operations, and bar plugins never
+receive op 4. Implement `cvd_indicator_sdk::book::BookIndicator` and call
+`export_book_indicator!(MyBook)`.
+
+- **Input (`BookSnapshot`)**: one source only (`source.exchange/market/symbol`,
+  `base`, `quote`), `generation`, exchange `seq`, `bids` best first and `asks`
+  best first as `[price, base_quantity]`, and `coverage.bid_floor/ask_ceiling`
+  (positive, `bid_floor < ask_ceiling`). Coverage is complete for the levels
+  actually supplied: when only the top 500 levels per side are sent, it ends at
+  the 500th level, not at the server's wider snapshot range. Levels outside
+  coverage are unknown, not zero. Only live, validated books are delivered;
+  syncing/stale books are withdrawn by the host.
+- **Output (`PriceLevels`)**: `unit`, `best_bid`/`best_ask` echoing the input,
+  and 1–400 `rows` of `{price, bid, ask}` strictly descending by price, with
+  positive prices. A grouped bucket may extend past the supplied coverage edge.
+- The host checks structure, resources, source and BBO; it does not recompute
+  the plugin's grouping or quantities. Rows are the plugin's view of the
+  supplied depth. A parameter the current book cannot satisfy (for example a
+  price group wider than the bid price) should return `invalid_params`; the
+  panel shows the fault and recovers when the parameters change.
+- Today the server serves Binance USDⓈ-M BTC and ETH (`/book` WebSocket,
+  memory only); other sources show "unavailable".
 
 ## 6. Runtime, failures and isolation
 

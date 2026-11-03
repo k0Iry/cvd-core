@@ -30,6 +30,9 @@ pub const OP_HISTORY: u32 = 1;
 pub const OP_LIVE_INIT: u32 = 2;
 /// Apply an append/replace delta to a live instance (`LiveUpdate` body).
 pub const OP_LIVE_UPDATE: u32 = 3;
+/// Order-book computation (`BookSnapshot` body, `PriceLevels` result). Only
+/// valid for descriptors declaring the `order_book` input; browser WASM only.
+pub const OP_BOOK: u32 = 4;
 
 /// Library-owned byte buffer. `ptr` may be null when `len == 0`.
 #[repr(C)]

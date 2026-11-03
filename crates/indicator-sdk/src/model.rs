@@ -210,6 +210,9 @@ pub enum InputField {
     QuoteVolume,
     AggregateQuoteVolume,
     Trades,
+    /// Live single-source order book (`OP_BOOK`, [`crate::book::BookSnapshot`]).
+    /// Exclusive: a book descriptor consumes no bar fields.
+    OrderBook,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -280,6 +283,9 @@ pub enum OutputKind {
         #[serde(default)]
         tail_marker: bool,
     },
+    /// Price-level rows (not time-aligned) produced by `OP_BOOK` from an
+    /// [`InputField::OrderBook`] input; drawn by the generic price-level panel.
+    PriceLevels,
 }
 
 // ---------------------------------------------------------------- params
@@ -565,8 +571,25 @@ impl Output {
 }
 
 impl Descriptor {
+    /// Order-book descriptor: consumes [`InputField::OrderBook`] and is invoked
+    /// only with `OP_BOOK`, never with bar operations.
+    pub fn is_book(&self) -> bool {
+        self.inputs.contains(&InputField::OrderBook)
+    }
+
     /// Structural validation performed by runner and host at load time.
     pub fn validate(&self) -> Result<(), PluginError> {
+        let levels = self.outputs.iter().filter(|o| o.kind == OutputKind::PriceLevels).count();
+        if self.is_book() {
+            if self.inputs.len() != 1 || self.outputs.len() != 1 || levels != 1 || self.live {
+                return Err(PluginError::new(
+                    codes::INCOMPATIBLE,
+                    "order_book descriptor needs one price_levels output, no bar inputs and live=false",
+                ));
+            }
+        } else if levels != 0 {
+            return Err(PluginError::new(codes::INCOMPATIBLE, "price_levels output requires the order_book input"));
+        }
         let ok_id = !self.id.is_empty()
             && self.id.len() <= 64
             && self.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b));

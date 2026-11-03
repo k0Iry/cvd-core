@@ -9,6 +9,8 @@
 
 pub mod abi;
 pub mod author;
+/// Live order-book plugin contract (`OP_BOOK`).
+pub mod book;
 pub mod model;
 pub mod protocol;
 /// Standalone browser WASM ABI (`cvd-wasm` v1) glue.

@@ -5,8 +5,9 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-11"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-11"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-12"
+import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-12"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-12"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -850,9 +851,22 @@ function invalidateLocalAt(times) {
     if (times.length && localCompute) applyLocalView(localCompute.invalidate(times))
 }
 
+// Order-book plugins run only through the generic price-level panel; bar
+// plugins only through the coordinator. Neither path ever sees the other kind.
+let bookPanel = null
+const isBookRecord = r => isBookDescriptor(r?.descriptor)
+function bookSource() { return { exchange: exchangeSel.value, market: marketSel.value, symbol: symbolSel.value } }
+function syncBookPanel() {
+    if (!bookPanel) return
+    bookPanel.setSource(bookSource())
+    bookPanel.setPlugins([...localRecords.values()].filter(r => r.enabled && isBookRecord(r)).map(r => ({
+        id: r.id, name: r.descriptor?.name || r.id, bytes: r.bytes, params: r.params, loadKey: `${r.sha256}|${JSON.stringify(r.params)}`,
+    })))
+}
 function syncLocalCompute() {
+    syncBookPanel()
     if (!localCompute) return
-    localCompute.setPlugins([...localRecords.values()].filter(r => r.enabled).map(r => ({
+    localCompute.setPlugins([...localRecords.values()].filter(r => r.enabled && !isBookRecord(r)).map(r => ({
         id: r.id, bytes: r.bytes, params: r.params, loadKey: `${r.sha256}|${JSON.stringify(r.params)}`,
     })))
 }
@@ -922,7 +936,7 @@ function approveMeta(descriptor, params, strict = false) {
 }
 
 function registryFromRecords() {
-    applyPluginDescriptors([...localRecords.values()].map(r => ({ id: r.id, status: "ready", descriptor: r.descriptor, error: null })), localUnavailable)
+    applyPluginDescriptors([...localRecords.values()].filter(r => !isBookRecord(r)).map(r => ({ id: r.id, status: "ready", descriptor: r.descriptor, error: null })), localUnavailable)
 }
 
 function setImportNotice(kind, text) {
@@ -939,6 +953,9 @@ async function initLocalPlugins() {
         localCoord = await createCoordinator(coordBytes)
         const hostBytes = await (await fetch("/wasm-host/cvd_browser_host.wasm", { cache: "no-cache" })).arrayBuffer()
         localHost = await WasmPluginHost.create(hostBytes, { workerUrl: new URL("/wasm-host/plugin-worker.js", location.origin) })
+        bookPanel = createBookPanel({ host: localHost, coord: localCoord, container: document.getElementById("book-panel"),
+            onChange: () => queueMicrotask(() => renderIndicatorMenu()),
+            wsUrl: src => { const u = new URL(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/book`); for (const [k, v] of Object.entries(src)) u.searchParams.set(k, v); return u } })
         localCompute = createLocalCompute({ host: localHost, coord: localCoord, onResult: onLocalResult, onStatus: onLocalStatus, onInvalid: onLocalInvalid, onView: onLocalView, log: (...a) => console.warn(...a) })
     } catch (error) {
         console.warn("local plugin host unavailable", error)
@@ -964,7 +981,7 @@ async function initLocalPlugins() {
     } catch (error) {
         localUnavailable ||= `local plugins unavailable: ${importMessage(error).text}`
     }
-    window.__cvdLocal = { compute: () => localCompute, host: () => localHost, values: () => localValues, records: () => localRecords, revision: () => dataRevision }
+    window.__cvdLocal = { book: () => bookPanel, compute: () => localCompute, host: () => localHost, values: () => localValues, records: () => localRecords, revision: () => dataRevision }
     registryFromRecords()
     syncLocalCompute()
     // Seed demand from an already-loaded page (quiet feed after late init).
@@ -1121,8 +1138,17 @@ function renderIndicatorMenu() {
                 checked: pluginEnabled(plugin), disabled: false, fault: !!fault,
                 params: (record?.descriptor?.params ?? []).map(spec => ({ ...spec, value: record.params?.[spec.key] })) }
         }),
+        // Order-book plugins: same import/enable/params/uninstall row, panel status as meta.
+        ...[...localRecords.values()].filter(isBookRecord).map(record => {
+            const st = bookPanel?.state().plugins.find(p => p.id === record.id)
+            const fault = st?.fault ? ` · fault ${st.hint ?? st.fault}` : ""
+            return { id: record.id, name: record.descriptor.name || record.id, meta: `${record.descriptor.version} · order book${fault}`,
+                title: `${record.descriptor.name} ${record.descriptor.version} — ${record.descriptor.description ?? ""} · local file ${record.fileName ?? ""}`,
+                checked: record.enabled === true, disabled: false, fault: !!st?.fault,
+                params: (record.descriptor.params ?? []).map(spec => ({ ...spec, value: record.params?.[spec.key] })) }
+        }),
     ]
-    indicatorMenu.render(items, registry.plugins.filter(pluginEnabled).length, importNotice)
+    indicatorMenu.render(items, registry.plugins.filter(pluginEnabled).length + [...localRecords.values()].filter(r => r.enabled && isBookRecord(r)).length, importNotice)
 }
 
 // Pane labels: one per pane; exclusive groups get a generic <select>.
@@ -2395,6 +2421,7 @@ async function reload() {
     historyController = new AbortController()
     const generation = ++historyGeneration
     stopRealtimeSocket()
+    syncBookPanel()
     cancelVisualWork()
     pendingChartRange = null
     initialViewportPending = false

@@ -5,6 +5,9 @@ mod coinbase_perp;
 mod config;
 mod ingestion;
 mod models;
+mod orderbook;
+#[cfg(test)]
+mod orderbook_served_tests;
 mod persistence;
 mod quality;
 mod recovery;
@@ -283,6 +286,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub ready: AtomicBool,
     pub static_dir: std::path::PathBuf,
+    /// Ephemeral demand-driven live order books (memory only).
+    pub books: Arc<orderbook::BookHub>,
 }
 
 fn pick_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> &Shard {
@@ -1324,6 +1329,7 @@ async fn main() -> Result<()> {
         http: market_http_client()?,
         ready: AtomicBool::new(false),
         static_dir: settings.static_dir.clone(),
+        books: orderbook::BookHub::new(Arc::new(orderbook::BinanceFeed { http: market_http_client()? })),
     };
     let state = Arc::new(state);
 
@@ -1352,6 +1358,7 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/history", get(history))
         .route("/ws", get(ws_upgrade))
+        .route("/book", get(book_upgrade))
         .fallback_service(ServeDir::new(state.static_dir.clone()))
         .layer(axum::middleware::map_response(|mut response: axum::response::Response| async move {
             // Revalidate HTML/module metadata across venue-policy upgrades.
@@ -1557,6 +1564,54 @@ async fn ws_handler(
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct BookParams {
+    exchange: Option<String>,
+    market: Option<String>,
+    symbol: Option<String>,
+}
+
+/// Live order-book WebSocket. Identity is exchange/market/symbol only (no
+/// timeframe); unsupported sources are rejected, never substituted.
+async fn book_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(p): Query<BookParams>,
+) -> impl IntoResponse {
+    let symbol = orderbook::supported(
+        p.exchange.as_deref().unwrap_or(""),
+        p.market.as_deref().unwrap_or(""),
+        p.symbol.as_deref().unwrap_or(""),
+    );
+    let Some(symbol) = symbol else {
+        return (axum::http::StatusCode::BAD_REQUEST, "unsupported order-book source").into_response();
+    };
+    ws.on_upgrade(move |socket| book_ws(socket, state, symbol)).into_response()
+}
+
+async fn book_ws(mut socket: WebSocket, state: Arc<AppState>, symbol: Symbol) {
+    let mut sub = state.books.subscribe(symbol);
+    sub.rx.mark_changed();
+    loop {
+        tokio::select! {
+            changed = sub.rx.changed() => {
+                if changed.is_err() { break }
+                let text = sub.rx.borrow_and_update().json.clone();
+                // Bounded send: a stuck client is dropped, never queued.
+                match tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Text(text.into()))).await {
+                    Ok(Ok(())) => {}
+                    _ => break,
+                }
+            }
+            incoming = socket.recv() => match incoming {
+                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+    drop(sub);
 }
 
 // ==============================
@@ -2006,6 +2061,7 @@ mod tests {
             ready: AtomicBool::new(false),
             db: PgPoolOptions::new().connect_lazy("postgres://localhost/cvd_test").unwrap(),
             static_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../static"),
+            books: orderbook::BookHub::new(Arc::new(orderbook::BinanceFeed { http: market_http_client().unwrap() })),
         }
     }
 

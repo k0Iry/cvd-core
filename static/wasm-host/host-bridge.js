@@ -186,12 +186,12 @@ export class WasmPluginHost {
         return { generation: rec.generation, descriptor: m.descriptor }
     }
 
-    /** op: 1 history, 2 live_init, 3 live_update; body: request JSON string. One request in flight per instance (else `busy`). Resolves to validated Output JSON text. */
+    /** op: 1 history, 2 live_init, 3 live_update, 4 book (order_book plugins only); body: request JSON string. One request in flight per instance (else `busy`). Resolves to validated Output JSON text. */
     async compute(instance, scopeKey, revision, op, body) {
         const rec = this.instances.get(instance)
         if (!rec) throw codeError("stale", "instance is not running")
         if (typeof scopeKey !== "string" || scopeKey.startsWith("__") || !Number.isSafeInteger(revision) || revision < 0) throw codeError("invalid_input", "bad scope/revision")
-        if (![1, 2, 3].includes(op)) throw codeError("invalid_input", "unknown operation")
+        if (![1, 2, 3, 4].includes(op)) throw codeError("invalid_input", "unknown operation")
         boundedText(body, CAPS.MAX_INPUT_BYTES, "body")
         const m = await this._send(rec, instance, { type: "compute", body }, scopeKey, revision, op, this.limits.compute_ms)
         return m.output
@@ -256,6 +256,8 @@ export async function createCoordinator(bytes) {
         map: bars => call({ cmd: "map", bars }),
         // Rust-owned scheduling/result authority (crates/browser-coordinator/src/sched.rs).
         plugins: list => call({ cmd: "plugins", list }),
+        // Order-book planning/admission (crates/browser-coordinator/src/book.rs).
+        book: (cmd, args = {}) => call({ ...args, cmd: `book_${cmd}` }),
         clearFault: plugin => call({ cmd: "clear_fault", plugin }),
         demand: d => call({ cmd: "demand", ...d }),
         superseded: plugin => call({ cmd: "superseded", plugin }),
