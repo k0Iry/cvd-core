@@ -114,6 +114,8 @@ impl Outbox {
                 .execute(&mut *transaction)
                 .await?;
         }
+        #[cfg(test)]
+        failpoint::hit(failpoint::Stage::BeforeOutboxCommit).await;
         transaction.commit().await?;
         self.notify.notify_one();
         Ok(())
@@ -139,6 +141,8 @@ impl Outbox {
             return Ok(false);
         };
         writer(serde_json::from_str(&payload)?).await?;
+        #[cfg(test)]
+        failpoint::hit(failpoint::Stage::AfterPgUpsert).await;
         sqlx::query("DELETE FROM pending_bars WHERE id = ?").bind(id).execute(&self.pool).await?;
         Ok(true)
     }
@@ -202,6 +206,47 @@ async fn persist_bar(db: &PgPool, pending: PendingBar) -> Result<()> {
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Test-only crash points at the three persistence commit boundaries. When the
+/// armed stage is reached for the `n`th time the caller parks forever (the test
+/// then aborts every task and discards the AppState: an in-process crash).
+#[cfg(test)]
+pub(crate) mod failpoint {
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        BeforeOutboxCommit,
+        AfterOutboxCommitBeforePublish,
+        AfterPgUpsert,
+    }
+    static ARMED: Mutex<Option<(Stage, u64)>> = Mutex::new(None);
+    pub(crate) static HIT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+    pub(crate) fn arm(stage: Stage, nth: u64) {
+        *ARMED.lock().unwrap() = Some((stage, nth));
+    }
+    pub(crate) async fn hit(stage: Stage) {
+        let fire = {
+            let mut armed = ARMED.lock().unwrap();
+            match armed.as_mut() {
+                Some((s, n)) if *s == stage => {
+                    *n -= 1;
+                    let fire = *n == 0;
+                    if fire {
+                        *armed = None;
+                    }
+                    fire
+                }
+                _ => false,
+            }
+        };
+        if fire {
+            HIT.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 #[cfg(test)]

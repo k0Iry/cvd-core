@@ -18,6 +18,11 @@ docker compose up -d --no-deps --no-build cvd &&
 docker compose logs --tail=50 cvd
 ```
 
+升级后，Coinbase USDC 合约会从已有的已收盘分钟历史自动回补，可能需要一段时间；
+恢复期间工具栏显示 `Source recovering`，完成后显示 `Source live`。请保留数据库和
+outbox，无需重置或新建分段。服务器除实时行情外，还需能访问公共 HTTPS
+`history.deribit.com`。
+
 <details>
 <summary>仍在使用旧的源码构建或 TOML 配置？</summary>
 

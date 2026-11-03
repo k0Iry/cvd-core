@@ -69,3 +69,45 @@ test('retained tooltip identifies old live evidence and ages on original clock',
     assert.match(call('qualityDisplay', {time:60,quality:q}, aggregate, 200000, false, {exchange:'binance',market:'spot'}).label, /stale/i);
   }
 });
+
+// ---- selected-source status (C): /health, independent of bars/quality/hover
+const SCOPE = { exchange: 'coinbase', market: 'usdc', symbol: 'BTC' };
+const row = (state, extra = {}) => ({ exchange: 'coinbase', market: 'usdc', symbol: 'BTC', error: null, last_trade_ms: 1_000_000,
+  recovery: { state, attempts: 3, buffered_trades: 12, durable_cursor: '24738167', durable_from_ms: 900_000, detail: 'DRB archive bridge', ...extra.recovery }, ...extra.top });
+const status = (h, scope = SCOPE, now = 1_010_000, f = null) => call('sourceStatusDisplay', h, scope, now, f);
+test('source_needs_backfill_is_stopped_not_recovering', () => {
+  const d = status({ sources: [row('needs_backfill')] });
+  assert.equal(d.label, 'Source stopped · needs backfill');
+  assert.doesNotMatch(d.label, /recovering/i);
+  assert.match(d.tooltip, /Not recovering/);
+});
+test('source_recovering_progress_and_checkpoint_wording', () => {
+  const a = status({ sources: [row('recovering', { top: { last_trade_ms: Date.UTC(2026, 9, 29, 14, 5) } })] });
+  const b = status({ sources: [row('recovering', { top: { last_trade_ms: Date.UTC(2026, 9, 29, 14, 7) } })] });
+  assert.equal(a.label, 'Source recovering · 14:05Z');
+  assert.equal(b.label, 'Source recovering · 14:07Z');
+  assert.match(a.tooltip, /in-memory progress, not a restart checkpoint/);
+  assert.match(a.tooltip, /cursor 24738167 \(in memory\)/);
+  assert.doesNotMatch(a.tooltip, /durable cursor/i);
+});
+test('source_health_failure_or_unknown_never_live', () => {
+  for (const d of [status(null), status({}), status({ sources: [] }), status(null, SCOPE, 1, 'HTTP 503'),
+    status({ sources: [row('weird')] }), status({ sources: [{ ...row('live'), recovery: null }] })]) {
+    assert.equal(d.label, 'Source status unknown'); assert.equal(d.state, 'attention');
+  }
+  assert.equal(status({ sources: [row('live', { top: { error: 'x' } })] }).label, 'Source error');
+  assert.equal(status({ sources: [row('live')] }, SCOPE, 1_000_000 + 90_000).label, 'Source live · no recent trade');
+  assert.equal(status({ sources: [row('live', { top: { last_trade_ms: null } })] }).label, 'Source live · no recent trade');
+});
+test('source_scope_is_exact_exchange_market_symbol', () => {
+  const h = { sources: [row('live'), { ...row('needs_backfill'), symbol: 'ETH' }, { ...row('recovering'), market: 'spot_usdc' }] };
+  assert.equal(status(h).label, 'Source live');
+  assert.equal(status(h, { ...SCOPE, symbol: 'ETH' }).label, 'Source stopped · needs backfill');
+  assert.match(status(h, { ...SCOPE, market: 'spot_usdc' }).label, /^Source recovering/);
+  assert.equal(status(h, { ...SCOPE, exchange: 'binance' }).label, 'Source status unknown');
+});
+test('source_recovery_to_live', () => {
+  assert.match(status({ sources: [row('recovering')] }).label, /^Source recovering/);
+  const live = status({ sources: [row('live')] });
+  assert.equal(live.label, 'Source live'); assert.equal(live.state, 'quiet');
+});

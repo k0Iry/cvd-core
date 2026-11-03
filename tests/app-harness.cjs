@@ -154,7 +154,7 @@ function harness(checked = {}, options = {}) {
     const elements = Object.fromEntries([
         'exchangeSel', 'symbolSel', 'marketSel', 'tfSel',
         'aggToggle', 'pluginControlsEl', 'pluginMenuEl', 'pluginStateEl',
-        'screenshotBtn', 'statusEl', 'qualityStateEl', 'sourceSeriesEl', 'chartEl', 'paneLabels',
+        'screenshotBtn', 'statusEl', 'qualityStateEl', 'sourceStateEl', 'sourceSeriesEl', 'chartEl', 'paneLabels',
     ].map(key => [key, element()]))
     Object.assign(elements.exchangeSel, { value: 'binance' })
     Object.assign(elements.symbolSel, { value: 'BTC' })

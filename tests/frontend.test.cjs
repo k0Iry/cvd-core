@@ -114,7 +114,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../static/j
 test('changed frontend modules share one coherent import version', () => {
     const html = fs.readFileSync(require('node:path').join(__dirname, '../static/index.html'), 'utf8')
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...source.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-12'])
+    assert.deepEqual([...versions], ['local-wasm-13'])
 })
 const chartSource = fs.readFileSync(require('node:path').join(__dirname, '../static/js/chart.js'), 'utf8').replace(/^export /gm, '')
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }
@@ -157,7 +157,7 @@ function harness() {
         // Stands in for the two default public plugin outputs (CVD line + selected Flow).
         updatePluginPoint: bar => { series.update(bar); series.update(bar) },
         priceSeries: series, backboneSeries: series,
-        pricePointForBar: bar => bar, updateFlowReadout: () => context.readoutWrites++, useAggregateMode: () => false,
+        pricePointForBar: bar => bar, updateFlowReadout: () => context.readoutWrites++, sourceRestarts: 0, restartSourceStatus: () => context.sourceRestarts++, useAggregateMode: () => false,
         CONFIG: { FETCH_COOLDOWN: 0, LIVE_RECONCILE_MS: 1000 }, warmupPrepending: false, localOlderPages: [],
     })
     vm.runInContext(chartSource, context)
@@ -458,6 +458,7 @@ test('source change aborts old HTTP and socket; wrong-series WS never buffers or
     run('marketSel.value="usdc"; exchangeSel.value="coinbase"');
     const next = run('reload()');
     assert.equal(requests[0].options.signal.aborted,true);
+    assert.equal(run('sourceRestarts'),2,'each selection reload restarts the selected-source status updater');
     respond(requests[1],[{time:60}],{series:'contracts-drb-v1'});
     await next; respond(requests[0],[{time:30}]); await old;
     assert.equal(run('page.bars[0].time'),60);

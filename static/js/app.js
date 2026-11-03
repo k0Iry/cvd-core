@@ -5,9 +5,9 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-12"
-import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-12"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-12"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-13"
+import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-13"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-13"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -93,8 +93,8 @@ const STORAGE_KEY = "cvd_prefs_v1"
 const DEFAULT_TITLE = "CVD"
 
 // ============================================================ DOM controls
-const elements = Object.fromEntries(Object.entries({ exchangeSel: "exchange", symbolSel: "symbol", marketSel: "market", tfSel: "tf", aggToggle: "toggle-agg", pluginControlsEl: "plugin-controls", pluginMenuEl: "plugin-menu", pluginStateEl: "plugin-state", screenshotBtn: "screenshot-btn", statusEl: "status", qualityStateEl: "quality-state", sourceSeriesEl: "source-series", chartEl: "chart", paneLabels: "pane-labels" }).map(([key, id]) => [key, document.getElementById(id)]))
-const { exchangeSel, symbolSel, marketSel, tfSel, aggToggle, pluginControlsEl, pluginMenuEl, pluginStateEl, screenshotBtn, statusEl, qualityStateEl, sourceSeriesEl, chartEl, paneLabels } = elements
+const elements = Object.fromEntries(Object.entries({ exchangeSel: "exchange", symbolSel: "symbol", marketSel: "market", tfSel: "tf", aggToggle: "toggle-agg", pluginControlsEl: "plugin-controls", pluginMenuEl: "plugin-menu", pluginStateEl: "plugin-state", screenshotBtn: "screenshot-btn", statusEl: "status", qualityStateEl: "quality-state", sourceStateEl: "source-state", sourceSeriesEl: "source-series", chartEl: "chart", paneLabels: "pane-labels" }).map(([key, id]) => [key, document.getElementById(id)]))
+const { exchangeSel, symbolSel, marketSel, tfSel, aggToggle, pluginControlsEl, pluginMenuEl, pluginStateEl, screenshotBtn, statusEl, qualityStateEl, sourceStateEl, sourceSeriesEl, chartEl, paneLabels } = elements
 
 // ============================================================ preferences
 // One-time migration of pre-plugin preferences (cvd_prefs_v1 written by the
@@ -1563,6 +1563,54 @@ function startQualityTimer() {
     if (!qualityTimer && page.bars.at(-1)?.quality) qualityTimer = setInterval(() => { if (!pageAway && !document.hidden) updateQualityReadout() }, 15000)
 }
 
+// Selected-source ingestion status: ONE page-level /health poll, at most one
+// request in flight, keyed by an exact exchange/market/symbol generation.
+// Independent of bars, per-bar quality, hover and the page WebSocket; never
+// touches the chart. Failure/unknown evidence never reads as live.
+const SOURCE_POLL_MS = 5000
+const SOURCE_TIMEOUT_MS = 8000
+let sourceTimer = null
+let sourceController = null
+let sourceGeneration = 0
+function renderSourceStatus(display) {
+    setText(sourceStateEl, "textContent", display.label)
+    setText(sourceStateEl, "title", display.tooltip)
+    setText(sourceStateEl.dataset, "state", display.state)
+}
+async function pollSourceStatus() {
+    if (sourceController) return
+    const generation = sourceGeneration
+    const scope = { exchange: exchangeSel.value, market: marketSel.value, symbol: symbolSel.value }
+    const controller = sourceController = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS)
+    let display
+    try {
+        const response = await fetch("/health", { cache: "no-store", signal: controller.signal })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        display = sourceStatusDisplay(await response.json(), scope, Date.now())
+    } catch (error) {
+        display = sourceStatusDisplay(null, scope, Date.now(), error?.name === "AbortError" ? "timeout" : error?.message ?? error)
+    } finally {
+        clearTimeout(timeout)
+        if (sourceController === controller) sourceController = null
+    }
+    if (generation === sourceGeneration) renderSourceStatus(display)
+}
+function stopSourceStatus() {
+    sourceGeneration++
+    clearInterval(sourceTimer)
+    sourceTimer = null
+    sourceController?.abort()
+    sourceController = null
+}
+function restartSourceStatus() {
+    stopSourceStatus()
+    renderSourceStatus({ label: "Source checking…", state: "attention", tooltip: "Selected source ingestion state (from /health); not yet observed." })
+    if (pageAway) return
+    pollSourceStatus()
+    sourceTimer = setInterval(() => { if (!pageAway && !document.hidden) pollSourceStatus() }, SOURCE_POLL_MS)
+}
+
 // Per-pane readout of the hovered (or latest) bar for the pane's active
 // outputs, from descriptor readout channels. Faulted outputs say so instead
 // of showing stale or zero values.
@@ -2421,6 +2469,7 @@ async function reload() {
     historyController = new AbortController()
     const generation = ++historyGeneration
     stopRealtimeSocket()
+    restartSourceStatus()
     syncBookPanel()
     cancelVisualWork()
     pendingChartRange = null
@@ -2494,6 +2543,7 @@ window.addEventListener("focus", () => {
 
 window.addEventListener("pageshow", () => {
     pageAway = false
+    if (prefsHydrated) restartSourceStatus()
     startQualityTimer()
     updateQualityReadout()
     keepUpdatesActive()
@@ -2502,6 +2552,7 @@ window.addEventListener("pageshow", () => {
 
 window.addEventListener("pagehide", () => {
     pageAway = true
+    stopSourceStatus()
     clearInterval(qualityTimer)
     qualityTimer = null
     chartNeedsRender = true

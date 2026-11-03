@@ -11,6 +11,26 @@ const MAX_PAGES: usize = 100;
 const MAX_TRADES: usize = 100_000;
 const DEADLINE: Duration = Duration::from_secs(30);
 const ATTEMPTS: usize = 20;
+/// Deribit's official public archive of the same matching-engine tape. The
+/// primary gateway only retains about 24 hours of sequences (observed, not a
+/// documented guarantee), so older anchors are bridged from here in bounded,
+/// sequence-exact chunks behind a per-chunk identity overlap gate.
+pub(super) const ARCHIVE: &str = "https://history.deribit.com/api/v2/public";
+/// Anchors older than this are bridged from the archive; the primary window is ~24h.
+pub(super) const ARCHIVE_AFTER_MS: i64 = 20 * 3_600_000;
+const ARCHIVE_SPAN: u64 = 900; // sequences requested per page; count=PAGE leaves edge padding
+const ARCHIVE_PAGES: usize = 20; // bounded chunk (<=18k trades) per worker attempt
+const ARCHIVE_PACE: Duration = Duration::from_millis(250);
+const GATE_BACK: u64 = 2_000;
+const GATE_LEN: u64 = 50;
+pub(super) fn archive_base(base: &str) -> String {
+    // Loopback tests serve the archive under `<base>/archive`.
+    if base == BASE {
+        ARCHIVE.into()
+    } else {
+        format!("{base}/archive")
+    }
+}
 
 pub(super) fn product(symbol: Symbol) -> &'static str {
     match symbol {
@@ -195,8 +215,17 @@ pub(super) async fn history(
     from_ms: Option<i64>,
     target: u64,
     target_ms: i64,
+    fresh: (u64, i64),
 ) -> std::result::Result<Vec<Trade>, HistoryError> {
     let name = product(symbol);
+    // Primary coverage/identity is judged against the freshest observed sequence
+    // (`fresh`: retained WS high-water), not the aging fixed target.
+    let (fresh_seq, fresh_ms) = (fresh.0.max(target), fresh.1.max(target_ms));
+    if from_ms.is_some_and(|from| from >= 0 && fresh_ms >= from && fresh_ms - from > ARCHIVE_AFTER_MS) {
+        let archive = archive_base(base);
+        archive_identity(client, base, &archive, symbol, size, fresh_seq).await?;
+        return archive_chunk(client, &archive, symbol, size, cursor, from_ms, target, fresh_ms).await;
+    }
     let predecessor = if let Some(cursor) = cursor {
         cursor
     } else if let Some(from) = from_ms {
@@ -269,10 +298,11 @@ pub(super) async fn history(
             }
             previous_ms = Some(trade.timestamp_ms);
             output.push(trade);
-            if output.len() > MAX_TRADES {
-                return Err(fatal("replay trade budget exhausted"));
-            }
             next = seq.checked_add(1).ok_or_else(|| fatal("sequence overflow"))?;
+        }
+        if output.len() >= MAX_TRADES && next <= target {
+            // Bounded validated chunk; the worker ingests it and resumes from its cursor.
+            return Ok(output);
         }
         if next > target {
             if more {
@@ -284,7 +314,181 @@ pub(super) async fn history(
             return Err(retry("REST has_more=false before fixed target; history lagging"));
         }
     }
-    Err(fatal("replay page budget exhausted"))
+    Ok(output) // bounded contiguous prefix; the worker resumes from its new cursor
+}
+
+const IDENTITY_FIELDS: [&str; 8] =
+    ["trade_seq", "trade_id", "timestamp", "price", "amount", "contracts", "direction", "instrument_name"];
+
+async fn seq_rows(
+    client: &reqwest::Client,
+    base: &str,
+    name: &str,
+    start: u64,
+    end: u64,
+) -> std::result::Result<BTreeMap<u64, Value>, HistoryError> {
+    let v = get(
+        client,
+        base,
+        "get_last_trades_by_instrument",
+        &[
+            ("instrument_name", name.into()),
+            ("start_seq", start.to_string()),
+            ("end_seq", end.to_string()),
+            ("count", PAGE.to_string()),
+            ("sorting", "asc".into()),
+        ],
+    )
+    .await?;
+    let rows = v["trades"].as_array().ok_or_else(|| fatal("missing sequence trades"))?;
+    if rows.len() > PAGE as usize {
+        return Err(fatal("page exceeds requested size"));
+    }
+    let mut out = BTreeMap::<u64, Value>::new();
+    for row in rows {
+        let seq = row.get("trade_seq").and_then(Value::as_u64).ok_or_else(|| fatal("invalid integer trade_seq"))?;
+        // The archive orders by timestamp and pads edges: keep only in-range rows,
+        // and require any repeated row to be field-identical.
+        if seq < start || seq > end {
+            continue;
+        }
+        if let Some(old) = out.get(&seq) {
+            if !IDENTITY_FIELDS.iter().all(|k| old.get(*k) == row.get(*k)) {
+                return Err(fatal(format!("conflicting duplicate archive sequence {seq}")));
+            }
+        } else {
+            out.insert(seq, row.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Same-tape gate: a retained primary window must be complete and field-identical
+/// on the archive, and the archive instrument must carry the same units.
+pub(super) async fn archive_identity(
+    client: &reqwest::Client,
+    primary: &str,
+    archive: &str,
+    symbol: Symbol,
+    size: f64,
+    target: u64,
+) -> std::result::Result<(), HistoryError> {
+    // The real archive instrument omits `state`/`instrument_type`; require the
+    // remaining identity/linear/active fields and the exact contract size.
+    let name = product(symbol);
+    let v = get(client, archive, "get_instrument", &[("instrument_name", name.into())]).await?;
+    let base = if matches!(symbol, Symbol::Btc) { "BTC" } else { "ETH" };
+    let ok = field(&v, "instrument_name").ok() == Some(name)
+        && field(&v, "base_currency").ok() == Some(base)
+        && ["quote_currency", "counter_currency", "settlement_currency"].iter().all(|k| field(&v, k).ok() == Some("USDC"))
+        && field(&v, "kind").ok() == Some("future")
+        && field(&v, "future_type").ok() == Some("linear")
+        && v["is_active"] == true;
+    if !ok {
+        return Err(fatal("archive instrument is not the same active linear USDC future"));
+    }
+    if positive(&v, "contract_size").map_err(fatal)? != size {
+        return Err(fatal("archive contract size differs from primary"));
+    }
+    let lo = target.saturating_sub(GATE_BACK).max(1);
+    let hi = lo + GATE_LEN - 1;
+    let name = product(symbol);
+    let a = seq_rows(client, primary, name, lo, hi).await?;
+    let b = seq_rows(client, archive, name, lo, hi).await?;
+    if a.len() as u64 != GATE_LEN || b.len() as u64 != GATE_LEN {
+        return Err(retry(format!("archive identity window {lo}-{hi} incomplete ({}/{})", a.len(), b.len())));
+    }
+    for (seq, row) in &a {
+        if !IDENTITY_FIELDS.iter().all(|k| row.get(*k).is_some() && row.get(*k) == b[seq].get(*k)) {
+            return Err(fatal(format!("archive identity mismatch at sequence {seq}")));
+        }
+    }
+    Ok(())
+}
+
+/// One bounded, sequence-exact archive chunk ending at most at `target - 1`
+/// (the fixed live target is handed off by the worker) or at the first trade
+/// back inside the primary window, whichever comes first.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn archive_chunk(
+    client: &reqwest::Client,
+    archive: &str,
+    symbol: Symbol,
+    size: f64,
+    cursor: Option<u64>,
+    from_ms: Option<i64>,
+    target: u64,
+    target_ms: i64,
+) -> std::result::Result<Vec<Trade>, HistoryError> {
+    let name = product(symbol);
+    let from = from_ms.ok_or_else(|| fatal("missing recovery anchor"))?;
+    let predecessor = if let Some(cursor) = cursor {
+        cursor
+    } else {
+        let v = get(
+            client,
+            archive,
+            "get_last_trades_by_instrument_and_time",
+            &[
+                ("instrument_name", name.into()),
+                ("start_timestamp", from.saturating_sub(3_600_000).max(0).to_string()),
+                ("end_timestamp", from.saturating_sub(1).to_string()),
+                ("count", "100".into()),
+                ("sorting", "desc".into()),
+            ],
+        )
+        .await?;
+        let rows = v["trades"].as_array().ok_or_else(|| fatal("invalid predecessor response"))?;
+        let mut best: Option<u64> = None;
+        for row in rows {
+            let trade = parse_trade(row, name, size).map_err(fatal)?;
+            if trade.timestamp_ms < from {
+                best = best.max(Some(trade.id.parse::<u64>().map_err(fatal)?));
+            }
+        }
+        best.ok_or_else(|| fatal("no archive predecessor before closed-minute boundary"))?
+    };
+    if predecessor >= target {
+        return Err(fatal("recovery predecessor is not before fixed target"));
+    }
+    let mut next = predecessor + 1;
+    let mut output = Vec::new();
+    let mut previous_ms = if cursor.is_some() { Some(from) } else { None };
+    for page in 0..ARCHIVE_PAGES {
+        if next >= target {
+            break;
+        }
+        if page > 0 {
+            tokio::time::sleep(ARCHIVE_PACE).await;
+        }
+        let end = (next + ARCHIVE_SPAN - 1).min(target - 1);
+        let rows = seq_rows(client, archive, name, next, end).await?;
+        let mut progressed = false;
+        for (seq, row) in rows.range(next..=end) {
+            if *seq != next {
+                break; // interior/edge hole: re-request from the missing sequence
+            }
+            let trade = parse_trade(row, name, size).map_err(fatal)?;
+            if previous_ms.is_some_and(|ms| trade.timestamp_ms < ms) {
+                return Err(fatal("sequence timestamps reversed"));
+            }
+            previous_ms = Some(trade.timestamp_ms);
+            output.push(trade);
+            next += 1;
+            progressed = true;
+        }
+        if !progressed {
+            if !output.is_empty() {
+                break; // deliver the validated prefix; the next attempt retries the hole
+            }
+            let upto = rows.keys().next().map_or(end, |s| s - 1);
+            return Err(retry(format!("archive missing sequence interval {next}-{upto}")));
+        }
+        if previous_ms.is_some_and(|ms| target_ms - ms <= ARCHIVE_AFTER_MS) {
+            break; // back inside the primary window: hand off to the primary gateway
+        }
+    }
+    Ok(output)
 }
 
 fn same(a: &Trade, b: &Trade) -> bool {
@@ -310,6 +514,16 @@ pub(super) fn remember(seen: &mut BTreeMap<u64, Trade>, seq: u64, trade: &Trade)
     Ok(())
 }
 
+/// Bound the long-gap buffer without forgetting the newest observed sequence:
+/// evict the entry just below the high-water mark, so a known discarded tail
+/// keeps a pending target and can never be reported live before it is ingested.
+pub(super) fn drop_below_high_water(pending: &mut BTreeMap<u64, Trade>) {
+    let Some(&high) = pending.keys().next_back() else { return };
+    if let Some(&below) = pending.range(..high).next_back().map(|(k, _)| k) {
+        pending.remove(&below);
+    }
+}
+
 pub(crate) async fn worker(
     state: Arc<AppState>,
     symbol: Symbol,
@@ -322,6 +536,9 @@ pub(crate) async fn worker(
     let mut pending = BTreeMap::<u64, Trade>::new();
     let mut seen = BTreeMap::<u64, Trade>::new();
     let mut budget: Option<(Instant, usize)> = None;
+    // True while the durable anchor is older than the primary window and the
+    // gap is being bridged from the archive in bounded chunks.
+    let mut long_gap = false;
     let (initial_cursor, initial_from) = {
         let e = shard.engine.lock().await;
         (e.last_trade_id.clone(), e.recovery_from_ms)
@@ -384,7 +601,12 @@ pub(crate) async fn worker(
         } else {
             pending.insert(seq, trade);
         }
-        if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY {
+        if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY && long_gap {
+            // Archive bridge: keep the fixed target and memory bounded by retaining the
+            // highest buffered identity and evicting the entry just below it; evicted
+            // sequences stay unproven until replay supplies them contiguously.
+            drop_below_high_water(&mut pending);
+        } else if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY {
             crate::recovery::mark_buffer_exhausted(&state, Exchange::Coinbase, market, symbol).await;
             break;
         }
@@ -429,7 +651,19 @@ pub(crate) async fn worker(
             diag.durable_cursor = cursor.map(|n| n.to_string());
             diag.durable_from_ms = initial_from;
             diag.buffered_trades = pending.len();
-            diag.detail = Some(format!("DRB sequence gap; fixed target {target}"));
+            let anchor_ms = if startup { initial_from } else { shard.engine.lock().await.last_trade_ms };
+            let (&high_seq, high_trade) = pending.last_key_value().expect("non-empty");
+            let fresh = (high_seq, high_trade.timestamp_ms);
+            long_gap = anchor_ms.is_some_and(|ms| fresh.1 - ms > ARCHIVE_AFTER_MS);
+            diag.detail = Some(if long_gap {
+                format!(
+                    "DRB archive bridge; cursor {} at {} ms; fixed target {target} at {first_ms} ms",
+                    cursor.map_or("closed-minute anchor".into(), |c| c.to_string()),
+                    anchor_ms.unwrap_or_default()
+                )
+            } else {
+                format!("DRB sequence gap; fixed target {target}")
+            });
             if !crate::recovery::store_recovery(&shard, diag.clone()).await {
                 return;
             }
@@ -442,6 +676,7 @@ pub(crate) async fn worker(
             *shard.stream_error.write().await = Some(format!("recovering: DRB sequence target {target}"));
             drop(current);
             let mut completed = false;
+            let mut progressed = false;
             while *attempts < ATTEMPTS && Instant::now() < *deadline {
                 if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await {
                     return;
@@ -452,6 +687,9 @@ pub(crate) async fn worker(
                     return;
                 }
                 let cursor_ms = shard.engine.lock().await.last_trade_ms;
+                // Re-derive the coverage/identity basis per attempt: the freshest
+                // retained observation advances while the fixed target ages.
+                let fresh = pending.last_key_value().map_or(fresh, |(&n, t)| (n, t.timestamp_ms));
                 let request = history(
                     &state.http,
                     &base,
@@ -461,6 +699,7 @@ pub(crate) async fn worker(
                     if startup { initial_from } else { cursor_ms },
                     target,
                     first_ms,
+                    fresh,
                 );
                 tokio::pin!(request);
                 let response = loop {
@@ -473,7 +712,7 @@ pub(crate) async fn worker(
                                 if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
                                 if let Some(old)=pending.get(&n) { if !same(old,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting buffered sequence {n}")).await;return;} }
                                 else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                                if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY {crate::recovery::mark_buffer_exhausted(&state,Exchange::Coinbase,market,symbol).await;return;}
+                                if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { if long_gap { drop_below_high_water(&mut pending); } else {crate::recovery::mark_buffer_exhausted(&state,Exchange::Coinbase,market,symbol).await;return;} }
                             },
                             None=>return, // no partial replay, join happens at caller
                         },
@@ -531,9 +770,14 @@ pub(crate) async fn worker(
                                 return;
                             }
                         }
-                        pending.retain(|&n, _| n > target);
+                        let committed =
+                            shard.engine.lock().await.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+                        pending.retain(|&n, _| committed.is_none_or(|c| n > c));
                         startup = false;
                         completed = true;
+                        // Renew the work budget only for validated, ingested progress
+                        // (a bounded chunk), never because more live trades arrived.
+                        progressed = committed != cursor;
                         break;
                     }
                     Some(Err(HistoryError::Fatal(e))) => {
@@ -557,7 +801,7 @@ pub(crate) async fn worker(
                             if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
                             if let Some(old)=pending.get(&n) {if !same(old,&t){crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting sequence {n}")).await;return;}}
                             else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY {crate::recovery::mark_buffer_exhausted(&state,Exchange::Coinbase,market,symbol).await;return;}
+                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { if long_gap { drop_below_high_water(&mut pending); } else {crate::recovery::mark_buffer_exhausted(&state,Exchange::Coinbase,market,symbol).await;return;} }
                         } else {return},
                         _=tokio::time::sleep_until(pause)=>break,
                     }
@@ -581,6 +825,8 @@ pub(crate) async fn worker(
             if pending.is_empty() {
                 budget = None;
                 crate::recovery::mark_live(&state, Exchange::Coinbase, market, symbol).await;
+            } else if long_gap && progressed {
+                budget = None;
             }
         }
     }

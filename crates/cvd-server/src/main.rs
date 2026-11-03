@@ -1276,13 +1276,16 @@ fn market_http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder().timeout(Duration::from_secs(15)).user_agent("cvd/0.1").build()?)
 }
 
+/// Startup recovery prefix (outbox drain -> closed-CVD seed), shared verbatim
+/// with the persisted-restart durability test.
+pub(crate) async fn startup_recover(state: &AppState) -> Result<()> {
+    state.outbox.drain(&state.db).await?;
+    seed_cvd_closed_from_db(state).await
+}
+
 async fn startup_data_pipeline(state: Arc<AppState>) {
     loop {
-        let recovered = async {
-            state.outbox.drain(&state.db).await?;
-            seed_cvd_closed_from_db(&state).await
-        }
-        .await;
+        let recovered = startup_recover(&state).await;
         match recovered {
             Ok(()) => break,
             Err(err) => {
@@ -1830,6 +1833,10 @@ pub async fn flush_second(
     while let Err(error) = state.outbox.enqueue_batch(&pending).await {
         eprintln!("outbox enqueue failed; ingestion paused without discarding bars: {error}");
         sleep(Duration::from_secs(1)).await;
+    }
+    #[cfg(test)]
+    if !pending.is_empty() {
+        persistence::failpoint::hit(persistence::failpoint::Stage::AfterOutboxCommitBeforePublish).await;
     }
     for (tf, bar) in closed {
         push_publish(state, exchange, market, symbol, tf, bar).await;

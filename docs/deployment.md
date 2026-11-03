@@ -19,6 +19,12 @@ docker compose up -d --no-deps --no-build cvd &&
 docker compose logs --tail=50 cvd
 ```
 
+After an upgrade, Coinbase USDC contracts automatically backfill from your
+existing closed-minute history, which can take a while; the toolbar shows
+`Source recovering` until it shows `Source live`. Keep the database and outbox — no reset or
+new segment is needed. The server must be able to reach `history.deribit.com`
+(public HTTPS) in addition to the live feeds.
+
 <details>
 <summary>Upgrading an older source-build or TOML installation?</summary>
 

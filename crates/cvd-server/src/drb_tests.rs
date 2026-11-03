@@ -189,14 +189,14 @@ async fn sequence_pages_retain_same_millisecond_and_fail_on_missing_numbers() {
     let name = drb::product(Symbol::Btc);
     let (base, calls) = fixture((101..=1102).map(|s| row(s, 1000, name)).collect(), 0).await;
     let rows =
-        drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, Some(100), None, 1102, 1000).await.unwrap();
+        drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, Some(100), None, 1102, 1000, (0, 0)).await.unwrap();
     assert_eq!(rows.len(), 1002);
     assert_eq!(rows[0].id, "101");
     assert_eq!(rows.last().unwrap().id, "1102");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let (base, _) = fixture([row(101, 1000, name), row(103, 1000, name)].to_vec(), 0).await;
     assert!(matches!(
-        drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, Some(100), None, 103, 1000).await,
+        drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, Some(100), None, 103, 1000, (0, 0)).await,
         Err(drb::HistoryError::Retry(_))
     ));
 }
@@ -296,7 +296,7 @@ async fn closed_minute_restart_proves_predecessor_and_replays_only_new_minute() 
     let host = base.strip_prefix("http://").unwrap();
     // A time endpoint on the same listener is required for closed-minute recovery;
     // an absent predecessor must fail closed instead of treating latest as coverage.
-    let err = drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, None, Some(60_000), 103, 60_001)
+    let err = drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, None, Some(60_000), 103, 60_001, (0, 0))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("404"), "{host}: {err}");
@@ -340,10 +340,11 @@ async fn closed_minute_restart_proves_predecessor_and_replays_only_new_minute() 
             None,
             Some(0),
             103,
-            86_400_001
+            86_400_001,
+            (0, 0)
         )
         .await,
-        Err(drb::HistoryError::Fatal(_))
+        Err(drb::HistoryError::Retry(_)) // >20h routes to the archive; an unreachable archive is transient, not terminal
     ));
 }
 
@@ -830,7 +831,7 @@ async fn malformed_rpc_and_sequence_overflow_fail_closed() {
     let name = drb::product(Symbol::Btc);
     let (base, _) = fixture(vec![row(u64::MAX, 1000, name)], 0).await;
     assert!(matches!(
-        drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, Some(u64::MAX - 1), None, u64::MAX, 1000)
+        drb::history(&reqwest::Client::new(), &base, Symbol::Btc, 0.0001, Some(u64::MAX - 1), None, u64::MAX, 1000, (0, 0))
             .await,
         Err(drb::HistoryError::Fatal(_))
     ));
@@ -854,6 +855,7 @@ async fn malformed_rpc_and_sequence_overflow_fail_closed() {
         None,
         101,
         1000,
+        (0, 0),
     )
     .await
     .unwrap_err();
@@ -884,3 +886,316 @@ fn validates_linear_units_and_preserves_sequence_identity() {
     huge["contracts"] = json!(1.0);
     assert!(drb::parse_trade(&huge, "BTC_USDC-PERPETUAL", 1e308).is_err());
 }
+
+// ---- Long-gap archive bridge (t_f8cd5ba7) ----
+const LG_N: u64 = 30_000;
+/// Live tail observed after the fixed target, 23h later (aging-window fixtures).
+const LG_TOP: u64 = LG_N + 9_000;
+const LG_JUMP: i64 = 23 * 3_600_000;
+fn lg_ms(seq: u64) -> i64 {
+    if seq <= 10 {
+        59_000 + seq as i64
+    } else if seq <= LG_N {
+        60_000 + ((seq - 11) / 2) as i64 * 6_000 // tied millisecond pairs
+    } else {
+        lg_ms(LG_N) + LG_JUMP + ((seq - LG_N) / 2) as i64 * 10
+    }
+}
+fn lg_row(seq: u64) -> Value {
+    let name = drb::product(Symbol::Btc);
+    json!({"instrument_name":name,"trade_seq":seq,"timestamp":lg_ms(seq),"price":100.0 + (seq % 7) as f64,
+        "amount":0.001,"contracts":10.0,"direction":if seq.is_multiple_of(3) {"sell"} else {"buy"},"trade_id":format!("USDC-{seq}")})
+}
+fn lg_trade(seq: u64) -> Trade {
+    drb::parse_trade(&lg_row(seq), drb::product(Symbol::Btc), 0.0001).unwrap()
+}
+/// Loopback primary (rolling 24h retention) + `/archive` (full tape, fuzzy edges,
+/// timestamp-desc order, first-call truncation, optional holes / divergent identity).
+async fn lg_fixture(holes: Vec<u64>, diverge: Option<u64>) -> (String, Arc<AtomicUsize>) {
+    lg_fixture_at(holes, diverge, Arc::new(std::sync::atomic::AtomicI64::new(lg_ms(LG_N)))).await
+}
+/// `now`: the fixture's advancing wall clock; primary keeps only `now - 24h ..`.
+async fn lg_fixture_at(
+    holes: Vec<u64>,
+    diverge: Option<u64>,
+    now: Arc<std::sync::atomic::AtomicI64>,
+) -> (String, Arc<AtomicUsize>) {
+    type Q = axum::extract::Query<std::collections::HashMap<String, String>>;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let instrument = || json!({"jsonrpc":"2.0","result":{"instrument_name":"BTC_USDC-PERPETUAL","base_currency":"BTC","quote_currency":"USDC","counter_currency":"USDC","settlement_currency":"USDC","kind":"future","future_type":"linear","is_active":true,"contract_size":0.0001}});
+    let now_pred = now.clone();
+    let primary = move |axum::extract::Query(q): Q| {
+        let target_ms = now.load(Ordering::SeqCst);
+        async move {
+        let (s, e) = (q["start_seq"].parse::<u64>().unwrap(), q["end_seq"].parse::<u64>().unwrap());
+        let rows: Vec<Value> = (s..=e.min(LG_TOP))
+            .filter(|n| target_ms - lg_ms(*n) <= 86_400_000)
+            .take(q["count"].parse().unwrap())
+            .map(lg_row)
+            .collect();
+        let more = rows.last().and_then(|v| v["trade_seq"].as_u64()).is_some_and(|n| n < e);
+        axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":more}}))
+        }
+    };
+    let (c2, h2) = (calls.clone(), holes.clone());
+    let archive = move |axum::extract::Query(q): Q| {
+        let (calls, holes) = (c2.clone(), h2.clone());
+        async move {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let (s, e) = (q["start_seq"].parse::<u64>().unwrap(), q["end_seq"].parse::<u64>().unwrap());
+            let mut rows: Vec<Value> = (s.saturating_sub(2).max(1)..=(e + 2).min(LG_TOP))
+                .filter(|x| !(holes.contains(x) || n % 3 == 1 && *x == e)) // truncated edge row
+                .map(|x| {
+                    let mut r = lg_row(x);
+                    if Some(x) == diverge { r["price"] = json!(1.0); }
+                    r
+                })
+                .collect();
+            rows.reverse(); // ordered by timestamp desc, not sequence
+            if n % 4 == 2 { let d = rows[rows.len() / 2].clone(); rows.push(d); } // exact duplicate
+            rows.truncate(1000);
+            axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":false}}))
+        }
+    };
+    let pred = |axum::extract::Query(q): Q| async move {
+        let end = q["end_timestamp"].parse::<i64>().unwrap();
+        let rows: Vec<Value> = (1..=LG_TOP).rev().filter(|n| lg_ms(*n) <= end).take(3).map(lg_row).collect();
+        axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":true}}))
+    };
+    let app = axum::Router::new()
+        .route("/get_last_trades_by_instrument", axum::routing::get(primary))
+        // Primary by-time predecessor: only rows inside the rolling 24h retention.
+        .route("/get_last_trades_by_instrument_and_time", axum::routing::get(move |axum::extract::Query(q): Q| {
+            let now_ms = now_pred.load(Ordering::SeqCst);
+            async move {
+                let end = q["end_timestamp"].parse::<i64>().unwrap();
+                let rows: Vec<Value> = (1..=LG_TOP).rev()
+                    .filter(|n| lg_ms(*n) <= end && now_ms - lg_ms(*n) <= 86_400_000)
+                    .take(q["count"].parse().unwrap()).map(lg_row).collect();
+                axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":false}}))
+            }
+        }))
+        .route("/archive/get_instrument", axum::routing::get(move || async move { axum::Json(instrument()) }))
+        .route("/archive/get_last_trades_by_instrument", axum::routing::get(archive))
+        .route("/archive/get_last_trades_by_instrument_and_time", axum::routing::get(pred));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+async fn wait_state(shard: &crate::Shard, want: &str, secs: u64) {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            if shard.recovery.read().await.state == want { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("state {want} not reached"));
+}
+type Row = (i64, u64, i64, i64, i64);
+async fn m1(shard: &crate::Shard) -> Vec<Row> {
+    shard.for_tf(crate::types::Tf::M1).0.read().await.iter()
+        .map(|b| (b.time, b.trades, (b.delta_usdt * 1e6).round() as i64, (b.buy_volume_base * 1e9).round() as i64, (b.cvd_usdt * 1e6).round() as i64))
+        .collect()
+}
+
+#[tokio::test]
+async fn long_gap_bridges_archive_to_primary_to_ws_and_survives_restart() {
+    // Reference: every trade after the closed-minute boundary ingested exactly once.
+    let reference = Arc::new(crate::tests::state().await);
+    for n in 11..=LG_N { crate::ingestion::ingest_trade(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc, lg_trade(n)).await.unwrap(); }
+    let rshard = crate::pick_shard(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    let want = m1(rshard).await;
+    let want_cvd = *rshard.cvd_closed_usdt.read().await;
+    assert!(lg_ms(LG_N) - 60_000 > 86_400_000, "gap exceeds the old 24h guard");
+
+    let (base, archive_calls) = lg_fixture(vec![], None).await;
+    // Run 1: interrupted mid-bridge (simulated crash: task aborted, in-memory state dropped).
+    let s1 = Arc::new(crate::tests::state().await);
+    let sh1 = crate::pick_shard(&s1, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    sh1.engine.lock().await.recovery_from_ms = Some(60_000);
+    let (tx, rx) = mpsc::channel(8);
+    let w1 = tokio::spawn(drb::worker(s1.clone(), Symbol::Btc, rx, base.clone(), 0.0001));
+    tx.send(lg_trade(LG_N)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let c = sh1.engine.lock().await.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+            if c.is_some_and(|c| c > 5_000) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    let diag = sh1.recovery.read().await.clone();
+    assert_eq!(diag.state, "recovering");
+    assert!(diag.detail.as_deref().unwrap_or("").contains("archive bridge"), "{diag:?}");
+    w1.abort();
+    let _ = w1.await;
+    drop(tx);
+    // Durable checkpoint = closed minutes only (what restart reloads); the cursor and
+    // the unfinished minute are deliberately discarded.
+    let closed = m1(sh1).await;
+    let last = *closed.last().unwrap();
+    let cvd = *sh1.cvd_closed_usdt.read().await;
+    let bars: Vec<crate::Bar> = sh1.for_tf(crate::types::Tf::M1).0.read().await.iter().cloned().collect();
+
+    // Run 2: restart from the closed-minute checkpoint.
+    let s2 = Arc::new(crate::tests::state().await);
+    let sh2 = crate::pick_shard(&s2, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    {
+        let mut e = sh2.engine.lock().await;
+        e.cvd_closed_usdt = cvd;
+        e.recovery_from_ms = Some((last.0 + 1) * 1000);
+        e.restore_minutes(&bars, last.0);
+    }
+    *sh2.cvd_closed_usdt.write().await = cvd;
+    let (tx, rx) = mpsc::channel(8);
+    let w2 = tokio::spawn(drb::worker(s2.clone(), Symbol::Btc, rx, base, 0.0001));
+    tx.send(lg_trade(LG_N)).await.unwrap();
+    wait_state(sh2, "live", 60).await;
+    drop(tx);
+    w2.await.unwrap();
+    let mut got: Vec<Row> = closed.clone();
+    got.extend(m1(sh2).await);
+    assert_eq!(got, want, "closed 1m bars (trades/delta/volume/cumulative) equal single uninterrupted ingest");
+    assert_eq!(*sh2.cvd_closed_usdt.read().await, want_cvd);
+    let (e2, er) = (sh2.engine.lock().await, rshard.engine.lock().await);
+    assert_eq!(e2.last_trade_id.as_deref(), Some("30000"));
+    assert_eq!((e2.sec.trades, e2.a1.trades), (er.sec.trades, er.a1.trades));
+    assert!(archive_calls.load(Ordering::SeqCst) >= 10, "bounded archive pages, not one giant request");
+}
+
+#[tokio::test]
+async fn long_gap_archive_hole_stays_blocked_with_exact_interval_and_identity_mismatch_is_fatal() {
+    for (holes, diverge, needle) in [
+        (vec![3_000u64, 3_001], None, "archive missing sequence interval 3000-3001"),
+        (vec![], Some(28_010u64), "archive identity mismatch at sequence 28010"),
+    ] {
+        let (base, _) = lg_fixture(holes, diverge).await;
+        let s = Arc::new(crate::tests::state().await);
+        let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+        sh.engine.lock().await.recovery_from_ms = Some(60_000);
+        let (tx, rx) = mpsc::channel(8);
+        let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+        tx.send(lg_trade(LG_N)).await.unwrap();
+        wait_state(sh, "needs_backfill", 90).await;
+        let d = sh.recovery.read().await.clone();
+        assert!(d.detail.as_deref().unwrap_or("").contains(needle), "{d:?}");
+        let e = sh.engine.lock().await;
+        // Never past the hole, never zero-reset; bars before it are intact.
+        assert!(e.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok()).is_none_or(|c| c < 3_000));
+        drop(e);
+        drop(tx);
+        let _ = w.await;
+    }
+}
+
+async fn lg_reference(top: u64) -> (Vec<Row>, f64, u64) {
+    let reference = Arc::new(crate::tests::state().await);
+    for n in 11..=top { crate::ingestion::ingest_trade(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc, lg_trade(n)).await.unwrap(); }
+    let rshard = crate::pick_shard(&reference, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    let cvd = *rshard.cvd_closed_usdt.read().await;
+    let trades = rshard.engine.lock().await.sec.trades as u64;
+    (m1(rshard).await, cvd, trades)
+}
+
+#[tokio::test]
+async fn long_gap_overflow_keeps_known_discarded_tail_required_before_live() {
+    // Overflow the bounded long-gap buffer with a WS tail (> RECOVERY_CHANNEL_CAPACITY)
+    // and send NO later WS trade: the newest observed sequence must still be required.
+    assert!((LG_TOP - LG_N) as usize > crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let (base, _) = lg_fixture(vec![], None).await;
+    let s = Arc::new(crate::tests::state().await);
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    sh.engine.lock().await.recovery_from_ms = Some(60_000);
+    let (tx, rx) = mpsc::channel(8);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+    for n in LG_N..=LG_TOP { tx.send(lg_trade(n)).await.unwrap(); }
+    let mut lied = None;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let st = sh.recovery.read().await.state.clone();
+            let c = sh.engine.lock().await.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+            if st == "live" {
+                if c != Some(LG_TOP) { lied = Some(c); }
+                break;
+            }
+            assert_ne!(st, "needs_backfill", "{:?}", sh.recovery.read().await.detail);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("live not reached");
+    assert_eq!(lied, None, "reported live while known tail through {LG_TOP} was outstanding");
+    drop(tx);
+    w.await.unwrap();
+    let (want, want_cvd, want_trades) = lg_reference(LG_TOP).await;
+    assert_eq!(m1(sh).await, want);
+    assert_eq!(*sh.cvd_closed_usdt.read().await, want_cvd);
+    assert_eq!(sh.engine.lock().await.sec.trades as u64, want_trades);
+}
+
+#[tokio::test]
+async fn long_gap_identity_and_primary_handoff_follow_fresh_window_as_target_ages() {
+    // Primary retention advances to the freshest WS observation (23h past the fixed
+    // target): the target-2000 identity window and target-relative handoff are evicted.
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(lg_ms(LG_TOP)));
+    assert!(lg_ms(LG_TOP) - lg_ms(LG_N - drb_gate_back()) > 86_400_000, "old identity window evicted");
+    assert!(lg_ms(LG_TOP) - lg_ms(LG_TOP - drb_gate_back()) < 86_400_000, "fresh identity window retained");
+    let (base, _) = lg_fixture_at(vec![], None, now).await;
+    let s = Arc::new(crate::tests::state().await);
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    sh.engine.lock().await.recovery_from_ms = Some(60_000);
+    let (tx, rx) = mpsc::channel(8);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+    tx.send(lg_trade(LG_N)).await.unwrap();
+    tx.send(lg_trade(LG_TOP)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let st = sh.recovery.read().await.state.clone();
+            assert_ne!(st, "needs_backfill", "{:?}", sh.recovery.read().await.detail);
+            if st == "live" { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("live not reached");
+    assert_eq!(sh.engine.lock().await.last_trade_id.as_deref(), Some(LG_TOP.to_string().as_str()));
+    drop(tx);
+    w.await.unwrap();
+    let (want, want_cvd, _) = lg_reference(LG_TOP).await;
+    assert_eq!(m1(sh).await, want, "no skip across the evicted primary range");
+    assert_eq!(*sh.cvd_closed_usdt.read().await, want_cvd);
+}
+fn drb_gate_back() -> u64 { 2_000 }
+
+/// Opt-in bounded REAL code-path probe (public primary + archive, no writes):
+/// `CVD_DRB_REAL_PROBE=1 cargo test -p cvd-server real_archive_chunk_probe -- --ignored --nocapture`.
+/// Per asset: 1 metadata x2, 1 latest, 1 identity window x2, <=3 archive pages, primary replay of 2000 seqs.
+#[tokio::test]
+#[ignore]
+async fn real_archive_chunk_probe() {
+    if std::env::var("CVD_DRB_REAL_PROBE").as_deref() != Ok("1") { return; }
+    const SPAN: u64 = 2_000;
+    let client = reqwest::Client::new();
+    let archive = drb::archive_base(drb::BASE);
+    for symbol in [Symbol::Btc, Symbol::Eth] {
+        let size = drb::metadata(&client, drb::BASE, symbol).await.unwrap();
+        let latest = drb::latest(&client, drb::BASE, symbol, size).await.unwrap().unwrap();
+        let top: u64 = latest.id.parse().unwrap();
+        let t0 = std::time::Instant::now();
+        drb::archive_identity(&client, drb::BASE, &archive, symbol, size, top).await.unwrap();
+        let cursor = top - 3_000;
+        let target = cursor + SPAN + 1;
+        // fresh_ms far ahead keeps the chunk on the archive through target-1 (no handoff).
+        let chunk = drb::archive_chunk(&client, &archive, symbol, size, Some(cursor), Some(0), target, latest.timestamp_ms + 30 * 3_600_000).await.unwrap();
+        let archive_secs = t0.elapsed().as_secs_f64();
+        let primary = drb::history(&client, drb::BASE, symbol, size, Some(cursor), None, target, latest.timestamp_ms, (0, 0)).await.unwrap();
+        assert_eq!(chunk.len() as u64, SPAN, "archive chunk exact length");
+        let primary: Vec<_> = primary.into_iter().filter(|t| t.id.parse::<u64>().unwrap() < target).collect();
+        assert_eq!(primary.len(), chunk.len());
+        for (a, b) in chunk.iter().zip(&primary) {
+            assert_eq!((&a.id, a.timestamp_ms, a.price, a.base, a.quote, a.is_buy), (&b.id, b.timestamp_ms, b.price, b.base, b.quote, b.is_buy));
+        }
+        println!("REAL {} latest_seq={top} chunk={}..={} trades={} archive_identity+chunk_secs={archive_secs:.2} first_ms={} last_ms={}",
+            drb::product(symbol), cursor + 1, target - 1, chunk.len(), chunk[0].timestamp_ms, chunk.last().unwrap().timestamp_ms);
+    }
+}
+
+#[path = "drb_durability_tests.rs"]
+mod durability;

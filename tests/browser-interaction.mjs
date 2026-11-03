@@ -76,7 +76,9 @@ function resetDataset() { dataset = Array.from({ length: TOTAL }, (_, i) => make
 globalThis.__dataset = () => dataset
 // assetFault: test-only fault on ONE served static asset (indicator_menu reload
 // controls): { path, delayMs } delays it, { path, status } fails it.
-const control = { tfGrid: false, beforeDelayMs: 0, requests: [], wsUpgrades: 0, assetFault: null, livePushes: 0 }
+// health: selected-source status fixture (source_status scenario); null => 404.
+// { rows: () => [...], status?: 503, delayNextMs?: n } ; healthLog records every GET /health.
+const control = { tfGrid: false, beforeDelayMs: 0, requests: [], wsUpgrades: 0, assetFault: null, livePushes: 0, health: null, healthLog: [], metaSymbols: ['BTC'] }
 
 // ------------------------------------------------------------ real indicators
 const ORACLE_WASM = (process.env.CVD_LOCAL_WASM || '').split(',').filter(Boolean)
@@ -213,7 +215,24 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1')
     if (url.pathname === '/meta') {
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ contract_series: 'contracts-drb-v1', exchanges: [{ exchange: 'binance', markets: ['spot'], symbols: ['BTC'] }] }))
+        res.end(JSON.stringify({ contract_series: 'contracts-drb-v1', exchanges: [{ exchange: 'binance', markets: ['spot'], symbols: control.metaSymbols }] }))
+        return
+    }
+    if (url.pathname === '/health') {
+        const h = control.health, entry = { at: Date.now(), answeredAt: null }
+        control.healthLog.push(entry)
+        // Client-side disconnect (e.g. an AbortController timeout) is recorded
+        // separately from the server finishing its own (leftover) processing.
+        res.on('close', () => { if (!res.writableFinished) entry.clientClosedAt = Date.now() })
+        // holdRows: rows frozen at HOLD start (a late answer carries stale state on purpose).
+        const held = h?.holdRows
+        if (h?.delayNextMs) { const d = h.delayNextMs; h.delayNextMs = 0; h.holdRows = undefined; entry.delayed = d; await new Promise(r => setTimeout(r, d)) }
+        // Rows are captured at ANSWER time (a delayed answer carries the state of its own instant).
+        const rows = held ?? h?.rows?.()
+        entry.answeredAt = Date.now(); entry.rows = rows
+        if (!h || h.status) { res.writeHead(h?.status || 404, { 'Cache-Control': 'no-store' }); res.end(); return }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+        res.end(JSON.stringify({ healthy: false, ready: true, pending_bars: 0, sources: rows }))
         return
     }
     if (url.pathname === '/history') {
@@ -348,6 +367,7 @@ const CACHE_TARGET = 16000
 const EXPECTED_PANES = 1 + new Set(runners.flatMap(r => r.descriptor.outputs.filter(o => o.pane === 'separate' && !o.readout_only).map(o => `${r.descriptor.id}:${o.pane_group ?? o.key}`))).size
 async function openPage() {
     resetDataset()
+    control.health = null; control.healthLog.length = 0; control.metaSymbols = ['BTC']
     control.beforeDelayMs = 0
     control.assetFault = null
     control.requests.length = 0
@@ -884,6 +904,166 @@ const scenarios = {
             one_resume_render: x.resumeSetBars === 1,
             tail_rendered: x.tail === last.time + STEP * 5,
         } }
+    },
+    async source_status() {
+        // C: selected-source ingestion status from /health, independent of
+        // page socket, per-bar quality (fixture bars carry none), hover and bars.
+        const shots = path.join(OUT, 'source-status'); fs.mkdirSync(shots, { recursive: true })
+        const shot = async name => { const r = await call('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(shots, name + '.png'), Buffer.from(r.data, 'base64')); return name + '.png' }
+        const x = { checks: {}, details: {}, screenshots: [] }, failures = []
+        const check = (name, ok, detail) => { x.checks[name] = !!ok; x.details[name] = detail ?? null; if (!ok) failures.push(name + ' ' + JSON.stringify(detail ?? null).slice(0, 600)) }
+        const row = (symbol, state, extra = {}) => ({ exchange: 'binance', market: 'spot', symbol, error: null, last_trade_ms: Date.now() - 1000,
+            recovery: { state, attempts: 2, buffered_trades: 7, durable_cursor: '24738167', durable_from_ms: Date.UTC(2026, 9, 29, 0, 0), detail: 'DRB archive bridge', ...(extra.recovery || {}) }, ...(extra.top || {}) })
+        const ui = () => evaluate(`({ source: document.getElementById('source-state').textContent, sourceTitle: document.getElementById('source-state').title, sourceState: document.getElementById('source-state').dataset.state,
+            page: document.getElementById('status').textContent, quality: document.getElementById('quality-state').textContent,
+            symbol: __cvd.elements.symbolSel.value, book: document.getElementById('book-panel').hidden })`)
+        const chartState = () => evaluate(`({ n: __cvd.page.bars.length, last: JSON.stringify(__cvd.page.bars.at(-1)), range: JSON.stringify(__cvd.range()), price: JSON.stringify(__cvd.seriesData().filter(s => s.type === 'Candlestick' || s.type === 'Line').map(s => s.data.at(-1))) })`)
+        const waitLabel = async (re, timeout = 12000) => { const src = re.source.replace(/\\/g, '\\\\').replace(/'/g, "\\'"); await waitFor(`new RegExp('${src}').test(document.getElementById('source-state').textContent)`, timeout); return ui() }
+        const health = { rows: () => [row('BTC', 'needs_backfill'), row('ETH', 'live')] }
+        // Two selectable symbols for the selection-change case (setup only).
+        control.metaSymbols = ['BTC', 'ETH']; control.health = null
+        // Real-timer/fetch instrumentation (no fakes): log every client /health
+        // fetch start/end/abort and every firing of the 5 s source-poll interval.
+        const probe = await call('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+            const log = globalThis.__srcProbe = { fetches: [], ticks: [], peak: 0, pending: 0 }
+            const f = globalThis.fetch.bind(globalThis)
+            globalThis.fetch = (input, init) => {
+                if (!String(input).endsWith('/health')) return f(input, init)
+                const e = { start: Date.now(), end: null, outcome: null, pendingAtStart: log.pending }
+                log.fetches.push(e); log.pending++; log.peak = Math.max(log.peak, log.pending)
+                const done = outcome => { if (e.end === null) { e.end = Date.now(); e.outcome = outcome; log.pending-- } }
+                init?.signal?.addEventListener('abort', () => done('abort'))
+                return f(input, init).then(r => r.clone().text().then(() => { done('ok'); return r }, err => { done(err?.name === 'AbortError' ? 'abort' : 'error'); throw err }), err => { done(err?.name === 'AbortError' ? 'abort' : 'error'); throw err })
+            }
+            const si = globalThis.setInterval.bind(globalThis)
+            globalThis.setInterval = (fn, ms, ...a) => ms === 5000 ? si((...b) => { log.ticks.push({ at: Date.now(), pendingAtTick: log.pending, fetchesBefore: log.fetches.length }); return fn(...b) }, ms, ...a) : si(fn, ms, ...a)
+        })()` })
+        await call('Page.navigate', { url: `http://127.0.0.1:${PORT}/` })
+        await waitFor(`!!globalThis.__cvd && __cvd.page.bars.length > 0 && document.getElementById('status').textContent === 'live'`)
+        await quiet()
+        // 1. Health failure / unknown never reads live.
+        let u = await waitLabel(/^Source status unknown$/)
+        check('health_failure_unknown_not_live', u.page === 'live' && u.source === 'Source status unknown' && u.sourceState === 'attention' && /Not treated as live/.test(u.sourceTitle), u)
+        control.health = { rows: () => [row('BTC', 'live')], status: 503 }
+        const n503 = control.healthLog.length; await waitFor(`true`); while (control.healthLog.length <= n503) await sleep(50); await sleep(300)
+        u = await ui(); check('health_503_unknown_not_live', u.source === 'Source status unknown' && /HTTP 503/.test(u.sourceTitle), u)
+        control.health = { rows: () => [row('BTC', 'mystery')] }
+        const nOdd = control.healthLog.length; while (control.healthLog.length <= nOdd) await sleep(50); await sleep(300)
+        u = await ui(); check('health_unknown_state_not_live', u.source === 'Source status unknown' && /mystery/.test(u.sourceTitle), u)
+        const before = await chartState()
+        await evaluate('__cvd.reset()')
+        // 2. Page live + selected source needs_backfill with no per-bar quality.
+        control.health = health
+        u = await waitLabel(/^Source stopped · needs backfill$/)
+        await shot('needs-backfill-desktop'); x.screenshots.push('needs-backfill-desktop.png')
+        check('page_live_source_needs_backfill_no_quality', u.page === 'live' && u.quality === 'Quality unknown' && !/recovering/i.test(u.source) && /Not recovering/.test(u.sourceTitle), u)
+        // 3. Historical hover (trusted pointer) keeps the source state.
+        const hx = paneBox.x + paneBox.width * 0.2, hy = paneBox.y + paneBox.height * 0.5
+        await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: hx, y: hy })
+        const nHover = control.healthLog.length; while (control.healthLog.length <= nHover + 1) await sleep(50); await sleep(300)
+        u = await ui()
+        const hovered = await evaluate('__cvd.elements.qualityStateEl.textContent')
+        check('history_hover_missing_quality_keeps_source_state', u.source === 'Source stopped · needs backfill' && hovered === 'Quality unknown', { u, hovered })
+        await shot('hover-history-needs-backfill'); x.screenshots.push('hover-history-needs-backfill.png')
+        await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 5, y: 5 })
+        // 4. Recovering detail progresses without new chart bars.
+        const t1 = Date.UTC(2026, 9, 29, 14, 5), t2 = Date.UTC(2026, 9, 29, 14, 7)
+        control.health = { rows: () => [row('BTC', 'recovering', { top: { last_trade_ms: t1 } }), row('ETH', 'live')] }
+        const r1 = await waitLabel(/^Source recovering · 14:05Z$/)
+        control.health = { rows: () => [row('BTC', 'recovering', { top: { last_trade_ms: t2 }, recovery: { attempts: 3 } }), row('ETH', 'live')] }
+        const r2 = await waitLabel(/^Source recovering · 14:07Z$/)
+        await shot('recovering-desktop'); x.screenshots.push('recovering-desktop.png')
+        const mid = await chartState(), writes = await evaluate('__cvd.snapshot().calls')
+        check('recovering_progresses_without_new_bars', r1.sourceTitle !== r2.sourceTitle && /Attempts 3/.test(r2.sourceTitle) && /not a restart checkpoint/.test(r2.sourceTitle) && /\(in memory\)/.test(r2.sourceTitle) && !/durable cursor/i.test(r2.sourceTitle)
+            && mid.n === before.n && mid.last === before.last && mid.price === before.price && mid.range === before.range && writeCount({ calls: writes }) === 0, { r1, r2, writes, before, mid })
+        // 5. Recovery -> live.
+        control.health = { rows: () => [row('BTC', 'live'), row('ETH', 'live')] }
+        u = await waitLabel(/^Source live$/)
+        check('recovery_to_live', u.sourceState === 'quiet' && u.page === 'live', u)
+        // 6. Selection change with a delayed old-scope response: BTC stopped, ETH live.
+        control.health = { rows: () => [row('BTC', 'needs_backfill'), row('ETH', 'live')] }
+        await waitLabel(/^Source stopped · needs backfill$/)
+        await evaluate(`window.__srcSeen = []; new MutationObserver(() => __srcSeen.push(document.getElementById('source-state').textContent)).observe(document.getElementById('source-state'), { childList: true, characterData: true, subtree: true })`)
+        control.health.delayNextMs = 2500
+        const nDelay = control.healthLog.length
+        while (!(control.healthLog.length > nDelay && control.healthLog.at(-1).delayed)) await sleep(20)
+        const delayed = control.healthLog.at(-1)
+        await evaluate(`__cvd.elements.symbolSel.value = 'ETH'; __cvd.elements.symbolSel.onchange(); __srcSeen.push('SWITCH')`)
+        u = await waitLabel(/^Source live$/)
+        while (delayed.answeredAt === null) await sleep(50)
+        await sleep(600); u = await ui()
+        const seen = await evaluate('__srcSeen')
+        const afterSwitch = seen.slice(seen.indexOf('SWITCH') + 1)
+        check('selection_change_delayed_old_response_ignored', u.symbol === 'ETH' && u.source === 'Source live' && delayed.answeredAt > 0 && afterSwitch.length > 0 && !afterSwitch.some(t => /stopped/.test(t)) && afterSwitch[0] === 'Source checking…', { u, seen, delayedMs: delayed.delayed })
+        // 7. Lifecycle: pagehide stops the one updater; pageshow renews it.
+        await evaluate(`window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))`)
+        const nHide = control.healthLog.length; await sleep(6500)
+        const duringHide = control.healthLog.length - nHide
+        control.health = { rows: () => [row('BTC', 'needs_backfill'), row('ETH', 'recovering', { top: { last_trade_ms: t2 } })] }
+        await evaluate(`window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))`)
+        u = await waitLabel(/^Source recovering · 14:07Z$/, 3000)
+        const nShow = control.healthLog.length; await sleep(5600)
+        const perTick = control.healthLog.length - nShow
+        check('lifecycle_pagehide_stops_pageshow_resumes', duringHide === 0 && u.symbol === 'ETH' && perTick >= 1 && perTick <= 2, { duringHide, perTick, u })
+        const conc = control.healthLog.filter(e => e.answeredAt === null).length
+        check('bounded_single_inflight', conc <= 1, { conc })
+        // 7b. NON-VACUOUS concurrency: hold one real response 7 s (> 5 s poll period,
+        // < 8 s deadline). A later real timer tick fires while it is pending and must
+        // not start a second fetch; release, then progress resumes.
+        control.health = { rows: () => [row('BTC', 'needs_backfill'), row('ETH', 'live')], holdRows: [row('BTC', 'needs_backfill'), row('ETH', 'live')], delayNextMs: 7000 }
+        const nHold = control.healthLog.length
+        while (!(control.healthLog.length > nHold && control.healthLog.at(-1).delayed)) await sleep(20)
+        const holdEntry = control.healthLog.at(-1)
+        const p0 = await evaluate('({ f: __srcProbe.fetches.length, t: __srcProbe.ticks.length, peak: __srcProbe.peak })')
+        const holdFetchIdx = p0.f - 1
+        await evaluate(`__srcProbe.peak = __srcProbe.pending`)
+        while (holdEntry.answeredAt === null) await sleep(50)
+        u = await waitLabel(/^Source live$/, 4000)
+        await sleep(300)
+        const p1 = await evaluate(`({ fetches: __srcProbe.fetches.slice(${holdFetchIdx}), ticks: __srcProbe.ticks.slice(${p0.t}), peak: __srcProbe.peak, pending: __srcProbe.pending })`)
+        const hf = p1.fetches[0], ticksDuring = p1.ticks.filter(t => t.at > hf.start && t.at < hf.end)
+        const startsDuring = p1.fetches.slice(1).filter(e => e.start < hf.end).length
+        check('held_inflight_across_tick_single', hf.outcome === 'ok' && hf.end - hf.start >= 6500 && hf.end - hf.start < 8000 && holdEntry.clientClosedAt === undefined
+            && ticksDuring.length >= 1 && ticksDuring.every(t => t.pendingAtTick === 1) && startsDuring === 0 && p1.peak === 1 && u.source === 'Source live',
+            { held: hf, ticksDuring, startsDuring, peak: p1.peak, server: holdEntry, u })
+        // 7c. TRUE timeout: hold 9 s (> 8 s production deadline) with STALE live rows.
+        // Client must abort at ~8 s -> unknown/timeout; the late server answer at ~9 s
+        // must not restore live; the next real poll reports the current state.
+        control.health = { rows: () => [row('BTC', 'needs_backfill'), row('ETH', 'needs_backfill')] }
+        await waitLabel(/^Source stopped · needs backfill$/)
+        await evaluate(`window.__srcSeen2 = []; new MutationObserver(() => __srcSeen2.push([Date.now(), document.getElementById('source-state').textContent, document.getElementById('source-state').title])).observe(document.getElementById('source-state'), { childList: true, characterData: true, subtree: true, attributes: true })`)
+        control.health.holdRows = [row('BTC', 'live'), row('ETH', 'live')]; control.health.delayNextMs = 9000
+        const nTo = control.healthLog.length
+        while (!(control.healthLog.length > nTo && control.healthLog.at(-1).delayed)) await sleep(20)
+        const toEntry = control.healthLog.at(-1)
+        const toIdx = (await evaluate('__srcProbe.fetches.length')) - 1
+        const uTimeout = await waitLabel(/^Source status unknown$/, 9500)
+        while (toEntry.answeredAt === null) await sleep(50)
+        await sleep(400)
+        const uLate = await ui()
+        const uNext = await waitLabel(/^Source stopped · needs backfill$/, 7000)
+        const tf = (await evaluate(`__srcProbe.fetches[${toIdx}]`)), seen2 = await evaluate('__srcSeen2')
+        check('timeout_unknown_late_response_ignored', tf.outcome === 'abort' && tf.end - tf.start >= 7900 && tf.end - tf.start < 8900
+            && /timeout/.test(uTimeout.sourceTitle) && toEntry.clientClosedAt > 0 && toEntry.answeredAt > tf.end && toEntry.rows?.[1]?.recovery?.state === 'live'
+            && uLate.source === 'Source status unknown' && !seen2.some(s => s[1] === 'Source live') && uNext.source === 'Source stopped · needs backfill',
+            { fetch: tf, server: { at: toEntry.at, clientClosedAt: toEntry.clientClosedAt, answeredAt: toEntry.answeredAt }, uTimeout, uLate, uNext, seen2 })
+        await call('Page.removeScriptToEvaluateOnNewDocument', { identifier: probe.identifier })
+        // 8. Chart and book unchanged by status ticks (ETH reload re-fetched history; compare after it).
+        const after = await chartState(); await sleep(5500); const after2 = await chartState()
+        check('chart_and_book_unchanged_by_status', after.n === after2.n && after.last === after2.last && after.price === after2.price && after.range === after2.range && u.book === true, { after, after2 })
+        // 9. Desktop + narrow viewport: badge fully visible, not clipped.
+        const fit = () => evaluate(`(() => { const e = document.getElementById('source-state'), b = document.querySelector('.bar'); e.scrollIntoView({ block: 'nearest', inline: 'nearest' }); const r = e.getBoundingClientRect(), br = b.getBoundingClientRect()
+            return { r: [r.left, r.top, r.right, r.bottom], bar: [br.left, br.top, br.right, br.bottom], vw: innerWidth, sw: e.scrollWidth, cw: e.clientWidth, text: e.textContent } })()`)
+        const ok = f => f.r[0] >= 0 && f.r[2] <= f.vw + 0.5 && f.r[1] >= f.bar[1] - 0.5 && f.r[3] <= f.bar[3] + 0.5 && f.sw <= f.cw + 1
+        const desk = await fit(); await shot('status-desktop'); x.screenshots.push('status-desktop.png')
+        await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true }); await frames(4)
+        const narrow = await fit(); await shot('status-narrow'); x.screenshots.push('status-narrow.png')
+        await call('Emulation.setDeviceMetricsOverride', { width: VIEW.width, height: VIEW.height, deviceScaleFactor: VIEW.deviceScaleFactor, mobile: false }); await frames(4)
+        check('badge_visible_desktop_and_narrow', ok(desk) && ok(narrow), { desk, narrow })
+        x.failures = failures
+        fs.writeFileSync(path.join(shots, 'source-status-results.json'), JSON.stringify({ label: 'Headless Chromium, loopback /health fixture, assembled static tree.', ...x }, null, 1))
+        if (failures.length) console.log('source_status failures:\n  ' + failures.join('\n  '))
+        return { m: { calls: {}, requests: [], setBarsMs: [], longTasks: [], frames: [], coverageMisses: null, wallMs: null, input: {}, extra: x.details }, checks: x.checks }
     },
     async indicator_menu() {
         // Compact indicator multiselect, driven ONLY by trusted CDP pointer

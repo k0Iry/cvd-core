@@ -11,12 +11,12 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const tmp = (p) => fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), p))
-const WANT12 = 'cached_drag,cached_zoom,crossing_buffer,crossing_newer,hidden_resize_resume,history_prepend_delayed,indicator_menu,long_drag,pane_contract,realtime_while_history,source_reset_new_grid,wide_zoom_return'
+const WANT13 = 'cached_drag,cached_zoom,crossing_buffer,crossing_newer,hidden_resize_resume,history_prepend_delayed,indicator_menu,long_drag,pane_contract,realtime_while_history,source_reset_new_grid,source_status,wide_zoom_return'
 const WANT2 = 'tf_roundtrip_pending,warmup_exposed_drag'
 // Pins the gate's own lists so a drift in either is caught here too.
 const gateSrc = fs.readFileSync(path.join(ROOT, 'scripts/core-app-gate.sh'), 'utf8')
-test('core-app-gate pins the 12 + 2 inventories', () => {
-  assert.ok(gateSrc.includes(`\nwant=${WANT12}\n`))
+test('core-app-gate pins the 13 + 2 inventories', () => {
+  assert.ok(gateSrc.includes(`\nwant=${WANT13}\n`))
   assert.ok(gateSrc.includes(`\ncovwant=${WANT2}\n`))
 })
 
@@ -29,7 +29,7 @@ function check(label, want, results) {
 }
 const green = (want) => ({ scenarios: Object.fromEntries(want.split(',').map(k => [k, { all_ok: true }])), errors: [], cleanup: { ok: true } })
 
-for (const [label, want] of [['scenario', WANT12], ['coverage', WANT2]]) {
+for (const [label, want] of [['scenario', WANT13], ['coverage', WANT2]]) {
   test(`${label} inventory: green fixture passes`, () => {
     const r = check(label, want, green(want)); assert.equal(r.status, 0, r.stderr)
   })

@@ -584,6 +584,39 @@ export function mergeHistoryQuality(existing, incoming) {
 }
 const retainedNote = q => q.retained === true ? 'Original real-time observation retained across identical history inputs, not a new historical completeness audit; coverage remains unverified. ' : '';
 const stamp = ms => Number.isFinite(ms) && ms > 0 && ms <= 8.64e15 ? new Date(ms).toISOString() : 'unknown';
+// ------------------------------------------------------------ Selected-source status
+// Presentation of the selected source's CURRENT ingestion state from /health,
+// independent of bars, per-bar quality, hover and the page WebSocket. Exact
+// exchange/market/symbol match only; missing/failed/odd evidence never reads live.
+const SOURCE_LIVE_MS = 90_000;
+const clock = ms => Number.isFinite(ms) && ms > 0 && ms <= 8.64e15 ? new Date(ms).toISOString().slice(11, 16) + 'Z' : null;
+export function sourceStatusDisplay(health, scope, now = Date.now(), failure = null) {
+    const unknown = why => ({ label: 'Source status unknown', state: 'attention', tooltip: `${why} Not treated as live.` });
+    if (failure) return unknown(`Health check failed (${String(failure).slice(0, 120)}).`);
+    if (!health || !Array.isArray(health.sources)) return unknown('No health evidence.');
+    const source = health.sources.find(s => s && s.exchange === scope?.exchange && s.market === scope?.market && s.symbol === scope?.symbol);
+    if (!source) return unknown(`No health row for ${scope?.exchange} ${scope?.market} ${scope?.symbol}.`);
+    const r = source.recovery && typeof source.recovery === 'object' ? source.recovery : {};
+    const name = `${source.exchange} ${source.market} ${source.symbol}`;
+    const detail = typeof r.detail === 'string' && r.detail ? ` Detail: ${r.detail.slice(0, 300)}.` : '';
+    const processed = Number.isFinite(source.last_trade_ms) ? source.last_trade_ms : null;
+    if (r.state === 'needs_backfill') return { label: 'Source stopped · needs backfill', state: 'attention',
+        tooltip: `${name}: ingestion stopped; historical backfill required. Not recovering automatically.${detail} Last processed trade ${stamp(processed)}.` };
+    if (r.state === 'recovering') {
+        const at = clock(processed);
+        return { label: at ? `Source recovering · ${at}` : 'Source recovering', state: 'attention',
+            tooltip: `${name}: recovering. Processed through ${stamp(processed)} (observed in-memory progress, not a restart checkpoint; a restart resumes from the last persisted closed minute).` +
+                `${Number.isFinite(r.durable_from_ms) ? ` Recovery anchored at ${stamp(r.durable_from_ms)}.` : ''}` +
+                `${r.durable_cursor != null ? ` Sequence cursor ${String(r.durable_cursor).slice(0, 40)} (in memory).` : ''}` +
+                ` Attempts ${Number.isFinite(r.attempts) ? r.attempts : '?'}; buffered live trades ${Number.isFinite(r.buffered_trades) ? r.buffered_trades : '?'}.${detail}` };
+    }
+    if (r.state === 'starting') return { label: 'Source starting', state: 'attention', tooltip: `${name}: starting.${detail}` };
+    if (r.state !== 'live') return unknown(`${name}: recovery state ${String(r.state ?? 'missing').slice(0, 40)}.`);
+    if (source.error) return { label: 'Source error', state: 'attention', tooltip: `${name}: ${String(source.error).slice(0, 300)}` };
+    if (processed === null || !Number.isFinite(now) || now - processed >= SOURCE_LIVE_MS) return { label: 'Source live · no recent trade', state: 'attention',
+        tooltip: `${name}: live, but last trade ${stamp(processed)} is older than ${SOURCE_LIVE_MS / 1000}s.` };
+    return { label: 'Source live', state: 'quiet', tooltip: `${name}: live; last trade ${stamp(processed)}.` };
+}
 export function qualityDisplay(bar, aggregate, now = Date.now(), latest = true, scope = null) {
     // Only a matching source row may describe a selected venue. Aggregate
     // participation counts never attest selected-feed completeness.
