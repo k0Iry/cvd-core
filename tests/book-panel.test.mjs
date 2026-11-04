@@ -3,12 +3,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { createBookPanel, bookSupported, isBookDescriptor, BOOK_STALE_MS } from '../static/js/book-panel.js'
+import { createBookPanel, isBookDescriptor, BOOK_STALE_MS } from '../static/js/book-panel.js'
 import { createCoordinator } from '../static/wasm-host/host-bridge.js'
 // Real Rust coordinator (book admission authority) built by the gate.
 const COORD = fs.readFileSync(process.env.CVD_COORDINATOR_WASM || new URL('../static/wasm-host/cvd_browser_coordinator.wasm', import.meta.url))
 
-async function harness({ computeImpl, onChange } = {}) {
+async function harness({ computeImpl, onChange, container = null, catalog = true, bookSupported = s => s.exchange === 'binance' && ['BTC', 'ETH'].includes(s.symbol) } = {}) {
   const coord = await createCoordinator(COORD)
   const sockets = []
   class FakeWS { constructor(url) { this.url = String(url); this.closed = false; sockets.push(this) } close() { this.closed = true } }
@@ -22,7 +22,7 @@ async function harness({ computeImpl, onChange } = {}) {
     disable(inst) { calls.disable.push(inst) },
     supersede(inst, k, r) { calls.supersede.push([inst, k, r]); return 0 },
   }
-  const panel = createBookPanel({ host, coord, container: null, wsUrl: s => `ws://x/book?symbol=${s.symbol}&market=${s.market}`, WebSocketImpl: FakeWS, timers, now: () => t, onChange })
+  const panel = createBookPanel({ host, coord, container, ...(catalog ? { bookSupported } : {}), wsUrl: s => `ws://x/book?symbol=${s.symbol}&market=${s.market}`, WebSocketImpl: FakeWS, timers, now: () => t, onChange })
   return { panel, sockets, host, calls, advance, coord }
 }
 function rowsFor(b) { return { unit: b.base, best_bid: b.bids[0][0], best_ask: b.asks[0][0], rows: [{ price: b.asks[0][0], bid: 0, ask: b.asks[0][1] }, { price: b.bids[0][0], bid: b.bids[0][1], ask: 0 }] } }
@@ -32,18 +32,22 @@ const flush = () => new Promise(r => setImmediate(r))
 const BTC = { exchange: 'binance', market: 'usdm', symbol: 'BTC' }
 const plugin = { id: 'orderbook', name: 'Order Book', bytes: new ArrayBuffer(8), params: {}, loadKey: 'a' }
 
-test('descriptor capability and supported sources', () => {
+test('descriptor capability; Book capability comes from the page catalog and fails closed', async () => {
   assert.equal(isBookDescriptor({ inputs: ['order_book'] }), true)
   assert.equal(isBookDescriptor({ inputs: ['price'] }), false)
-  assert.equal(bookSupported(BTC), true)
-  assert.equal(bookSupported({ ...BTC, symbol: 'ETH' }), true)
-  // M2: all ten Binance spot/spot_usdc/usdm/usdm_usdc/coinm x BTC/ETH keys.
-  for (const market of ['spot', 'spot_usdc', 'usdm', 'usdm_usdc', 'coinm']) for (const symbol of ['BTC', 'ETH']) assert.equal(bookSupported({ ...BTC, market, symbol }), true, `${market}/${symbol}`)
-  for (const s of [{ ...BTC, exchange: 'coinbase' }, { ...BTC, exchange: 'coinbase', market: 'usdc', symbol: 'SOL' }, { ...BTC, exchange: 'coinbase', market: 'drb' }, { ...BTC, exchange: 'coinbase', market: 'spot', symbol: 'SOL' }, { ...BTC, symbol: 'SOL' }, { ...BTC, market: 'coinm', symbol: 'SOL' }, { ...BTC, market: 'usdc' }]) assert.equal(bookSupported(s), false, JSON.stringify(s))
-  // M3A: Coinbase Exchange spot BTC/ETH (exchange-inclusive identity).
-  for (const symbol of ['BTC', 'ETH']) assert.equal(bookSupported({ exchange: 'coinbase', market: 'spot', symbol }), true, symbol)
-  // M3B: Coinbase DRB linear USDC perpetual BTC/ETH.
-  for (const symbol of ['BTC', 'ETH']) assert.equal(bookSupported({ exchange: 'coinbase', market: 'usdc', symbol }), true, symbol)
+  // Default (no catalog predicate): no socket for any source.
+  const d = await harness({ catalog: false })
+  d.panel.setSource(BTC); d.panel.setPlugins([plugin]); await flush()
+  assert.equal(d.sockets.length, 0)
+  assert.equal(d.panel.state().status.state, 'unsupported')
+  // The predicate gets the exact identity (a copy) and gates the socket.
+  const seen = []
+  const h = await harness({ bookSupported: s => { seen.push(s); s.symbol = 'X'; return true } })
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  assert.deepEqual(seen.at(-1), { ...BTC, symbol: 'X' })
+  assert.equal(h.panel.state().source.symbol, 'BTC', 'predicate cannot mutate panel source')
+  assert.equal(h.sockets.length, 1)
+  assert.match(h.sockets[0].url, /symbol=BTC/)
 })
 
 test('no plugin => no socket; unsupported source => no socket', async () => {
@@ -178,6 +182,29 @@ test('A: an expired result is not refreshed by new raw frames', async () => {
   assert.equal(view(h).rows, 0, 'stale result withdrawn')
 })
 
+test('A (DOM): rendered rows withdraw at MAX_RESULT_AGE_MS while raw frames keep the feed live', async () => {
+  const pend = []
+  const { root } = fakeDom()
+  const h = await harness({ container: root, computeImpl: (inst, b) => b.seq === 1 ? Promise.resolve(JSON.stringify(rowsFor(b))) : new Promise(r => pend.push(r)) })
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 1)); await flush(); await flush()
+  const box = root.kids[1]
+  const rowCount = () => box.querySelectorAll('[data-scroll]').reduce((n, s) => n + s.kids.length, 0)
+  assert.equal(rowCount(), 2, 'nonempty admitted rows rendered')
+  // Raw frames every 200 ms; compute for seq>=2 stays pending. Admitted at t=0.
+  let s = 2
+  for (; s <= 26; s++) { h.advance(200); h.sockets[0].onmessage(frame('BTC', 1, s)) } // t = 5000
+  assert.ok(pend.length >= 1, 'compute pending')
+  assert.equal(h.panel.state().status.state, 'live')
+  assert.equal(box.dataset.view, 'updating', 'age 5000 ms: still within limit')
+  assert.equal(rowCount(), 2, 'rows kept at exact limit')
+  h.advance(1); h.sockets[0].onmessage(frame('BTC', 1, s)) // t = 5001
+  assert.equal(h.panel.state().status.state, 'live', 'raw feed itself is live')
+  assert.equal(box.dataset.view, 'stale')
+  assert.equal(box.querySelectorAll('[data-scroll]').length, 0, 'row sections withdrawn from DOM')
+  assert.match(box.firstChild.textContent, /result stale — withdrawn/)
+})
+
 test('A: late success and late error during source switch / resync are fenced', async () => {
   for (const kind of ['switch', 'resync']) {
     for (const fail of [false, true]) {
@@ -235,4 +262,96 @@ test('closure §2: safe invalid_params hint via real coordinator; arbitrary text
   f.panel.setSource({ ...BTC, symbol: 'ETH' }); await flush()
   v = view(f)
   assert.deepEqual([v.state, v.fault], ['fault', 'worker_crashed'])
+})
+
+// ---------------------------------------------------------- DOM reuse
+// Minimal element stand-in: enough tree/text/scroll surface for render().
+function fakeDom() {
+  const made = { created: 0 }
+  const doc = { createElement: tag => { made.created++; return node(tag) } }
+  function node(tag) {
+    const n = { tag, className: '', dataset: {}, style: { setProperty() {} }, attrs: {}, kids: [], parent: null, listeners: 0, scrollTop: 0, scrollHeight: 100, clientHeight: 10, ownerDocument: doc, _text: '',
+      get textContent() { return this.kids.length ? this.kids.map(k => k.textContent).join('') : this._text }, set textContent(v) { this._text = String(v); this.kids = [] },
+      get firstChild() { return this.kids[0] ?? null }, get lastChild() { return this.kids.at(-1) ?? null }, get children() { return this.kids },
+      get isConnected() { let p = this; while (p.parent) p = p.parent; return p === root },
+      setAttribute(k, v) { this.attrs[k] = v }, addEventListener(t, f) { this.listeners++; (this.on ??= {})[t] = f },
+      append(...c) { for (const k of c) { if (k.parent) k.parent.kids = k.parent.kids.filter(x => x !== k); k.parent = this; this.kids.push(k) } },
+      replaceChildren(...c) { made.replaced = (made.replaced ?? 0) + (this === root ? 1 : 0); for (const k of this.kids) k.parent = null; this.kids = []; this.append(...c) },
+      querySelectorAll(sel) { const out = []; const walk = n => { for (const k of n.kids) { if (sel === '[data-scroll]' && k.dataset.scroll) out.push(k); walk(k) } }; walk(this); return out } }
+    return n
+  }
+  const root = node('div'); made.created = 0
+  return { root, made }
+}
+
+test('unchanged admitted result reuses row DOM; age/status advance; new result rebuilds; stale withdraws', async () => {
+  const pend = []
+  const { root, made } = fakeDom()
+  const h = await harness({ container: root, computeImpl: (inst, b) => new Promise(r => pend.push(() => r(JSON.stringify(rowsFor(b))))) })
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 10)); pend.shift()(); await flush(); await flush()
+  const box = root.kids[1], rows0 = box.querySelectorAll('[data-scroll]')
+  assert.equal(rows0.length, 2)
+  const title0 = box.firstChild.textContent, b0 = h.panel.state().counters.rowBuilds, c0 = made.created, rep0 = made.replaced
+  assert.match(title0, /live 0\.0s/)
+  // Raw frames while the next compute is in flight + clock ticks: same admitted result.
+  h.sockets[0].onmessage(frame('BTC', 1, 11)); h.advance(1000)
+  assert.equal(h.panel.state().counters.rowBuilds, b0, 'no row rebuild for the same result')
+  assert.equal(made.created, c0, 'no element creation')
+  assert.equal(made.replaced, rep0, 'container children not replaced')
+  assert.equal(root.kids[1], box); assert.deepEqual(box.querySelectorAll('[data-scroll]'), rows0)
+  assert.notEqual(box.firstChild.textContent, title0, 'age/status still advance')
+  // Admitted new result (seq 11) rebuilds rows.
+  pend.shift()(); await flush(); await flush()
+  assert.equal(h.panel.state().counters.rowBuilds, b0 + 1)
+  assert.notEqual(box.querySelectorAll('[data-scroll]')[0], rows0[0])
+  assert.equal(h.panel.state().plugins[0].seq, 11)
+  // Silent feed: stale withdraws rows immediately.
+  h.advance(BOOK_STALE_MS)
+  assert.equal(h.panel.state().status.state, 'stale')
+  assert.equal(box.querySelectorAll('[data-scroll]').length, 0)
+  assert.match(root.kids[0].textContent, /levels withdrawn/)
+  // Disable removes the panel content.
+  h.panel.setPlugins([]); await flush()
+  assert.equal(root.kids.length, 0)
+})
+
+for (const side of ['asks', 'bids']) for (const [kind, ch] of [['large', 70], ['one-pixel', 51]]) {
+  test(`layout clamp keeps the saved manual offset (${side}, ${kind}); genuine user scroll after the clamp replaces it`, async () => {
+    const pend = []
+    const { root } = fakeDom()
+    const h = await harness({ container: root, computeImpl: (inst, b) => new Promise(r => pend.push(() => r(JSON.stringify(rowsFor(b))))) })
+    h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+    let seq = 10
+    const next = async () => { h.sockets[0].onmessage(frame('BTC', 1, ++seq)); pend.shift()(); await flush(); await flush() }
+    const sec = () => root.kids[1].querySelectorAll('[data-scroll]').find(e => e.dataset.scroll.endsWith(`:${side}`))
+    const scroll = (e, top) => { e.scrollTop = top; e.on.scroll() }
+    await next()
+    scroll(sec(), 50)                                    // genuine user offset, max 90
+    const e = sec(); e.clientHeight = ch; const max = e.scrollHeight - e.clientHeight
+    scroll(e, max)                                       // layout shrink: browser clamps to new max
+    assert.ok(max < 50 && (kind === 'large' ? max <= 30 : 50 - max === 1), `witness: new max ${max} below saved offset`)
+    e.clientHeight = 10
+    await next()                                         // rebuild re-pins from saved state
+    assert.equal(sec().scrollTop, 50, 'saved offset restored after geometry returns')
+    const f = sec(); f.clientHeight = ch; scroll(f, max) // clamp again
+    scroll(f, 12)                                        // genuine user move after the clamp
+    f.clientHeight = 10
+    await next()
+    assert.equal(sec().scrollTop, 12, 'user intent after clamp replaces the old offset')
+  })
+}
+
+test('row partition keeps the original ask predicate and descending order (grouped both-sided bucket)', async () => {
+  const { root } = fakeDom()
+  const out = { unit: 'BTC', best_bid: 100.05, best_ask: 100.15, rows: [{ price: 102, bid: 0, ask: 1 }, { price: 101, bid: 0, ask: 2 }, { price: 100, bid: 1, ask: 3 }, { price: 99, bid: 4, ask: 0 }, { price: 98, bid: 5, ask: 0 }] }
+  const h = await harness({ container: root, computeImpl: () => Promise.resolve(JSON.stringify(out)) })
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 10)); await flush(); await flush()
+  const [asks, bids] = root.kids[1].querySelectorAll('[data-scroll]')
+  const prices = s => s.kids.map(r => r.kids[1].textContent)
+  assert.deepEqual(prices(asks), ['102', '101'])
+  assert.deepEqual(prices(bids), ['100', '99', '98'])
+  assert.equal(bids.kids[0].dataset.side, 'both')
+  assert.match(root.kids[1].kids[2].textContent, /bid 100\.05 · spread 0\.10 · ask 100\.15/)
 })

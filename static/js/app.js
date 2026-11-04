@@ -5,9 +5,9 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-14"
-import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-14"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-14"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-15"
+import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-15"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-15"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -75,13 +75,28 @@ const source = (exchange, market, symbol) => {
         category, contract_kind: category === "spot" ? null : market === "coinm" ? "inverse" : "linear",
         quote_asset, settlement_asset: category === "spot" ? null : market === "coinm" ? symbol : quote_asset }
 }
-const SOURCE_INSTRUMENTS = Object.fromEntries(
-    [["binance", ["spot", "spot_usdc", "usdm", "usdm_usdc", "coinm"]], ["coinbase", ["spot", "usdc"]]]
-        .flatMap(([exchange, markets]) => markets.flatMap(market => ["BTC", "ETH"].map(symbol => {
-            const descriptor = source(exchange, market, symbol)
-            return [`${exchange}:${market}:${symbol}`, descriptor]
-        }))))
+// Catalog: [exchange, [[market, book]]]. `book` is the explicit page-owned
+// Book capability (a chart market may be chart-only with book=false).
+const SOURCE_CATALOG = [
+    ["binance", [["spot", true], ["spot_usdc", true], ["usdm", true], ["usdm_usdc", true], ["coinm", true]]],
+    ["coinbase", [["spot", true], ["usdc", true]]],
+]
+const SOURCE_INSTRUMENTS = {}
+// Kept beside (not inside) the descriptors so `/meta` validation still compares
+// only wire fields and metadata can never grant Book capability.
+const SOURCE_BOOK = {}
+for (const [exchange, markets] of SOURCE_CATALOG) for (const [market, book] of markets) for (const symbol of ["BTC", "ETH"]) {
+    const key = `${exchange}:${market}:${symbol}`
+    SOURCE_INSTRUMENTS[key] = source(exchange, market, symbol)
+    SOURCE_BOOK[key] = book === true
+}
 const sourceKey = (exchange, market, symbol) => `${exchange}:${market}:${symbol}`
+// Fails closed: unknown, chart-only (book=false) or missing capability.
+const bookCapable = src => {
+    if (!src) return false
+    const key = sourceKey(src.exchange, src.market, src.symbol)
+    return !!SOURCE_INSTRUMENTS[key] && SOURCE_BOOK[key] === true
+}
 const sourceSeries = market => market === "spot" || market === "spot_usdc" ? "spot-v1" : "contracts-drb-v1"
 const legacySource = descriptor => descriptor.market !== "spot_usdc" && descriptor.market !== "usdm_usdc"
 function validInstrument(item) {
@@ -953,7 +968,7 @@ async function initLocalPlugins() {
         localCoord = await createCoordinator(coordBytes)
         const hostBytes = await (await fetch("/wasm-host/cvd_browser_host.wasm", { cache: "no-cache" })).arrayBuffer()
         localHost = await WasmPluginHost.create(hostBytes, { workerUrl: new URL("/wasm-host/plugin-worker.js", location.origin) })
-        bookPanel = createBookPanel({ host: localHost, coord: localCoord, container: document.getElementById("book-panel"),
+        bookPanel = createBookPanel({ host: localHost, coord: localCoord, container: document.getElementById("book-panel"), bookSupported: bookCapable,
             onChange: () => queueMicrotask(() => renderIndicatorMenu()),
             wsUrl: src => { const u = new URL(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/book`); for (const [k, v] of Object.entries(src)) u.searchParams.set(k, v); return u } })
         localCompute = createLocalCompute({ host: localHost, coord: localCoord, onResult: onLocalResult, onStatus: onLocalStatus, onInvalid: onLocalInvalid, onView: onLocalView, log: (...a) => console.warn(...a) })

@@ -14,15 +14,9 @@ export const BOOK_OP = 4
 export const BOOK_STALE_MS = 5000
 const VIEW_TICK_MS = 500
 const INSTANCE_BASE = 2 ** 29
-// Exact exchange/market/symbol identities (Coinbase Exchange spot only; INTX deferred).
-const SUPPORTED = new Set([...["spot", "spot_usdc", "usdm", "usdm_usdc", "coinm"].map(m => `binance/${m}`), "coinbase/spot", "coinbase/usdc"].flatMap(k => ["BTC", "ETH"].map(s => `${k}/${s}`)))
 
 export function isBookDescriptor(d) {
     return Array.isArray(d?.inputs) && d.inputs.includes("order_book")
-}
-
-export function bookSupported(src) {
-    return !!src && SUPPORTED.has(`${src.exchange}/${src.market}/${src.symbol}`)
 }
 
 const fmt = (v, d) => Number.isFinite(v) ? v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }) : "–"
@@ -33,7 +27,10 @@ function priceDigits(rows) {
     return d
 }
 
-export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), timers = globalThis, onChange = null }) {
+// `bookSupported(source)` is the page catalog's explicit Book capability
+// (app.js owns the source list); the default fails closed. The server's
+// /book admission remains final.
+export function createBookPanel({ host, coord, container, wsUrl, bookSupported = () => false, WebSocketImpl = globalThis.WebSocket, now = () => Date.now(), timers = globalThis, onChange = null }) {
     const plugins = new Map() // id -> { id, name, loadKey, spec, instance, inflight: Map(token -> frame), shown: { token, frame, out } | null }
     let source = null
     let epoch = 0
@@ -46,7 +43,7 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
     let lastFrame = null
     let nextInstance = INSTANCE_BASE
     let views = new Map()
-    const counters = { frames: 0, computes: 0, fenced: 0, renders: 0 }
+    const counters = { frames: 0, computes: 0, fenced: 0, renders: 0, rowBuilds: 0 }
     let lastInput = null
     const book = (cmd, args) => coord.book(cmd, args)
 
@@ -91,7 +88,7 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
     function connect() {
         disconnect()
         if (!active() || !source) { setStatus("off"); return }
-        if (!bookSupported(source)) { setStatus("unsupported"); return }
+        if (!bookSupported({ ...source })) { setStatus("unsupported"); return }
         const e = epoch
         const want = { ...source }
         setStatus("connecting")
@@ -252,6 +249,12 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
     const scrolls = new Map()
     const restored = new WeakMap()
     let faultSig = ""
+    // DOM projection handles live on the plugin entry (p.dom). The admitted
+    // result object (p.shown, replaced only by an admitted completion) is the
+    // row identity: head/title/age/status refresh on every render, row
+    // sections are rebuilt only when the displayed result changes and are
+    // removed as soon as current() stops admitting it.
+    let head = null
     function render() {
         counters.renders++
         views = new Map((book("view", { now_ms: now() }).plugins ?? []).map(v => [v.plugin, v]))
@@ -260,26 +263,34 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
         if (sig !== faultSig) { faultSig = sig; if (onChange) onChange() }
         if (!container || typeof container.replaceChildren !== "function") return
         container.hidden = !active()
-        if (!active()) { container.replaceChildren(); return }
+        if (!active()) { if (container.firstChild) container.replaceChildren(); head = null; return }
         const doc = container.ownerDocument
         const el = (tag, cls, text) => { const e = doc.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e }
-        const head = el("div", "book-head")
-        head.append(el("span", "book-venue", venueLabel(lastFrame)), el("span", `book-status book-${status.state}`, statusText()))
+        const setText = (e, t) => { if (e.textContent !== t) e.textContent = t }
+        if (!head) { head = el("div", "book-head"); head.append(el("span", "book-venue"), el("span")) }
+        setText(head.firstChild, venueLabel(lastFrame))
+        head.lastChild.className = `book-status book-${status.state}`
+        setText(head.lastChild, statusText())
         head.dataset.state = status.state
         const blocks = [head]
         for (const p of plugins.values()) {
-            const box = el("div", "book-plugin")
-            box.dataset.plugin = p.id
+            if (!p.dom) { const b = el("div", "book-plugin"); b.dataset.plugin = p.id; b.append(el("div", "book-title")); p.dom = { box: b, shown: null } }
+            const box = p.dom.box
             const v = views.get(p.id)
             const shown = current(p)
             const r = shown?.out
             const f = shown?.frame
-            const d = r ? priceDigits(r.rows) : 0
             const age = v?.age_ms != null ? `${(v.age_ms / 1000).toFixed(1)}s` : ""
             const meta = v?.fault ? `fault ${v.hint ?? v.fault}` : v?.state === "starting" ? "starting…" : v?.state === "stale" ? "result stale — withdrawn" : r ? `qty ${r.unit} · ${v.state === "updating" ? "updating" : "live"} ${age}` : ""
             box.dataset.view = v?.state ?? "none"
-            box.append(el("div", "book-title", `${p.name}${meta ? " · " + meta : ""}`))
+            setText(box.firstChild, `${p.name}${meta ? " · " + meta : ""}`)
+            blocks.push(box)
+            if (p.dom.shown === shown) continue
+            p.dom.shown = shown
+            box.replaceChildren(box.firstChild)
             if (r) {
+                counters.rowBuilds++
+                const d = priceDigits(r.rows)
                 const max = Math.max(...r.rows.map(x => Math.max(x.bid, x.ask)), 1e-300)
                 const row = x => {
                     const e = el("div", "book-row")
@@ -295,9 +306,9 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
                 const bids = el("div", "book-rows book-bids"); bids.dataset.scroll = `${p.id}:bids`
                 asks.setAttribute("role", "table"); bids.setAttribute("role", "table")
                 asks.setAttribute("aria-label", `asks, quantities in ${r.unit}`); bids.setAttribute("aria-label", `bids, quantities in ${r.unit}`)
-                const askRows = r.rows.filter(x => x.price >= r.best_ask || (x.ask > 0 && x.bid === 0)).sort((a, b) => b.price - a.price)
-                for (const x of askRows) asks.append(row(x))
-                for (const x of r.rows.filter(x => !askRows.includes(x))) bids.append(row(x))
+                // Rows arrive strictly price-descending (SDK/host-enforced): one
+                // pass with the original ask predicate keeps each side's order.
+                for (const x of r.rows) (x.price >= r.best_ask || (x.ask > 0 && x.bid === 0) ? asks : bids).append(row(x))
                 // Raw BBO/spread keep the supplied price precision even when
                 // grouped rows are shown with fewer digits.
                 const dec = x => (String(x).split(".")[1] ?? "").length
@@ -306,29 +317,34 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
                 box.append(asks, spread, bids)
                 const cov = f?.coverage
                 if (cov) box.append(el("div", "book-note", `Plugin view of supplied depth (resting, single source; ${f.seq_kind === "internal_revision" ? "internal rev" : "seq"} ${f.seq}). Supplied range ${fmt(cov.bid_floor, d)}–${fmt(cov.ask_ceiling, d)}; outside is unknown. Depth ${f.bids.length}/${f.asks.length} levels per side${f.bids.length >= 5000 ? " (deep)" : ""}; a grouped edge bucket sums only supplied levels.`))
+                // Manual scroll is recorded from scroll events (not re-derived
+                // from geometry at render/resize time); a section left at its
+                // spread edge stays pinned there.
+                for (const e of [asks, bids]) e.addEventListener("scroll", () => {
+                    // Scroll events are delivered a frame later; one that only
+                    // reports pin()'s own restoration (possibly read against
+                    // newer geometry) or a detached section is not user intent.
+                    // The marker is consumed so a later return to it counts.
+                    const r = restored.get(e); restored.delete(e)
+                    if (!e.isConnected || e.scrollTop === r) return
+                    // A shrinking layout clamps scrollTop to the new maximum;
+                    // that is not user intent, so keep the larger saved offset.
+                    const max = e.scrollHeight - e.clientHeight, saved = scrolls.get(e.dataset.scroll)
+                    if (saved != null && saved > max && e.scrollTop >= max - 1) return
+                    const atEdge = e.dataset.scroll.endsWith(":asks") ? e.scrollHeight - e.clientHeight - e.scrollTop <= 2 : e.scrollTop <= 2
+                    scrolls.set(e.dataset.scroll, atEdge ? null : e.scrollTop)
+                }, { passive: true })
             }
-            blocks.push(box)
         }
-        container.replaceChildren(...blocks)
-        // Manual scroll is recorded from scroll events (not re-derived from
-        // geometry at render/resize time); a section left at its spread edge
-        // stays pinned there.
-        for (const e of container.querySelectorAll("[data-scroll]")) {
-            e.addEventListener("scroll", () => {
-                // Scroll events are delivered a frame later; one that only
-                // reports pin()'s own restoration (possibly read against
-                // newer geometry) or a detached section is not user intent.
-                // The marker is consumed so a later return to it counts.
-                const r = restored.get(e); restored.delete(e)
-                if (!e.isConnected || e.scrollTop === r) return
-                const atEdge = e.dataset.scroll.endsWith(":asks") ? e.scrollHeight - e.clientHeight - e.scrollTop <= 2 : e.scrollTop <= 2
-                scrolls.set(e.dataset.scroll, atEdge ? null : e.scrollTop)
-            }, { passive: true })
-        }
+        // The container's children change only when the box set changes.
+        const kids = container.children
+        if (kids.length !== blocks.length || blocks.some((b, i) => kids[i] !== b)) container.replaceChildren(...blocks)
         pin()
     }
 
     // Default places the spread in view on both sides; keeps manual scroll.
+    // Always marks the restored offset, including a browser-clamped one, so the
+    // queued layout scroll event is not mistaken for user intent.
     function pin() {
         for (const e of container?.querySelectorAll?.("[data-scroll]") ?? []) {
             const saved = scrolls.get(e.dataset.scroll)

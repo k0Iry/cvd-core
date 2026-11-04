@@ -114,7 +114,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../static/j
 test('changed frontend modules share one coherent import version', () => {
     const html = fs.readFileSync(require('node:path').join(__dirname, '../static/index.html'), 'utf8')
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...source.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-14'])
+    assert.deepEqual([...versions], ['local-wasm-15'])
 })
 const chartSource = fs.readFileSync(require('node:path').join(__dirname, '../static/js/chart.js'), 'utf8').replace(/^export /gm, '')
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }
@@ -811,4 +811,74 @@ test('import picker imposes no accept filter (iOS greys out .wasm) and keeps cli
     }
     assert.equal(imported.length, 2); assert.ok(imported.every(x => x === f))
     assert.deepEqual(seen, ["", ""])                                         // callback sees the reset (empty) value
+})
+
+// Book capability matrix on the REAL app catalog/predicate (moved from
+// book-panel.test.mjs when the panel stopped owning a source list).
+function bookCatalog() {
+    const ctx = vm.createContext({})
+    vm.runInContext(section('const CONFIG = {', 'const elements =') + '\n;globalThis.__x = { SOURCE_INSTRUMENTS, SOURCE_BOOK, bookCapable, validInstrument, fallbackLegacy: Object.values(SOURCE_INSTRUMENTS).filter(legacySource) }', ctx)
+    return ctx.__x
+}
+test('Book capability: all 14 configured keys; invalid/INTX/SOL/unknown fail closed', () => {
+    const { SOURCE_INSTRUMENTS, bookCapable } = bookCatalog()
+    const keys = []
+    for (const market of ['spot', 'spot_usdc', 'usdm', 'usdm_usdc', 'coinm']) for (const symbol of ['BTC', 'ETH']) keys.push(['binance', market, symbol])
+    for (const market of ['spot', 'usdc']) for (const symbol of ['BTC', 'ETH']) keys.push(['coinbase', market, symbol])
+    assert.equal(keys.length, 14)
+    assert.deepEqual(Object.keys(SOURCE_INSTRUMENTS).sort(), keys.map(k => k.join(':')).sort())
+    for (const [exchange, market, symbol] of keys) assert.equal(bookCapable({ exchange, market, symbol }), true, `${exchange}/${market}/${symbol}`)
+    const BTC = { exchange: 'binance', market: 'usdm', symbol: 'BTC' }
+    for (const s of [{ ...BTC, exchange: 'coinbase' }, { ...BTC, exchange: 'coinbase', market: 'usdc', symbol: 'SOL' }, { ...BTC, exchange: 'coinbase', market: 'drb' }, { ...BTC, exchange: 'coinbase', market: 'intx' }, { ...BTC, exchange: 'coinbase', market: 'spot', symbol: 'SOL' }, { ...BTC, symbol: 'SOL' }, { ...BTC, market: 'coinm', symbol: 'SOL' }, { ...BTC, market: 'usdc' }, { ...BTC, exchange: 'bybit' }, {}, null, undefined])
+        assert.equal(bookCapable(s), false, JSON.stringify(s))
+})
+test('Book capability is explicit: catalog membership alone does not grant it; metadata cannot grant it', () => {
+    const { SOURCE_INSTRUMENTS, SOURCE_BOOK, bookCapable, validInstrument, fallbackLegacy } = bookCatalog()
+    const k = 'binance:usdm:BTC', src = { exchange: 'binance', market: 'usdm', symbol: 'BTC' }
+    // Chart-only control: catalog present (meta-valid) with book=false or capability missing.
+    SOURCE_BOOK[k] = false
+    assert.ok(validInstrument(SOURCE_INSTRUMENTS[k]), 'still a valid chart source')
+    assert.equal(bookCapable(src), false, 'book=false')
+    delete SOURCE_BOOK[k]
+    assert.equal(bookCapable(src), false, 'missing capability')
+    SOURCE_BOOK[k] = 'yes'
+    assert.equal(bookCapable(src), false, 'only literal true counts')
+    SOURCE_BOOK[k] = true
+    // New chart-only catalog entry without capability.
+    SOURCE_INSTRUMENTS['binance:usdm:SOL'] = { ...SOURCE_INSTRUMENTS[k], symbol: 'SOL', native_symbol: 'SOLUSDT' }
+    assert.equal(bookCapable({ ...src, symbol: 'SOL' }), false)
+    delete SOURCE_INSTRUMENTS['binance:usdm:SOL']
+    // Untrusted /meta item: extra book flag is ignored by validation and grants nothing.
+    const intx = { ...SOURCE_INSTRUMENTS['coinbase:usdc:BTC'], market: 'intx', book: true, book_capable: true }
+    assert.equal(validInstrument(intx), false)
+    assert.equal(bookCapable(intx), false)
+    assert.equal(validInstrument({ ...SOURCE_INSTRUMENTS[k], book: false }), true, 'wire validation unchanged by a UI flag')
+    assert.equal(bookCapable({ ...src, book: false }), true, 'capability is page-owned, not metadata-owned')
+    // USDC before/after hydration: legacy fallback excludes USDC markets; capability is unchanged.
+    assert.ok(!fallbackLegacy.some(d => d.market.endsWith('_usdc')))
+    assert.equal(fallbackLegacy.length, 10)
+    for (const symbol of ['BTC', 'ETH']) for (const market of ['spot_usdc', 'usdm_usdc']) {
+        assert.equal(bookCapable({ exchange: 'binance', market, symbol }), true)
+        assert.ok(validInstrument(SOURCE_INSTRUMENTS[`binance:${market}:${symbol}`]))
+    }
+})
+test('chart-only (book=false) catalog source opens no Book socket through the real panel', async () => {
+    const { SOURCE_BOOK, bookCapable } = bookCatalog()
+    const { createBookPanel } = await import('../static/js/book-panel.js')
+    const { createCoordinator } = await import('../static/wasm-host/host-bridge.js')
+    const wasm = fs.readFileSync(process.env.CVD_COORDINATOR_WASM || require('node:path').join(__dirname, '../static/wasm-host/cvd_browser_coordinator.wasm'))
+    const run = async () => {
+        const coord = await createCoordinator(wasm)
+        const sockets = []
+        class WS { constructor(u) { sockets.push(u) } close() {} }
+        const panel = createBookPanel({ host: { load: async () => 1, disable() {}, compute: async () => '{}', supersede: () => 0 }, coord, container: null, bookSupported: bookCapable, wsUrl: s => `ws://x/book?${s.symbol}`, WebSocketImpl: WS, timers: { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {} }, now: () => 0 })
+        panel.setSource({ exchange: 'binance', market: 'usdm', symbol: 'BTC' })
+        panel.setPlugins([{ id: 'orderbook', name: 'Order Book', bytes: new ArrayBuffer(8), params: {}, loadKey: 'a' }])
+        await new Promise(r => setImmediate(r))
+        return { sockets, state: panel.state().status.state }
+    }
+    SOURCE_BOOK['binance:usdm:BTC'] = false
+    assert.deepEqual(await run(), { sockets: [], state: 'unsupported' })
+    SOURCE_BOOK['binance:usdm:BTC'] = true
+    assert.equal((await run()).sockets.length, 1, 'positive control opens one socket')
 })

@@ -443,6 +443,10 @@ try {
     check('fallback_manual_scroll_kept_under_live_ticks', Math.abs(fk.top - ft.top) <= 1, JSON.stringify([ft.top, fk.top]))
     await evaluate(`(() => { document.getElementById('no-safe-sim').remove(); const e = ${sec('asks')}; e.scrollTop = e.scrollHeight; e.dispatchEvent(new Event('scroll')); return true })()`)
     await sleep(300)
+    // P/Q observers fire on the semantic event: a new row section
+    // ([data-scroll]) inserted anywhere under #book-panel (persistent boxes no
+    // longer replace root children); title/age-only text mutations are ignored.
+    const ROWS_INSERTED = `ms.some(m => [...m.addedNodes].some(n => n.nodeType === 1 && (n.matches('[data-scroll]') || n.querySelector('[data-scroll]'))))`
     // P. Pin survives render -> queued programmatic-scroll event -> resize.
     // LABELLED LAYOUT FAULT INJECTION: a real live tick renders real WASM rows
     // and pin() restores the spread edge; in the microtask right after that
@@ -451,7 +455,7 @@ try {
     // filled directly; only the box height is changed.
     {
       const p0 = await settled('asks')
-      await evaluate(`new Promise(res => { const mo = new MutationObserver(() => { mo.disconnect(); const s = document.createElement('style'); s.id = 'resize-sim'; s.textContent = '#book-panel .book-asks { flex: none !important; height: 60px !important }'; document.head.appendChild(s); res(true) }); mo.observe(document.getElementById('book-panel'), { childList: true }) })`)
+      await evaluate(`new Promise(res => { const mo = new MutationObserver(ms => { if (!${ROWS_INSERTED}) return; mo.disconnect(); const s = document.createElement('style'); s.id = 'resize-sim'; s.textContent = '#book-panel .book-asks { flex: none !important; height: 60px !important }'; document.head.appendChild(s); res(true) }); mo.observe(document.getElementById('book-panel'), { childList: true, subtree: true }) })`)
       const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 3}`, 15000)
       const p1 = await settled('asks')
       check('pin_kept_through_queued_scroll_then_resize', p1.max > p0.max + 20 && p1.max - p1.top <= 2, JSON.stringify([p0, p1]))
@@ -468,10 +472,52 @@ try {
     {
       await evaluate(`(() => { const e = ${sec('asks')}; e.scrollTop = e.scrollHeight - e.clientHeight - 150; e.dispatchEvent(new Event('scroll')); return true })()`)
       { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
-      const q = await evaluate(`new Promise(res => { const mo = new MutationObserver(() => { mo.disconnect(); const e = ${sec('asks')}; const r = e.scrollTop; e.scrollTop = r - 60; const a = e.scrollTop; e.dispatchEvent(new Event('scroll')); e.scrollTop = r; e.dispatchEvent(new Event('scroll')); res({ r, a, back: e.scrollTop }) }); mo.observe(document.getElementById('book-panel'), { childList: true }) })`)
+      const q = await evaluate(`new Promise(res => { const mo = new MutationObserver(ms => { if (!${ROWS_INSERTED}) return; mo.disconnect(); const e = ${sec('asks')}; const r = e.scrollTop; e.scrollTop = r - 60; const a = e.scrollTop; e.dispatchEvent(new Event('scroll')); e.scrollTop = r; e.dispatchEvent(new Event('scroll')); res({ r, a, back: e.scrollTop }) }); mo.observe(document.getElementById('book-panel'), { childList: true, subtree: true }) })`)
       { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 3}`, 15000) }
       const q1 = await geo('asks')
       check('return_to_restored_offset_kept_after_away_scroll', q.r > 100 && q.r - q.a === 60 && q.back === q.r && Math.abs(q1.top - q.r) <= 1, JSON.stringify([q, q1.top]))
+      await evaluate(`(() => { const e = ${sec('asks')}; e.scrollTop = e.scrollHeight; e.dispatchEvent(new Event('scroll')); return true })()`)
+      await sleep(300)
+    }
+    // R. Saved manual offset survives a layout CLAMP and returns with geometry.
+    // REAL wheel sets the offset S; LABELLED LAYOUT INJECTION grows the asks box
+    // so its max scroll drops below S (browser clamps), live ticks render, then
+    // the box is restored. Required non-vacuity: max_after_resize < S.
+    {
+      { const g = await geo('asks'); await call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: g.x, y: g.y, deltaX: 0, deltaY: -240 }) }
+      const r0 = await settled('asks')
+      { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
+      const r1 = await settled('asks')
+      const hNew = r1.sh - Math.floor(r1.top / 2)
+      await evaluate(`(() => { const s = document.createElement('style'); s.id = 'clamp-sim'; s.textContent = '#book-panel .book-asks { flex: none !important; height: ${hNew}px !important }'; document.head.appendChild(s); return true })()`)
+      { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
+      const r2 = await settled('asks')
+      check('clamp_witness_max_below_saved_offset', r1.top > 20 && r1.top < r1.max - 20 && Math.abs(r1.top - r0.top) <= 1 && r2.max < r1.top && r2.top <= r2.max, JSON.stringify([r0, r1, r2]))
+      await evaluate(`document.getElementById('clamp-sim').remove()`)
+      { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
+      const r3 = await settled('asks')
+      check('saved_offset_restored_after_clamp_geometry_returns', r3.max === r1.max && Math.abs(r3.top - r1.top) <= 1, JSON.stringify([r1, r2, r3]))
+      await evaluate(`(() => { const e = ${sec('asks')}; e.scrollTop = e.scrollHeight; e.dispatchEvent(new Event('scroll')); return true })()`)
+      await sleep(300)
+    }
+    // R-1px. Same as R with a ONE-PIXEL clamp: the asks box is sized so its
+    // new max scroll is exactly S-1 (measured clientHeight, corrected once).
+    // Required non-vacuity: S - max_after_resize === 1.
+    {
+      { const g = await geo('asks'); await call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: g.x, y: g.y, deltaX: 0, deltaY: -240 }) }
+      const p0 = await settled('asks')
+      { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
+      const p1 = await settled('asks')
+      const size = (h) => evaluate(`(() => { let s = document.getElementById('clamp-sim-1px'); if (!s) { s = document.createElement('style'); s.id = 'clamp-sim-1px'; document.head.appendChild(s) } s.textContent = '#book-panel .book-asks { flex: none !important; height: ${h}px !important }'; const e = ${sec('asks')}; return e.scrollHeight - e.clientHeight })()`)
+      let h = p1.sh - p1.top + 1, m = await size(h)
+      if (m !== p1.top - 1) { h += m - (p1.top - 1); m = await size(h) }
+      { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
+      const p2 = await settled('asks')
+      check('one_pixel_clamp_witness_max_one_below_saved_offset', p1.top > 20 && p1.top < p1.max - 20 && Math.abs(p1.top - p0.top) <= 1 && p1.top - p2.max === 1 && p2.top <= p2.max, JSON.stringify([p0, p1, p2, h]))
+      await evaluate(`document.getElementById('clamp-sim-1px').remove()`)
+      { const s0 = await bookState(); await waitFor(`${B}.state().counters.renders >= ${s0.counters.renders + 2}`, 15000) }
+      const p3 = await settled('asks')
+      check('saved_offset_restored_after_one_pixel_clamp_geometry_returns', p3.max === p1.max && p3.top === p1.top, JSON.stringify([p1, p2, p3]))
       await evaluate(`(() => { const e = ${sec('asks')}; e.scrollTop = e.scrollHeight; e.dispatchEvent(new Event('scroll')); return true })()`)
       await sleep(300)
     }
