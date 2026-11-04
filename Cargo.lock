@@ -299,6 +299,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "cvd-indicator-sdk",
  "futures",
  "rand 0.8.5",
  "reqwest",

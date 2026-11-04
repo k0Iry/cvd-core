@@ -1594,7 +1594,7 @@ async fn book_upgrade(
     ws.on_upgrade(move |socket| book_ws(socket, state, symbol)).into_response()
 }
 
-async fn book_ws(mut socket: WebSocket, state: Arc<AppState>, symbol: Symbol) {
+async fn book_ws(mut socket: WebSocket, state: Arc<AppState>, symbol: orderbook::BookKey) {
     let mut sub = state.books.subscribe(symbol);
     sub.rx.mark_changed();
     loop {

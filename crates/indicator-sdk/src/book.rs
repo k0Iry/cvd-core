@@ -13,8 +13,9 @@
 use crate::model::{codes, PluginError};
 use serde::{Deserialize, Serialize};
 
-/// Maximum levels per side in a snapshot handed to a plugin.
-pub const MAX_BOOK_LEVELS: usize = 1000;
+/// Maximum levels per side in a snapshot handed to a plugin (Binance spot
+/// REST depth is 5000/side).
+pub const MAX_BOOK_LEVELS: usize = 5000;
 /// Maximum rows a plugin may return.
 pub const MAX_PRICE_LEVEL_ROWS: usize = 400;
 
@@ -44,7 +45,10 @@ pub struct BookSnapshot {
     pub quote: String,
     /// Server sync generation (changes on every resync/reconnect).
     pub generation: u64,
-    /// Exchange update id of the last applied event.
+    /// Opaque book revision, scoped to (`source`, `generation`): the upstream
+    /// update id when the venue provides one, otherwise a server-internal
+    /// per-generation revision. Compare only within one source+generation;
+    /// never do arithmetic across sources or generations.
     pub seq: u64,
     /// Exchange event time (unix ms) of the last applied event.
     pub exchange_time_ms: i64,

@@ -1,0 +1,29 @@
+{
+  "provenance": {
+    "source": "GET https://dapi.binance.com/dapi/v1/exchangeInfo (public, unauthenticated)",
+    "recorded_file_sha256": "d71a52b0860800074dbd0efdbde3f5323d569c06e5678b54ee958a42caa60bf4",
+    "note": "pinned excerpt of a recorded public response (relevant fields, 2 symbols); NOT fetched at runtime"
+  },
+  "symbols": [
+    {
+      "symbol": "BTCUSD_PERP",
+      "pair": "BTCUSD",
+      "contractType": "PERPETUAL",
+      "baseAsset": "BTC",
+      "quoteAsset": "USD",
+      "marginAsset": "BTC",
+      "contractSize": 100,
+      "contractStatus": "TRADING"
+    },
+    {
+      "symbol": "ETHUSD_PERP",
+      "pair": "ETHUSD",
+      "contractType": "PERPETUAL",
+      "baseAsset": "ETH",
+      "quoteAsset": "USD",
+      "marginAsset": "ETH",
+      "contractSize": 10,
+      "contractStatus": "TRADING"
+    }
+  ]
+}

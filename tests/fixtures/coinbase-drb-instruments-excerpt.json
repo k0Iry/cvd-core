@@ -1,0 +1,7 @@
+{
+  "provenance": "Excerpt of public Coinbase DRB JSON-RPC public/get_instrument results recorded 2026-11-03 (audit coinbase/drb-BTC-metadata.json and drb-ETH-metadata.json; sha256 caf006a5d23b3fe5acbaaa2ec629c4c2e1a63a0d857928b9b54d42fabc4a38a6 / e07e158725e4d5489bf5e8776dd0d0217123fbeff6e1741568eae991e413518d); only fields relevant to book quantity units are kept. Book amounts for these LINEAR USDC perpetuals are base-coin (cross-checked against the live book stream); contract_size is NOT applied.",
+  "instruments": [
+    {"instrument_name": "BTC_USDC-PERPETUAL", "kind": "future", "instrument_type": "linear", "future_type": "linear", "settlement_period": "perpetual", "base_currency": "BTC", "quote_currency": "USDC", "settlement_currency": "USDC", "contract_size": 0.0001, "tick_size": 0.1},
+    {"instrument_name": "ETH_USDC-PERPETUAL", "kind": "future", "instrument_type": "linear", "future_type": "linear", "settlement_period": "perpetual", "base_currency": "ETH", "quote_currency": "USDC", "settlement_currency": "USDC", "contract_size": 0.0001, "tick_size": 0.01}
+  ]
+}

@@ -76,7 +76,7 @@ try {
   fs.writeFileSync(appPath, app.replace(/\ninit\(\)\s*$/, `\nwindow.__cvdSrv = { range: () => { const r = chart.timeScale().getVisibleLogicalRange(); return r ? [r.from, r.to] : null }, readouts: () => paneSummaryEls.map(e => e.textContent) }\n\ninit()\n`))
 
   // Unsupported source is rejected by the server (no substitution).
-  for (const q of ['exchange=binance&market=spot&symbol=BTC', 'exchange=coinbase&market=usdc&symbol=BTC', 'exchange=binance&market=usdm&symbol=SOL']) {
+  for (const q of ['exchange=binance&market=coinm&symbol=SOL', 'exchange=coinbase&market=usdc&symbol=SOL', 'exchange=coinbase&market=usdm_usdc&symbol=ETH', 'exchange=coinbase&market=spot&symbol=SOL', 'exchange=coinbase&market=usdm&symbol=BTC', 'exchange=binance&market=usdm&symbol=SOL']) {
     const r = await new Promise(res => { const s = new WebSocket(`ws://127.0.0.1:${info.port}/book?${q}`); s.onopen = () => { s.close(); res('open') }; s.onerror = () => res('error'); setTimeout(() => res('timeout'), 5000) })
     check(`server_rejects_unsupported_${q.replace(/[=&]/g, '_')}`, r === 'error', r)
   }
@@ -256,7 +256,7 @@ try {
     // The side panel narrows the chart: the right edge (to) is kept, the view is not reset to default.
     check('enable_keeps_values_and_viewport', sameValues(b0, b1) && near(b1.range[1], b0.range[1]) && !near(b1.range[1], r0.range[1]), JSON.stringify([b0.range, b1.range, r0.range, sameValues(b0, b1), b0.readouts, b1.readouts]))
     let st = await mailbox({ op: 'state' })
-    check('server_demand_btc_one_subscriber', JSON.stringify(st.active) === JSON.stringify([['BTC', 1]]), JSON.stringify(st))
+    check('server_demand_btc_one_subscriber', JSON.stringify(st.active) === JSON.stringify([['binance/usdm/BTC', 1]]), JSON.stringify(st))
     // B. snapshot + bridging event (pu != L is legal for the first event).
     await mailbox({ op: 'snapshot', sym: 'BTCUSDT', id: 1000, mid: 30000, tick: 0.1, levels: 200 })
     const c0 = st.connects.BTCUSDT ?? 0
@@ -281,7 +281,7 @@ try {
     await waitFor(valuesReady, 30000)
     await sleep(1500)
     const tfAfter = { st: await mailbox({ op: 'state' }), sockets: sockets.filter(u => u.includes('/book')).length, bs: await bookState(), cvd: await basis() }
-    check('tf_change_keeps_book_subscription', tfAfter.sockets === tfBefore.sockets && tfAfter.st.connects.BTCUSDT === tfBefore.st.connects.BTCUSDT && JSON.stringify(tfAfter.st.active) === JSON.stringify([['BTC', 1]]) && tfAfter.bs.generation === tfBefore.gen && tfAfter.bs.connected && tfAfter.bs.status.state === 'live' && tfAfter.bs.plugins[0].rows > 0 && tfAfter.bs.seq > 1005,
+    check('tf_change_keeps_book_subscription', tfAfter.sockets === tfBefore.sockets && tfAfter.st.connects.BTCUSDT === tfBefore.st.connects.BTCUSDT && JSON.stringify(tfAfter.st.active) === JSON.stringify([['binance/usdm/BTC', 1]]) && tfAfter.bs.generation === tfBefore.gen && tfAfter.bs.connected && tfAfter.bs.status.state === 'live' && tfAfter.bs.plugins[0].rows > 0 && tfAfter.bs.seq > 1005,
       JSON.stringify({ b: [tfBefore.sockets, tfBefore.st.connects, tfBefore.gen], a: [tfAfter.sockets, tfAfter.st.connects, tfAfter.st.active, tfAfter.bs.generation, tfAfter.bs.status, tfAfter.bs.seq] }))
     const flowKeys = b => Object.keys(b.values).filter(k => /^(delta|flow)\//.test(k))
     check('tf_change_cvd_and_flow_recomputed_valid', tfAfter.cvd.tf === '5m' && basisOk(tfAfter.cvd, 'BTC|5m') && flowKeys(tfAfter.cvd).length > 0 && JSON.stringify(tfAfter.cvd.values) !== JSON.stringify(tfBefore.cvd.values)
@@ -322,23 +322,30 @@ try {
     const extra = new WebSocket(`ws://127.0.0.1:${info.port}/book?exchange=binance&market=usdm&symbol=BTC`)
     await bounded(new Promise(r => extra.addEventListener('message', r, { once: true })), 10000, 'extra frame')
     st = await mailbox({ op: 'state' })
-    check('shared_subscribers_one_task', JSON.stringify(st.active) === JSON.stringify([['BTC', 2]]), JSON.stringify(st.active))
+    check('shared_subscribers_one_task', JSON.stringify(st.active) === JSON.stringify([['binance/usdm/BTC', 2]]), JSON.stringify(st.active))
+    // Outbox physical-connection replacement while the book is subscribed.
+    const rep = await mailbox({ op: 'replace_outbox_connection' })
+    check('outbox_connection_replaced_schema_kept', rep.ok && rep.file_backed && JSON.stringify(rep.schema) === JSON.stringify(['pending_bars', 'retired_pending_bars']) && rep.pending_after === rep.pending_before && rep.bars_rows_after === rep.bars_rows_before, JSON.stringify(rep))
+    st = await mailbox({ op: 'state' })
+    check('book_continues_after_outbox_replacement', JSON.stringify(st.active) === JSON.stringify([['binance/usdm/BTC', 2]]) && st.outbox_pending === st.outbox_pending_at_start && st.bars_rows === st.bars_rows_at_start, JSON.stringify(st))
     extra.close(); await sleep(500)
     st = await mailbox({ op: 'state' })
-    check('extra_client_release_keeps_page_demand', JSON.stringify(st.active) === JSON.stringify([['BTC', 1]]), JSON.stringify(st.active))
+    check('extra_client_release_keeps_page_demand', JSON.stringify(st.active) === JSON.stringify([['binance/usdm/BTC', 1]]), JSON.stringify(st.active))
     // G. source switch to ETH: BTC cleared + released, ETH distinct data.
-    await mailbox({ op: 'snapshot', sym: 'ETHUSDT', id: 500, mid: 2000, tick: 0.01, levels: 700 })
+    await mailbox({ op: 'snapshot', sym: 'ETHUSDT', id: 500, mid: 2000, tick: 0.01, levels: 1000 })
     await selectSource('usdm', 'ETH')
     await waitFor(`${B}.state().source?.symbol === 'ETH'`, 10000)
     d = await dom()
     check('source_switch_clears_old_rows', d.rows.length === 0, JSON.stringify(d.rows.slice(0, 2)))
-    for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects.ETHUSDT ?? 0) > 0 && JSON.stringify(st.active) === JSON.stringify([['ETH', 1]])) break; await sleep(50) }
-    check('btc_demand_released_eth_acquired', JSON.stringify(st.active) === JSON.stringify([['ETH', 1]]), JSON.stringify(st.active))
+    for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects.ETHUSDT ?? 0) > 0 && JSON.stringify(st.active) === JSON.stringify([['binance/usdm/ETH', 1]])) break; await sleep(50) }
+    check('btc_demand_released_eth_acquired', JSON.stringify(st.active) === JSON.stringify([['binance/usdm/ETH', 1]]), JSON.stringify(st.active))
     await sleep(100)
-    await mailbox({ op: 'event', sym: 'ETHUSDT', U: 499, u: 501, pu: 400, b: [], a: [] })
+    // Legal 1000-level snapshot + 5 inside-range inserts per side => 1005 maintained, top 1000 transmitted.
+    const INS_B = [1990.505, 1991.505, 1992.505, 1993.505, 1994.505], INS_A = [2009.495, 2008.495, 2007.495, 2006.495, 2005.495]
+    await mailbox({ op: 'event', sym: 'ETHUSDT', U: 499, u: 501, pu: 400, b: INS_B.map(p => [p.toFixed(3), '1']), a: INS_A.map(p => [p.toFixed(3), '1']) })
     await waitFor(`${B}.state().status.state === 'live' && ${B}.state().plugins[0].rows > 0`, 15000)
     d = await dom()
-    want = expectedRows(2000, 0.01, 700, []).map(r => [q3(r[0]), r[1], q3(r[2])])
+    want = expectedRows(2000, 0.01, 1000, []).map(r => [q3(r[0]), r[1], q3(r[2])])
     check('eth_rows_exact_and_distinct', JSON.stringify(d.rows) === JSON.stringify(want) && /ETHUSDT/.test(d.venue) && /qty ETH/.test(d.title), JSON.stringify(d.rows.slice(0, 3)))
     // Keep the scripted ETH feed alive (empty diffs continue the pu chain) while
     // parameters/layout are exercised; results must stay admitted, not aged out.
@@ -351,8 +358,9 @@ try {
     await panChart(-220)
     const e0 = await basis()
     check('basis_eth_values_meaningful_and_distinct', basisOk(e0, 'ETH|1m') && JSON.stringify(e0.values) !== JSON.stringify(b0.values) && Math.abs(e0.range[1] - e0r.range[1]) > 5, JSON.stringify([e0r.range, e0.range]))
-    // C. 700-level snapshot, 500 transmitted: supplied coverage is the 500th level, not the snapshot range.
-    check('coverage_truthful_for_transmitted_500', /Supplied range 1,995\.00–2,005\.00;/.test(d.note), d.note)
+    // C. 1200-level legal snapshot, USD-M cap 1000 transmitted: supplied coverage is the 1000th level, not the snapshot range.
+    { const li0 = (await bookState()).lastInput
+      check('coverage_truthful_top_1000_of_1005_after_inside_inserts', /Supplied range 1,990\.05–2,009\.95;/.test(d.note) && li0?.bids === 1000 && li0?.asks === 1000, d.note + JSON.stringify(li0)) }
     // H. both sides visible on desktop (side panel) before any manual scroll.
     await closeMenu(); await sleep(200)
     let v = await bothSides()
@@ -364,7 +372,9 @@ try {
     d = await dom()
     const gq = (() => {
       const b = new Map(), a = new Map()
-      for (let i = 0; i < 500; i++) {
+      for (const p of INS_B) b.set(Math.floor(p), (b.get(Math.floor(p)) ?? 0) + p)
+      for (const p of INS_A) a.set(Math.ceil(p), (a.get(Math.ceil(p)) ?? 0) + p)
+      for (let i = 0; i < 995; i++) {
         const bp = +(2000 - 0.01 * (i + 1)).toFixed(2), ap = +(2000 + 0.01 * (i + 1)).toFixed(2)
         const bq = +(0.5 + (i % 7)).toFixed(3), aq = +(0.25 + (i % 5)).toFixed(3)
         const bk = Math.floor(bp), ak = Math.ceil(ap)
@@ -485,17 +495,385 @@ try {
     await shot('book-replay-desktop.png')
     pumping = false; await pump
     check('eth_feed_advanced_while_exercised', (await bookState()).seq > 501, String((await bookState()).seq))
+    // S. M1 deep spot slice: binance/spot/BTC with a SYNTHETIC 5000-level/side
+    // snapshot (tick 0.01 => bid floor 29,950.00) through the served /book
+    // socket into the IMPORTED order-book WASM. A decisive deep bid (index
+    // 4499, beyond both 500 and 1000) only reaches the rendered grouped bucket
+    // when all 5000 levels are carried end to end.
+    await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+    await mailbox({ op: 'snapshot', sym: 'spot:BTCUSDT', id: 7000, mid: 30000, tick: 0.01, levels: 5000 })
+    const spotSockets0 = sockets.filter(u => u.includes('/book') && u.includes('market=spot')).length
+    await selectSource('spot', 'BTC')
+    await waitFor(`${B}.state().source?.market === 'spot' && ${B}.state().source?.symbol === 'BTC'`, 10000)
+    for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects['spot:BTCUSDT'] ?? 0) > 0 && JSON.stringify(st.active) === JSON.stringify([['binance/spot/BTC', 1]])) break; await sleep(50) }
+    check('spot_btc_distinct_producer_from_usdm', JSON.stringify(st.active) === JSON.stringify([['binance/spot/BTC', 1]]) && (st.connects['spot:BTCUSDT'] ?? 0) === 1
+      && sockets.filter(u => u.includes('/book') && u.includes('market=spot') && u.includes('symbol=BTC')).length === spotSockets0 + 1, JSON.stringify([st.active, st.connects]))
+    await sleep(100)
+    // Spot bridge: U <= L+1 <= u, no `pu` field (venue shape).
+    check('spot_bridge_event_sent', (await mailbox({ op: 'event', sym: 'spot:BTCUSDT', U: 6995, u: 7005, b: [['29955.00', '777.5']], a: [] })).ok)
+    await waitFor(`${B}.state().status.state === 'live' && ${B}.state().plugins[0].rows > 0 && ${B}.state().source?.market === 'spot'`, 20000)
+    // Official overlap (local 7005, U 7003/u 7010): applied, not a gap.
+    await mailbox({ op: 'event', sym: 'spot:BTCUSDT', U: 7003, u: 7010, b: [['29999.99', '4.321']], a: [] })
+    await waitFor(`${B}.state().seq === 7010 && ${B}.state().plugins[0].seq === 7010`, 10000)
+    let spotU = 7010, spotPump = true
+    const pumpSpot = (async () => { while (spotPump) { await mailbox({ op: 'event', sym: 'spot:BTCUSDT', U: spotU + 1, u: spotU + 1, b: [], a: [] }); spotU++; await sleep(600) } })()
+    d = await dom()
+    want = expectedRows(30000, 0.01, 5000, [['b', 29955, 777.5], ['b', 29999.99, 4.321]]).map(r => [q3(r[0]), r[1], q3(r[2])])
+    check('spot_overlap_applied_rows_exact', JSON.stringify(d.rows) === JSON.stringify(want) && /live/.test(d.status), `got=${JSON.stringify(d.rows.slice(18, 22))} want=${JSON.stringify(want.slice(18, 22))} status=${d.status}`)
+    check('spot_labels_venue_deep_coverage', /Binance spot BTCUSDT/.test(d.venue) && /qty BTC/.test(d.title) && /Supplied range 29,950\.00–30,050\.00;/.test(d.note) && /Depth 5000\/5000 levels per side \(deep\)/.test(d.note) && /edge bucket sums only supplied levels/.test(d.note), JSON.stringify(d))
+    let li = (await bookState()).lastInput
+    check('spot_wasm_input_5000_per_side', li?.bids === 5000 && li?.asks === 5000, JSON.stringify(li))
+    // Grouped 10 (base): bucket 29,950 is reachable only from levels 4040..4999
+    // and carries the decisive 777.5 at index 4499. Independent expectation.
+    await setParams('orderbook', { rows: 20, group: 10, unit: 'base' })
+    await waitFor(`${B}.state().plugins[0]?.fault === null && ${B}.state().plugins[0].rows === 10`, 15000)
+    d = await dom()
+    const gs = (() => {
+      const b = new Map(), a = new Map()
+      for (let i = 0; i < 5000; i++) {
+        const bp = +(30000 - 0.01 * (i + 1)).toFixed(2), ap = +(30000 + 0.01 * (i + 1)).toFixed(2)
+        let bq = +(0.5 + (i % 7)).toFixed(3); const aq = +(0.25 + (i % 5)).toFixed(3)
+        if (bp === 29955) bq = 777.5
+        if (bp === 29999.99) bq = 4.321
+        const bk = Math.floor(bp / 10) * 10, ak = Math.ceil(ap / 10) * 10
+        b.set(bk, (b.get(bk) ?? 0) + bq); a.set(ak, (a.get(ak) ?? 0) + aq)
+      }
+      const qf = x => x >= 1000 ? fmt(x, 0) : x >= 1 ? fmt(x, 3) : fmt(x, 4)
+      return { rows: [...[...a].sort((x, y) => y[0] - x[0]).map(([p, q]) => ['', fmt(p, 0), qf(q)]), ...[...b].sort((x, y) => y[0] - x[0]).map(([p, q]) => [qf(q), fmt(p, 0), ''])], deep: b.get(29950) }
+    })()
+    check('spot_grouped_deep_bucket_exact', JSON.stringify(d.rows) === JSON.stringify(gs.rows) && gs.deep > 777.5, `got=${JSON.stringify(d.rows)} want=${JSON.stringify(gs.rows)}`)
+    check('spot_raw_bbo_spread_precision_kept_when_grouped', /bid 29,999\.99 · spread 0\.02 · ask 30,000\.01/.test(d.spread), d.spread)
+    li = (await bookState()).lastInput
+    console.log(`NOTE spot5000 input=${JSON.stringify(li)}`)
+    await shot('book-replay-spot-5000.png')
+    await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+    await closeMenu()
+    spotPump = false; await pumpSpot
+    // M2. All TEN Binance keys through served /book -> imported WASM -> DOM.
+    // Independent expectations: legal SYNTHETIC snapshot per key with a
+    // distinct mid; base qty = raw (linear) or contracts*face/LEVEL price
+    // (COIN-M, face from the pinned public exchangeInfo excerpt); quote = base*price.
+    const TEN = [
+      ['spot', 'BTC', 'spot:BTCUSDT', 'BTCUSDT', 'spot', 'USDT', 31000, 0.1, 5000, null],
+      ['spot', 'ETH', 'spot:ETHUSDT', 'ETHUSDT', 'spot', 'USDT', 2100, 0.01, 5000, null],
+      ['spot_usdc', 'BTC', 'spot:BTCUSDC', 'BTCUSDC', 'spot', 'USDC', 32000, 0.1, 5000, null],
+      ['spot_usdc', 'ETH', 'spot:ETHUSDC', 'ETHUSDC', 'spot', 'USDC', 2200, 0.01, 5000, null],
+      ['usdm', 'BTC', 'BTCUSDT', 'BTCUSDT', 'USDⓈ-M perpetual', 'USDT', 33000, 0.1, 1000, null],
+      ['usdm', 'ETH', 'ETHUSDT', 'ETHUSDT', 'USDⓈ-M perpetual', 'USDT', 2300, 0.01, 1000, null],
+      ['usdm_usdc', 'BTC', 'BTCUSDC', 'BTCUSDC', 'USDⓈ-M perpetual', 'USDC', 34000, 0.1, 1000, null],
+      ['usdm_usdc', 'ETH', 'ETHUSDC', 'ETHUSDC', 'USDⓈ-M perpetual', 'USDC', 2400, 0.01, 1000, null],
+      ['coinm', 'BTC', 'coinm:BTCUSD_PERP', 'BTCUSD_PERP', 'COIN-M perpetual', 'USD', 35000, 0.1, 1000, 100],
+      ['coinm', 'ETH', 'coinm:ETHUSD_PERP', 'ETHUSD_PERP', 'COIN-M perpetual', 'USD', 2500, 0.01, 1000, 10],
+    ]
+    const qf = x => x >= 1000 ? fmt(x, 0) : x >= 1 ? fmt(x, 3) : fmt(x, 4)
+    const expectKey = (mid, tick, face, unit) => {
+      const lv = side => Array.from({ length: 20 }, (_, i) => { const p = +(side === 'b' ? mid - tick * (i + 1) : mid + tick * (i + 1)).toFixed(2)
+        const raw = side === 'b' ? 0.5 + (i % 7) : 0.25 + (i % 5); const base = face ? raw * face / p : raw; return [p, unit === 'quote' ? base * p : base] })
+      const b = lv('b'), a = lv('a'); const d = Math.max(0, ...[...a, ...b].map(([p]) => (String(p).split('.')[1] ?? '').length))
+      return [...a.reverse().map(([p, q]) => ['', fmt(p, d), qf(q)]), ...b.map(([p, q]) => [qf(q), fmt(p, d), ''])]
+    }
+    let tenId = 20000
+    for (const [m, s, sk, native, vlabel, quote, mid, tick, cap, face] of TEN) {
+      const tag = `${m}_${s}`; const id0 = tenId += 1000
+      const LEVELS = cap === 5000 ? 1200 : 1000
+      await mailbox({ op: 'snapshot', sym: sk, id: id0, mid, tick, levels: LEVELS })
+      const c0 = (await mailbox({ op: 'state' })).connects[sk] ?? 0
+      await selectSource(m, s)
+      await waitFor(`${B}.state().source?.market === ${JSON.stringify(m)} && ${B}.state().source?.symbol === ${JSON.stringify(s)}`, 10000)
+      for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects[sk] ?? 0) > c0 && JSON.stringify(st.active) === JSON.stringify([[`binance/${m}/${s}`, 1]])) break; await sleep(50) }
+      check(`ten_${tag}_exact_producer_demand`, JSON.stringify(st.active) === JSON.stringify([[`binance/${m}/${s}`, 1]]) && st.connects[sk] === c0 + 1, JSON.stringify([st.active, st.connects]))
+      await sleep(100)
+      const ev = m.startsWith('spot') ? { U: id0 - 2, u: id0 + 3 } : { U: id0 - 2, u: id0 + 3, pu: id0 - 10 }
+      check(`ten_${tag}_bridge_sent`, (await mailbox({ op: 'event', sym: sk, b: [], a: [], ...ev })).ok)
+      await waitFor(`${B}.state().status.state === 'live' && ${B}.state().seq === ${id0 + 3} && ${B}.state().plugins[0].rows > 0 && ${B}.state().source?.market === ${JSON.stringify(m)}`, 15000)
+      let dd = await dom(); const li = (await bookState()).lastInput; const want = Math.min(cap, LEVELS)
+      check(`ten_${tag}_wasm_input_capped_${want}`, li?.bids === want && li?.asks === want, JSON.stringify(li))
+      check(`ten_${tag}_base_rows_exact`, JSON.stringify(dd.rows) === JSON.stringify(expectKey(mid, tick, face, 'base')), `got=${JSON.stringify(dd.rows.slice(18, 22))} want=${JSON.stringify(expectKey(mid, tick, face, 'base').slice(18, 22))}`)
+      check(`ten_${tag}_labels`, dd.venue.includes(`Binance ${vlabel} ${s}${quote}`) && new RegExp(`qty ${s}\\b`).test(dd.title), JSON.stringify([dd.venue, dd.title]))
+      await setParams('orderbook', { rows: 20, group: 0, unit: 'quote' })
+      await waitFor(`${B}.state().plugins[0]?.unit === ${JSON.stringify(quote)} && ${B}.state().plugins[0].rows > 0`, 15000).catch(() => {})
+      dd = await dom()
+      check(`ten_${tag}_quote_rows_exact`, JSON.stringify(dd.rows) === JSON.stringify(expectKey(mid, tick, face, 'quote')) && new RegExp(`qty ${quote}\\b`).test(dd.title), `got=${JSON.stringify(dd.rows.slice(18, 22))} want=${JSON.stringify(expectKey(mid, tick, face, 'quote').slice(18, 22))} title=${dd.title}`)
+      await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+      await waitFor(`${B}.state().plugins[0]?.unit === ${JSON.stringify(s)}`, 15000).catch(() => {})
+      await closeMenu()
+    }
+    // M2 concurrent producers: four simultaneous external subscribers on
+    // spot vs USD-M and USDT vs USDC BTC books. Each must receive only its own
+    // source with its own distinct values; a diff to one producer must not
+    // reach the others.
+    {
+      const CK = [['spot', 'spot:BTCUSDT', 31000], ['usdm', 'BTCUSDT', 33000], ['spot_usdc', 'spot:BTCUSDC', 32000], ['usdm_usdc', 'BTCUSDC', 34000]]
+      const c0 = (await mailbox({ op: 'state' })).connects
+      const subs = CK.map(([m]) => { const s = new WebSocket(`ws://127.0.0.1:${info.port}/book?exchange=binance&market=${m}&symbol=BTC`); const frames = []; s.onmessage = e => frames.push(JSON.parse(e.data)); return { m, s, frames } })
+      for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if (CK.every(([, sk]) => (st.connects[sk] ?? 0) > (c0[sk] ?? 0))) break; await sleep(50) }
+      const act = Object.fromEntries(st.active)
+      check('concurrent_four_independent_producers', CK.every(([m, sk]) => (act[`binance/${m}/BTC`] ?? 0) >= 1 && st.connects[sk] === (c0[sk] ?? 0) + 1), JSON.stringify([st.active, st.connects]))
+      await sleep(150)
+      for (const [m, sk] of CK) await mailbox({ op: 'event', sym: sk, b: [], a: [], ...(m.startsWith('spot') ? { U: 1, u: 60000 } : { U: 1, u: 60000, pu: 1 }) })
+      const live = sub => sub.frames.filter(f => f.status === 'live' && f.bids.length)
+      await bounded((async () => { while (!subs.every(x => live(x).length)) await sleep(50) })(), 15000, 'concurrent live').catch(() => {})
+      const bb = subs.map(x => { const f = live(x).at(-1); return f && [f.source.market, f.native_symbol, +f.bids[0][0], f.seq] })
+      check('concurrent_sources_distinct_values_no_cross_admission', subs.every((x, i) => x.frames.every(f => f.source.market === x.m && f.source.symbol === 'BTC') && bb[i] && bb[i][2] === +(CK[i][2] - 0.1).toFixed(2)) && new Set(bb.map(v => v && v[2])).size === 4, JSON.stringify(bb))
+      const seqs = subs.map(x => live(x).at(-1)?.seq)
+      await mailbox({ op: 'event', sym: 'spot:BTCUSDT', U: 60001, u: 60001, b: [['30999.90', '424.242']], a: [] })
+      await bounded((async () => { while (!live(subs[0]).some(f => f.seq === 60001)) await sleep(50) })(), 10000, 'spot diff').catch(() => {})
+      await sleep(400)
+      const has = x => live(x).some(f => f.bids.some(([, q]) => Math.abs(+q - 424.242) < 1e-9))
+      check('concurrent_diff_isolated_to_its_producer', has(subs[0]) && subs.slice(1).every((x, i) => !has(x) && live(x).at(-1)?.seq === seqs[i + 1]), JSON.stringify([seqs, subs.map(x => live(x).at(-1)?.seq), subs.map(has)]))
+      for (const x of subs) x.s.close()
+      await sleep(600)
+    }
+    // M3A Coinbase Exchange spot (SYNTHETIC level2_batch shapes): full WS
+    // snapshot on the same stream (no REST, no upstream seq), absolute
+    // l2update replacement/zero delete, nearest-5000 window, internal rev.
+    {
+      await evaluate(`(() => { const e = document.getElementById('exchange'); e.value = 'coinbase'; e.dispatchEvent(new Event('change')); return e.value })()`)
+      const CB = [['BTC', 'BTC-USD', 70000, 0.01, 6000, 21000], ['ETH', 'ETH-USD', 2290, 0.01, 5200, 13275]]
+      const expectCb = (mid, tick, unit, bid0, delAsk0) => {
+        const lv = side => { const out = []; for (let i = 0; out.length < 20; i++) { if (side === 'a' && delAsk0 && i === 0) continue
+          const p = +(side === 'b' ? mid - tick * (i + 1) : mid + tick * (i + 1)).toFixed(2)
+          let q = side === 'b' ? 0.5 + (i % 7) * 0.125 : 0.25 + (i % 7) * 0.125; if (side === 'b' && i === 0 && bid0 != null) q = bid0
+          out.push([p, unit === 'quote' ? q * p : q]) } return out }
+        const b = lv('b'), a = lv('a')
+        return [...a.reverse().map(([p, q]) => ['', fmt(p, 2), qf(q)]), ...b.map(([p, q]) => [qf(q), fmt(p, 2), ''])]
+      }
+      for (const [s, native, mid, tick, nb, na] of CB) {
+        const sk = `coinbase:${native}`; const tag = `coinbase_spot_${s}`
+        const c0 = (await mailbox({ op: 'state' })).connects[sk] ?? 0
+        await selectSource('spot', s)
+        await waitFor(`${B}.state().source?.exchange === 'coinbase' && ${B}.state().source?.symbol === ${JSON.stringify(s)}`, 10000)
+        for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects[sk] ?? 0) > c0) break; await sleep(50) }
+        check(`${tag}_exact_producer_demand`, JSON.stringify(st.active) === JSON.stringify([[`coinbase/spot/${s}`, 1]]) && st.connects[sk] === c0 + 1 && sockets.some(u => u.includes('/book') && u.includes('exchange=coinbase') && u.includes(`symbol=${s}`)), JSON.stringify([st.active, st.connects]))
+        check(`${tag}_snapshot_sent`, (await mailbox({ op: 'cb_snapshot', sym: sk, mid, tick, bids: nb, asks: na })).ok)
+        await sleep(300)
+        check(`${tag}_syncing_until_timestamped_update`, (await bookState()).status.state !== 'live', JSON.stringify((await bookState()).status))
+        check(`${tag}_update_sent`, (await mailbox({ op: 'cb_update', sym: sk, changes: [['buy', (mid - tick).toFixed(2), '3.50000000'], ['sell', (mid + tick).toFixed(2), '0']] })).ok)
+        await waitFor(`${B}.state().status.state === 'live' && ${B}.state().seq === 1 && ${B}.state().plugins[0].rows > 0 && ${B}.state().source?.exchange === 'coinbase'`, 15000)
+        let dd = await dom(); const li = (await bookState()).lastInput
+        // Anchored window: nearest 5000/side from the deep snapshot; the zero delete
+        // leaves 4999 asks inside the window (never refilled from unknown outside).
+        check(`${tag}_wasm_input_window_5000_4999`, li?.bids === 5000 && li?.asks === 4999, JSON.stringify(li))
+        check(`${tag}_base_rows_absolute_and_delete`, JSON.stringify(dd.rows) === JSON.stringify(expectCb(mid, tick, 'base', 3.5, true)), `got=${JSON.stringify(dd.rows.slice(18, 22))} want=${JSON.stringify(expectCb(mid, tick, 'base', 3.5, true).slice(18, 22))}`)
+        check(`${tag}_labels_native_internal_rev`, dd.venue.includes(`Coinbase Exchange spot ${native}`) && new RegExp(`qty ${s}\\b`).test(dd.title) && /internal rev 1\b/.test(dd.note) && /Depth 5000\/4999 levels per side \(deep\)/.test(dd.note)
+          && dd.note.includes(`Supplied range ${fmt(+(mid - tick * 5000).toFixed(2), 2)}–${fmt(+(mid + tick * 5000).toFixed(2), 2)};`), JSON.stringify([dd.venue, dd.title, dd.note]))
+        await setParams('orderbook', { rows: 20, group: 0, unit: 'quote' })
+        await waitFor(`${B}.state().plugins[0]?.unit === 'USD' && ${B}.state().plugins[0].rows > 0`, 15000).catch(() => {})
+        dd = await dom()
+        check(`${tag}_quote_usd_rows_exact`, JSON.stringify(dd.rows) === JSON.stringify(expectCb(mid, tick, 'quote', 3.5, true)) && /qty USD\b/.test(dd.title), `got=${JSON.stringify(dd.rows.slice(18, 22))} title=${dd.title}`)
+        await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+        await waitFor(`${B}.state().plugins[0]?.unit === ${JSON.stringify(s)}`, 15000).catch(() => {})
+        // Absolute replacement (not delta) of the same level.
+        await mailbox({ op: 'cb_update', sym: sk, dt_ms: 5, changes: [['buy', (mid - tick).toFixed(2), '1.25000000']] })
+        await waitFor(`${B}.state().seq === 2 && ${B}.state().plugins[0].rows > 0`, 15000).catch(() => {})
+        await sleep(300)
+        dd = await dom()
+        check(`${tag}_absolute_replace_rev2`, JSON.stringify(dd.rows) === JSON.stringify(expectCb(mid, tick, 'base', 1.25, true)), JSON.stringify(dd.rows.slice(19, 21)))
+        // M3A closure: Coinbase-specific deep numeric oracle. Bid index 1500
+        // (beyond 1000, inside the retained 5000 window) gets a distinctive
+        // absolute size twice (9 then 4321.5: replacement, no double add);
+        // a bid beyond the window (index 5200, present in the snapshot but
+        // outside the anchored 5000) must not contribute.
+        const deepP = +(mid - tick * 1501).toFixed(2), outP = +(mid - tick * 5201).toFixed(2)
+        await mailbox({ op: 'cb_update', sym: sk, dt_ms: 10, changes: [['buy', deepP.toFixed(2), '9.00000000']] })
+        await mailbox({ op: 'cb_update', sym: sk, dt_ms: 15, changes: [['buy', deepP.toFixed(2), '4321.50000000'], ['buy', outP.toFixed(2), '999999.00000000']] })
+        await waitFor(`${B}.state().seq >= 4`, 15000).catch(() => {})
+        await setParams('orderbook', { rows: 20, group: 10, unit: 'base' })
+        await waitFor(`${B}.state().plugins[0]?.fault === null && ${B}.state().plugins[0].rows === 10`, 15000).catch(() => {})
+        await sleep(200)
+        dd = await dom()
+        const gcb = (() => {
+          const b = new Map(), a = new Map()
+          for (let i = 0; i < 5000; i++) {
+            const bp = +(mid - tick * (i + 1)).toFixed(2), ap = +(mid + tick * (i + 1)).toFixed(2)
+            let bq = 0.5 + (i % 7) * 0.125; if (i === 0) bq = 1.25; if (i === 1500) bq = 4321.5
+            const bk = Math.floor(bp / 10) * 10; b.set(bk, (b.get(bk) ?? 0) + bq)
+            if (i > 0) { const ak = Math.ceil(ap / 10) * 10; a.set(ak, (a.get(ak) ?? 0) + 0.25 + (i % 7) * 0.125) }
+          }
+          const k = Math.floor(deepP / 10) * 10
+          return { rows: [...[...a].sort((x, y) => y[0] - x[0]).map(([p, q]) => ['', fmt(p, 0), qf(q)]), ...[...b].sort((x, y) => y[0] - x[0]).map(([p, q]) => [qf(q), fmt(p, 0), ''])], deep: b.get(k), k }
+        })()
+        check(`${tag}_deep_beyond1000_grouped_exact`, JSON.stringify(dd.rows) === JSON.stringify(gcb.rows) && gcb.deep > 4321.5 && gcb.deep < 9000 && dd.rows.some(r => r[1] === fmt(gcb.k, 0) && r[0] === qf(gcb.deep)), `got=${JSON.stringify(dd.rows)} want=${JSON.stringify(gcb.rows)}`)
+        check(`${tag}_outside_window_not_counted`, !dd.rows.some(r => r[1] === fmt(Math.floor(outP / 10) * 10, 0)) && !JSON.stringify(dd.rows).includes('999,999'), JSON.stringify(dd.rows))
+        await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+        await waitFor(`${B}.state().plugins[0]?.unit === ${JSON.stringify(s)}`, 15000).catch(() => {})
+        await closeMenu()
+      }
+      // Positive cross-exchange isolation: Binance spot BTC and Coinbase spot
+      // BTC share market+symbol, differ in exchange; simultaneous producers.
+      await mailbox({ op: 'snapshot', sym: 'spot:BTCUSDT', id: 90000, mid: 31000, tick: 0.1, levels: 300 })
+      const XS = [['binance', 'spot:BTCUSDT'], ['coinbase', 'coinbase:BTC-USD']]
+      const c0 = (await mailbox({ op: 'state' })).connects
+      const subs = XS.map(([ex]) => { const s = new WebSocket(`ws://127.0.0.1:${info.port}/book?exchange=${ex}&market=spot&symbol=BTC`); const frames = []; s.onmessage = e => frames.push(JSON.parse(e.data)); return { ex, s, frames } })
+      for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if (XS.every(([, sk]) => (st.connects[sk] ?? 0) > (c0[sk] ?? 0))) break; await sleep(50) }
+      const act = Object.fromEntries(st.active)
+      check('xex_two_producers_same_market_symbol', (act['binance/spot/BTC'] ?? 0) >= 1 && (act['coinbase/spot/BTC'] ?? 0) >= 1 && XS.every(([, sk]) => st.connects[sk] === (c0[sk] ?? 0) + 1), JSON.stringify([st.active, st.connects]))
+      await sleep(150)
+      await mailbox({ op: 'event', sym: 'spot:BTCUSDT', U: 89999, u: 90001, b: [], a: [] })
+      await mailbox({ op: 'cb_snapshot', sym: 'coinbase:BTC-USD', mid: 70000, tick: 0.01, bids: 300, asks: 300 })
+      await mailbox({ op: 'cb_update', sym: 'coinbase:BTC-USD', changes: [['buy', '69999.99', '2.00000000']] })
+      const live = x => x.frames.filter(f => f.status === 'live' && f.bids.length)
+      await bounded((async () => { while (!subs.every(x => live(x).length)) await sleep(50) })(), 15000, 'xex live').catch(() => {})
+      const snap = x => { const f = live(x).at(-1); return f && { ex: f.source.exchange, native: f.native_symbol, quote: f.quote, kind: f.seq_kind, seq: f.seq, gen: f.generation, bid: +f.bids[0][0] } }
+      const s0 = subs.map(snap)
+      check('xex_distinct_identity_values', s0[0]?.ex === 'binance' && s0[0]?.native === 'BTCUSDT' && s0[0]?.quote === 'USDT' && s0[0]?.kind === 'exchange_update_id' && s0[0]?.seq === 90001 && s0[0]?.bid === 30999.9
+        && s0[1]?.ex === 'coinbase' && s0[1]?.native === 'BTC-USD' && s0[1]?.quote === 'USD' && s0[1]?.kind === 'internal_revision' && s0[1]?.seq === 1 && s0[1]?.bid === 69999.99
+        && subs.every(x => x.frames.every(f => f.source.exchange === x.ex)), JSON.stringify(s0))
+      await mailbox({ op: 'cb_update', sym: 'coinbase:BTC-USD', dt_ms: 9, changes: [['buy', '69999.98', '777.00000000']] })
+      await bounded((async () => { while (!live(subs[1]).some(f => f.seq === 2)) await sleep(50) })(), 10000, 'cb rev2').catch(() => {})
+      await mailbox({ op: 'event', sym: 'spot:BTCUSDT', U: 90002, u: 90002, b: [['30999.80', '555.555']], a: [] })
+      await bounded((async () => { while (!live(subs[0]).some(f => f.seq === 90002)) await sleep(50) })(), 10000, 'bn diff').catch(() => {})
+      await sleep(400)
+      const has = (x, q) => live(x).some(f => f.bids.some(([, v]) => Math.abs(+v - q) < 1e-9))
+      check('xex_updates_isolated_no_cross_admission', has(subs[1], 777) && !has(subs[0], 777) && has(subs[0], 555.555) && !has(subs[1], 555.555)
+        && live(subs[1]).at(-1)?.seq === 2 && live(subs[0]).at(-1)?.seq === 90002, JSON.stringify(subs.map(snap)))
+      for (const x of subs) x.s.close()
+      await sleep(600)
+    }
+    // M3B Coinbase DRB linear USDC perpetuals (SYNTHETIC JSON-RPC envelopes:
+    // ack, full WS snapshot with change_id, prev_change_id-chained changes;
+    // amounts are BASE coin, never multiplied by contract_size). Base-unit
+    // policy is tied to the recorded public instrument excerpt (fixture).
+    {
+      const meta = JSON.parse(fs.readFileSync(new URL('./fixtures/coinbase-drb-instruments-excerpt.json', import.meta.url), 'utf8'))
+      const DRB = [['BTC', 'BTC_USDC-PERPETUAL', 78000, 0.5, 1, 6000, 6000, 1000], ['ETH', 'ETH_USDC-PERPETUAL', 2300, 0.05, 2, 5200, 5200, 100]]
+      for (const [s, native] of DRB) {
+        const m = meta.instruments.find(x => x.instrument_name === native)
+        check(`drb_${s}_registered_linear_usdc_metadata`, !!m && m.instrument_type === 'linear' && m.future_type === 'linear' && m.kind === 'future' && m.settlement_period === 'perpetual'
+          && m.base_currency === s && m.quote_currency === 'USDC' && m.settlement_currency === 'USDC' && m.contract_size === 0.0001, JSON.stringify(m))
+      }
+      const qfD = x => x >= 1000 ? fmt(x, 0) : x >= 1 ? fmt(x, 3) : fmt(x, 4)
+      const rnd = x => +x.toFixed(2)
+      const expectDrb = (mid, tick, pd, unit, bid0, delAsk0) => {
+        const lv = side => { const out = []; for (let i = 0; out.length < 20; i++) { if (side === 'a' && delAsk0 && i === 0) continue
+          const p = rnd(side === 'b' ? mid - tick * (i + 1) : mid + tick * (i + 1))
+          let q = side === 'b' ? 0.5 + (i % 7) * 0.125 : 0.25 + (i % 7) * 0.125; if (side === 'b' && i === 0 && bid0 != null) q = bid0
+          out.push([p, unit === 'quote' ? q * p : q]) } return out }
+        const b = lv('b'), a = lv('a')
+        return [...a.reverse().map(([p, q]) => ['', fmt(p, pd), qfD(q)]), ...b.map(([p, q]) => [qfD(q), fmt(p, pd), ''])]
+      }
+      for (const [s, native, mid, tick, pd, nb, na, G] of DRB) {
+        const sk = `coinbase:${native}`; const tag = `drb_${s}`
+        const c0 = (await mailbox({ op: 'state' })).connects[sk] ?? 0
+        await selectSource('usdc', s)
+        await waitFor(`${B}.state().source?.exchange === 'coinbase' && ${B}.state().source?.market === 'usdc' && ${B}.state().source?.symbol === ${JSON.stringify(s)}`, 10000)
+        for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects[sk] ?? 0) > c0) break; await sleep(50) }
+        check(`${tag}_exact_producer_demand`, JSON.stringify(st.active) === JSON.stringify([[`coinbase/usdc/${s}`, 1]]) && st.connects[sk] === c0 + 1 && sockets.some(u => u.includes('/book') && u.includes('exchange=coinbase') && u.includes('market=usdc') && u.includes(`symbol=${s}`)), JSON.stringify([st.active, st.connects]))
+        check(`${tag}_ack_and_snapshot_sent`, (await mailbox({ op: 'drb_ack', sym: sk })).ok && (await mailbox({ op: 'drb_snapshot', sym: sk, mid, tick, bids: nb, asks: na, cid: 1000 })).ok)
+        await waitFor(`${B}.state().status.state === 'live' && ${B}.state().seq === 1000`, 15000).catch(() => {})
+        // change_id may jump (1000 -> 1007) when prev_change_id matches.
+        check(`${tag}_change_sent`, (await mailbox({ op: 'drb_change', sym: sk, prev: 1000, cid: 1007, dt_ms: 3, b: [['change', rnd(mid - tick), 3.5]], a: [['delete', rnd(mid + tick), 0]] })).ok)
+        await waitFor(`${B}.state().status.state === 'live' && ${B}.state().seq === 1007 && ${B}.state().plugins[0].rows > 0 && ${B}.state().source?.market === 'usdc'`, 15000)
+        await sleep(200)
+        let dd = await dom(); const li = (await bookState()).lastInput
+        check(`${tag}_wasm_input_window_5000_4999`, li?.bids === 5000 && li?.asks === 4999, JSON.stringify(li))
+        check(`${tag}_base_rows_change_and_delete_no_contract_size`, JSON.stringify(dd.rows) === JSON.stringify(expectDrb(mid, tick, pd, 'base', 3.5, true)), `got=${JSON.stringify(dd.rows.slice(18, 22))} want=${JSON.stringify(expectDrb(mid, tick, pd, 'base', 3.5, true).slice(18, 22))}`)
+        check(`${tag}_labels_native_usdc_seq`, dd.venue.includes(`Coinbase DRB USDC perpetual ${native}`) && new RegExp(`qty ${s}\\b`).test(dd.title) && /\bseq 1007\b/.test(dd.note) && !/internal rev/.test(dd.note) && /Depth 5000\/4999 levels per side \(deep\)/.test(dd.note), JSON.stringify([dd.venue, dd.title, dd.note]))
+        await setParams('orderbook', { rows: 20, group: 0, unit: 'quote' })
+        await waitFor(`${B}.state().plugins[0]?.unit === 'USDC' && ${B}.state().plugins[0].rows > 0`, 15000).catch(() => {})
+        await sleep(200)
+        dd = await dom()
+        check(`${tag}_quote_usdc_rows_exact_price_times_base`, JSON.stringify(dd.rows) === JSON.stringify(expectDrb(mid, tick, pd, 'quote', 3.5, true)) && /qty USDC\b/.test(dd.title), `got=${JSON.stringify(dd.rows.slice(18, 22))} title=${dd.title}`)
+        await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+        await waitFor(`${B}.state().plugins[0]?.unit === ${JSON.stringify(s)}`, 15000).catch(() => {})
+        await mailbox({ op: 'drb_change', sym: sk, prev: 1007, cid: 1008, dt_ms: 5, b: [['change', rnd(mid - tick), 1.25]], a: [] })
+        await waitFor(`${B}.state().seq === 1008 && ${B}.state().plugins[0].rows > 0`, 15000).catch(() => {})
+        await sleep(300)
+        dd = await dom()
+        check(`${tag}_absolute_replace_seq1008`, JSON.stringify(dd.rows) === JSON.stringify(expectDrb(mid, tick, pd, 'base', 1.25, true)), JSON.stringify(dd.rows.slice(19, 21)))
+        // Deep numeric oracle: bid index 1500 (beyond 1000, inside the 5000
+        // window) replaced 9 -> 4321.5; index 2500 deleted; an update at index
+        // 5200 (outside the anchored window: an existing level in the BTC
+        // 6000 snapshot, a new level for ETH's 5200 snapshot) must not count.
+        const deepP = rnd(mid - tick * 1501), delP = rnd(mid - tick * 2501), outP = rnd(mid - tick * 5201)
+        await mailbox({ op: 'drb_change', sym: sk, prev: 1008, cid: 1009, dt_ms: 10, b: [['change', deepP, 9]], a: [] })
+        await mailbox({ op: 'drb_change', sym: sk, prev: 1009, cid: 1010, dt_ms: 15, b: [['change', deepP, 4321.5], ['delete', delP, 0], [nb > 5200 ? 'change' : 'new', outP, 999999]], a: [] })
+        await waitFor(`${B}.state().seq === 1010`, 15000).catch(() => {})
+        await setParams('orderbook', { rows: 20, group: G, unit: 'base' })
+        await waitFor(`${B}.state().plugins[0]?.fault === null && ${B}.state().plugins[0].rows > 0 && ${B}.state().plugins[0].rows < 20`, 15000).catch(() => {})
+        await sleep(300)
+        dd = await dom()
+        const g = (() => {
+          const b = new Map(), a = new Map()
+          for (let i = 0; i < 5000; i++) {
+            const bp = rnd(mid - tick * (i + 1)), ap = rnd(mid + tick * (i + 1))
+            let bq = 0.5 + (i % 7) * 0.125; if (i === 0) bq = 1.25; if (i === 1500) bq = 4321.5; if (i === 2500) bq = 0
+            const bk = Math.floor(bp / G) * G; b.set(bk, (b.get(bk) ?? 0) + bq)
+            if (i > 0) { const ak = Math.ceil(ap / G) * G; a.set(ak, (a.get(ak) ?? 0) + 0.25 + (i % 7) * 0.125) }
+          }
+          const k = Math.floor(deepP / G) * G
+          return { rows: [...[...a].sort((x, y) => y[0] - x[0]).map(([p, q]) => ['', fmt(p, 0), qfD(q)]), ...[...b].sort((x, y) => y[0] - x[0]).map(([p, q]) => [qfD(q), fmt(p, 0), ''])], deep: b.get(k), k }
+        })()
+        check(`${tag}_deep_beyond1000_grouped_exact`, JSON.stringify(dd.rows) === JSON.stringify(g.rows) && g.deep > 4321.5 && dd.rows.some(r => r[1] === fmt(g.k, 0) && r[0] === qfD(g.deep)), `got=${JSON.stringify(dd.rows)} want=${JSON.stringify(g.rows)}`)
+        check(`${tag}_outside_window_not_counted`, !JSON.stringify(dd.rows).includes('999,999') && !dd.rows.some(r => r[1] === fmt(Math.floor(outP / G) * G, 0) && Math.floor(outP / G) * G < Math.floor(rnd(mid - tick * 5000) / G) * G), JSON.stringify(dd.rows))
+        await setParams('orderbook', { rows: 20, group: 0, unit: 'base' })
+        await waitFor(`${B}.state().plugins[0]?.unit === ${JSON.stringify(s)} && ${B}.state().plugins[0].rows === 40`, 15000).catch(() => {})
+        // Native change_id gap: wrong prev ends the generation (rows withdrawn),
+        // the producer reconnects and a fresh WS snapshot restores correct
+        // rows in generation+1 without re-enabling the plugin.
+        const gen0 = (await bookState()).generation; const cg = (await mailbox({ op: 'state' })).connects[sk]
+        check(`${tag}_wrong_prev_sent`, (await mailbox({ op: 'drb_change', sym: sk, prev: 9999, cid: 10011, dt_ms: 20, b: [['change', rnd(mid - tick), 777]], a: [] })).ok)
+        await waitFor(`${B}.state().status.state !== 'live'`, 10000).catch(() => {})
+        await sleep(100)
+        dd = await dom(); const bs = await bookState()
+        check(`${tag}_gap_withdraws_rows`, bs.status.state !== 'live' && dd.rows.length === 0 && bs.seq !== 10011, JSON.stringify([bs.status, bs.seq, dd.rows.length]))
+        for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if ((st.connects[sk] ?? 0) > cg) break; await sleep(50) }
+        check(`${tag}_gap_reconnects_same_producer`, st.connects[sk] === cg + 1 && JSON.stringify(st.active) === JSON.stringify([[`coinbase/usdc/${s}`, 1]]), JSON.stringify([st.active, st.connects]))
+        await mailbox({ op: 'drb_snapshot', sym: sk, mid, tick, bids: nb, asks: na, cid: 20000, dt_ms: 30 })
+        await waitFor(`${B}.state().status.state === 'live' && ${B}.state().seq === 20000 && ${B}.state().plugins[0].rows > 0`, 15000).catch(() => {})
+        await sleep(300)
+        dd = await dom(); const bs2 = await bookState()
+        check(`${tag}_fresh_snapshot_new_generation_restores_rows`, bs2.generation === gen0 + 1 && bs2.seq === 20000 && JSON.stringify(dd.rows) === JSON.stringify(expectDrb(mid, tick, pd, 'base', null, false)) && /\bseq 20000\b/.test(dd.note), JSON.stringify([gen0, bs2.generation, bs2.seq, dd.rows.slice(19, 21)]))
+        await closeMenu()
+      }
+      // Positive isolation: Coinbase Exchange spot BTC vs Coinbase DRB BTC —
+      // same exchange+symbol, different market/native/quote/seq kind.
+      const XS = [['spot', 'coinbase:BTC-USD'], ['usdc', 'coinbase:BTC_USDC-PERPETUAL']]
+      const c0 = (await mailbox({ op: 'state' })).connects
+      const subs = XS.map(([mk]) => { const s = new WebSocket(`ws://127.0.0.1:${info.port}/book?exchange=coinbase&market=${mk}&symbol=BTC`); const frames = []; s.onmessage = e => frames.push(JSON.parse(e.data)); return { mk, s, frames } })
+      for (let i = 0; i < 200; i++) { st = await mailbox({ op: 'state' }); if (XS.every(([, sk]) => (st.connects[sk] ?? 0) > (c0[sk] ?? 0))) break; await sleep(50) }
+      const act = Object.fromEntries(st.active)
+      check('cbx_spot_vs_drb_two_producers', (act['coinbase/spot/BTC'] ?? 0) >= 1 && (act['coinbase/usdc/BTC'] ?? 0) >= 1 && XS.every(([, sk]) => st.connects[sk] === (c0[sk] ?? 0) + 1), JSON.stringify([st.active, st.connects]))
+      await sleep(150)
+      await mailbox({ op: 'cb_snapshot', sym: 'coinbase:BTC-USD', mid: 70000, tick: 0.01, bids: 300, asks: 300 })
+      await mailbox({ op: 'cb_update', sym: 'coinbase:BTC-USD', changes: [['buy', '69999.99', '2.00000000']] })
+      await mailbox({ op: 'drb_snapshot', sym: 'coinbase:BTC_USDC-PERPETUAL', mid: 78000, tick: 0.5, bids: 300, asks: 300, cid: 500 })
+      const live = x => x.frames.filter(f => f.status === 'live' && f.bids.length)
+      await bounded((async () => { while (!subs.every(x => live(x).length)) await sleep(50) })(), 15000, 'cbx live').catch(() => {})
+      const snap = x => { const f = live(x).at(-1); return f && { mk: f.source.market, native: f.native_symbol, quote: f.quote, kind: f.seq_kind, seq: f.seq, t: f.exchange_time_ms, bid: +f.bids[0][0], q0: +f.bids[0][1], raw: f.raw_quantity, cs: f.contract_size_quote } }
+      const s0 = subs.map(snap)
+      check('cbx_distinct_identity_values', s0[0]?.mk === 'spot' && s0[0]?.native === 'BTC-USD' && s0[0]?.quote === 'USD' && s0[0]?.kind === 'internal_revision' && s0[0]?.seq === 1 && s0[0]?.bid === 69999.99
+        && s0[1]?.mk === 'usdc' && s0[1]?.native === 'BTC_USDC-PERPETUAL' && s0[1]?.quote === 'USDC' && s0[1]?.kind === 'exchange_update_id' && s0[1]?.seq === 500 && s0[1]?.bid === 77999.5 && s0[1]?.q0 === 0.5
+        && s0[1]?.raw === 'base' && s0[1]?.cs === null && s0[1]?.t > 1.7e12 && subs.every(x => x.frames.every(f => f.source.exchange === 'coinbase' && f.source.market === x.mk)), JSON.stringify(s0))
+      await mailbox({ op: 'drb_change', sym: 'coinbase:BTC_USDC-PERPETUAL', prev: 500, cid: 501, dt_ms: 9, b: [['change', 77999.5, 777]], a: [] })
+      await bounded((async () => { while (!live(subs[1]).some(f => f.seq === 501)) await sleep(50) })(), 10000, 'drb 501').catch(() => {})
+      await mailbox({ op: 'cb_update', sym: 'coinbase:BTC-USD', dt_ms: 9, changes: [['buy', '69999.98', '555.55500000']] })
+      await bounded((async () => { while (!live(subs[0]).some(f => f.seq === 2)) await sleep(50) })(), 10000, 'cb rev2').catch(() => {})
+      await sleep(400)
+      const has = (x, q) => live(x).some(f => f.bids.some(([, v]) => Math.abs(+v - q) < 1e-9))
+      check('cbx_updates_isolated_no_cross_admission', has(subs[1], 777) && !has(subs[0], 777) && has(subs[0], 555.555) && !has(subs[1], 555.555)
+        && live(subs[1]).at(-1)?.seq === 501 && live(subs[0]).at(-1)?.seq === 2, JSON.stringify(subs.map(snap)))
+      for (const x of subs) x.s.close()
+      await sleep(600)
+    }
     // J. unsupported source in UI: no /book socket, explicit label, demand released.
     const before = sockets.filter(u => u.includes('/book')).length
-    await selectSource('spot', 'BTC')
+    await evaluate(`(() => { const e = document.getElementById('exchange'); e.value = 'coinbase'; e.dispatchEvent(new Event('change')); return e.value })()`)
+    // M3B: all 14 registered sources are supported and the UI offers only
+    // registered BTC/ETH sources, so no real unsupported user selection
+    // remains. COMPONENT INJECTION (not a user flow): drive the actual
+    // BookPanel.setSource boundary with an unregistered identity.
+    check('unsupported_no_ui_option_remains', await evaluate(`(() => { const m = document.getElementById('market'), s = document.getElementById('symbol'); return [...s.options].every(o => ['BTC', 'ETH'].includes(o.value)) && [...m.options].every(o => ['spot', 'usdc'].includes(o.value)) })()`), 'coinbase market/symbol options')
+    await evaluate(`${B}.setSource({ exchange: 'coinbase', market: 'usdc', symbol: 'SOL' })`)
     await waitFor(`${B}.state().status.state === 'unsupported'`, 10000)
     d = await dom()
     check('unsupported_source_label_no_rows', /unavailable for this source/.test(d.status) && d.rows.length === 0, JSON.stringify(d))
     await sleep(500)
-    check('unsupported_no_book_socket', sockets.filter(u => u.includes('/book')).length === before && !sockets.some(u => u.includes('/book') && u.includes('market=spot')))
+    check('unsupported_no_book_socket', sockets.filter(u => u.includes('/book')).length === before && !sockets.some(u => u.includes('/book') && u.includes('symbol=SOL')))
     st = await mailbox({ op: 'state' })
     check('unsupported_releases_demand', st.active.length === 0, JSON.stringify(st.active))
     // K. disable releases demand and hides panel; bars path unaffected.
+    await evaluate(`(() => { const e = document.getElementById('exchange'); e.value = 'binance'; e.dispatchEvent(new Event('change')); return e.value })()`)
     await selectSource('usdm', 'BTC')
     await waitFor(`${B}.state().source?.symbol === 'BTC' && ${B}.state().connected`, 10000)
     await waitFor(valuesReady, 30000); await sleep(500)
@@ -571,6 +949,14 @@ try {
     const ethBid = parseFloat(d.rows[20][1].replace(/,/g, ''))
     check('real_eth_live_rows_distinct', /ETHUSDT/.test(d.venue) && ethBid > 10 && ethBid < bid, `${ethBid} vs ${bid}`)
     await shot('book-real-eth.png')
+    // Bounded real spot BTC read (5000/side REST snapshot + spot diff stream).
+    await selectSource('spot', 'BTC')
+    await waitFor(`${B}.state().source?.market === 'spot' && ${B}.state().status.state === 'live' && ${B}.state().plugins[0].rows >= 40`, 45000)
+    d = await dom()
+    const sli = (await bookState()).lastInput
+    console.log(`NOTE real spot input=${JSON.stringify(sli)}`)
+    check('real_spot_btc_live_deep_input', /Binance spot BTCUSDT/.test(d.venue) && sli?.bids === 5000 && sli?.asks === 5000, JSON.stringify([d.venue, sli]))
+    await shot('book-real-spot-btc.png')
     await toggle('orderbook', false)
     await sleep(500)
     const st = await mailbox({ op: 'state' })

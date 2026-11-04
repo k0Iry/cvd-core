@@ -14,7 +14,8 @@ export const BOOK_OP = 4
 export const BOOK_STALE_MS = 5000
 const VIEW_TICK_MS = 500
 const INSTANCE_BASE = 2 ** 29
-const SUPPORTED = new Set(["binance/usdm/BTC", "binance/usdm/ETH"])
+// Exact exchange/market/symbol identities (Coinbase Exchange spot only; INTX deferred).
+const SUPPORTED = new Set([...["spot", "spot_usdc", "usdm", "usdm_usdc", "coinm"].map(m => `binance/${m}`), "coinbase/spot", "coinbase/usdc"].flatMap(k => ["BTC", "ETH"].map(s => `${k}/${s}`)))
 
 export function isBookDescriptor(d) {
     return Array.isArray(d?.inputs) && d.inputs.includes("order_book")
@@ -46,6 +47,7 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
     let nextInstance = INSTANCE_BASE
     let views = new Map()
     const counters = { frames: 0, computes: 0, fenced: 0, renders: 0 }
+    let lastInput = null
     const book = (cmd, args) => coord.book(cmd, args)
 
     const active = () => plugins.size > 0
@@ -144,8 +146,13 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
             if (!p || !f || f.seq !== a.seq || f.generation !== a.generation) { complete(a.plugin, a.token, "superseded"); continue }
             p.inflight.set(a.token, f)
             counters.computes++
-            host.compute(p.instance, `book:${srcKey(f.source)}`, f.generation, BOOK_OP, bodyOf(f)).then(
-                text => complete(a.plugin, a.token, null, text, p),
+            // Bounded diagnostic: level counts/bytes handed to the Worker and
+            // wall time of the last compute (no market values retained).
+            const body = bodyOf(f), t0 = performance.now()
+            lastInput = { bids: f.bids.length, asks: f.asks.length, bytes: body.length, ms: null }
+            const li = lastInput
+            host.compute(p.instance, `book:${srcKey(f.source)}`, f.generation, BOOK_OP, body).then(
+                text => { li.ms = Math.round(performance.now() - t0); complete(a.plugin, a.token, null, text, p) },
                 err => complete(a.plugin, a.token, err?.code || "error", null, p, publicCode(err)))
         }
     }
@@ -217,14 +224,16 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
     function venueLabel(f) {
         const src = f?.source || source
         if (!src) return ""
-        const m = src.market === "usdm" ? "USDⓈ-M perpetual" : src.market
-        return `${src.exchange === "binance" ? "Binance" : src.exchange} ${m} ${src.symbol}${f?.quote ?? (src.market === "usdm" ? "USDT" : "")}`
+        if (src.exchange === "coinbase" && src.market === "usdc") return `Coinbase DRB USDC perpetual ${f?.native_symbol ?? `${src.symbol}_USDC-PERPETUAL`}`
+        if (src.exchange === "coinbase") return `Coinbase Exchange spot ${f?.native_symbol ?? `${src.symbol}-USD`}`
+        const m = ({ spot: "spot", spot_usdc: "spot", usdm: "USDⓈ-M perpetual", usdm_usdc: "USDⓈ-M perpetual", coinm: "COIN-M perpetual" })[src.market] ?? src.market
+        return `${src.exchange === "binance" ? "Binance" : src.exchange} ${m} ${src.symbol}${f?.quote ?? (({ spot: "USDT", usdm: "USDT", spot_usdc: "USDC", usdm_usdc: "USDC", coinm: "USD" })[src.market] ?? "")}`
     }
 
     function statusText() {
         switch (status.state) {
             case "live": return "live"
-            case "unsupported": return "unavailable for this source (Binance USDⓈ-M BTC/ETH only)"
+            case "unsupported": return "unavailable for this source"
             case "connecting": return "connecting…"
             case "syncing": return "syncing…"
             case "stale": return `stale${status.reason ? ` (${status.reason})` : ""} — levels withdrawn`
@@ -289,10 +298,14 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
                 const askRows = r.rows.filter(x => x.price >= r.best_ask || (x.ask > 0 && x.bid === 0)).sort((a, b) => b.price - a.price)
                 for (const x of askRows) asks.append(row(x))
                 for (const x of r.rows.filter(x => !askRows.includes(x))) bids.append(row(x))
-                const spread = el("div", "book-spread", `bid ${fmt(r.best_bid, d)} · spread ${fmt(r.best_ask - r.best_bid, d)} · ask ${fmt(r.best_ask, d)}`)
+                // Raw BBO/spread keep the supplied price precision even when
+                // grouped rows are shown with fewer digits.
+                const dec = x => (String(x).split(".")[1] ?? "").length
+                const rd = Math.max(d, dec(r.best_bid), dec(r.best_ask))
+                const spread = el("div", "book-spread", `bid ${fmt(r.best_bid, rd)} · spread ${fmt(r.best_ask - r.best_bid, rd)} · ask ${fmt(r.best_ask, rd)}`)
                 box.append(asks, spread, bids)
                 const cov = f?.coverage
-                if (cov) box.append(el("div", "book-note", `Plugin view of supplied depth (resting, single source; seq ${f.seq}). Supplied range ${fmt(cov.bid_floor, d)}–${fmt(cov.ask_ceiling, d)}; outside is unknown.`))
+                if (cov) box.append(el("div", "book-note", `Plugin view of supplied depth (resting, single source; ${f.seq_kind === "internal_revision" ? "internal rev" : "seq"} ${f.seq}). Supplied range ${fmt(cov.bid_floor, d)}–${fmt(cov.ask_ceiling, d)}; outside is unknown. Depth ${f.bids.length}/${f.asks.length} levels per side${f.bids.length >= 5000 ? " (deep)" : ""}; a grouped edge bucket sums only supplied levels.`))
             }
             blocks.push(box)
         }
@@ -336,6 +349,6 @@ export function createBookPanel({ host, coord, container, wsUrl, WebSocketImpl =
                 return { id: p.id, state: v?.fault ? (v.fatal ? "fault" : "ready") : v?.state === "starting" ? "starting" : "ready",
                     fault: v?.fault ?? null, publicCode: v?.public_code ?? null, hint: v?.hint ?? null, rows: s?.out?.rows?.length ?? 0, unit: s?.out?.unit ?? null,
                     view: v?.state ?? null, seq: s?.frame.seq ?? null, generation: s?.frame.generation ?? null, bestBid: s?.out?.best_bid ?? null, ageMs: v?.age_ms ?? null }
-            }), counters: { ...counters } }),
+            }), counters: { ...counters }, lastInput: lastInput && { ...lastInput } }),
     }
 }

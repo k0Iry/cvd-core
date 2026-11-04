@@ -236,7 +236,7 @@ fn book_describe_requires_book_descriptor() {
 /// create without describe), for both domains, before any constructor runs.
 mod domain_agreement {
     use super::*;
-    use cvd_indicator_sdk::abi::{OP_LIVE_UPDATE};
+    use cvd_indicator_sdk::abi::OP_LIVE_UPDATE;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn bar_desc() -> Descriptor {
@@ -328,4 +328,19 @@ mod domain_agreement {
         assert_eq!(g.invoke(OP_BOOK, &body), STATUS_OK);
         assert_eq!(g.invoke(OP_HISTORY, b"{}"), STATUS_INVALID_ARGUMENT, "wrong-op guard");
     }
+}
+
+/// M1: a genuine 5000-level-per-side spot snapshot is admitted; 5001 is not.
+#[test]
+fn snapshot_admits_5000_levels_rejects_5001() {
+    let deep = |n: usize| {
+        let mut s = snapshot();
+        s.bids = (0..n).map(|i| [50_000.0 - 0.01 * (i as f64 + 1.0), 1.0]).collect();
+        s.asks = (0..n).map(|i| [50_000.0 + 0.01 * (i as f64 + 1.0), 1.0]).collect();
+        s.coverage = BookCoverage { bid_floor: s.bids[n - 1][0], ask_ceiling: s.asks[n - 1][0] };
+        s
+    };
+    assert_eq!(MAX_BOOK_LEVELS, 5000);
+    assert!(deep(5000).check().is_ok());
+    assert!(deep(5001).check().is_err());
 }

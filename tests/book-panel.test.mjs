@@ -37,14 +37,20 @@ test('descriptor capability and supported sources', () => {
   assert.equal(isBookDescriptor({ inputs: ['price'] }), false)
   assert.equal(bookSupported(BTC), true)
   assert.equal(bookSupported({ ...BTC, symbol: 'ETH' }), true)
-  for (const s of [{ ...BTC, market: 'spot' }, { ...BTC, exchange: 'coinbase' }, { ...BTC, symbol: 'SOL' }, { ...BTC, market: 'usdm_usdc' }]) assert.equal(bookSupported(s), false)
+  // M2: all ten Binance spot/spot_usdc/usdm/usdm_usdc/coinm x BTC/ETH keys.
+  for (const market of ['spot', 'spot_usdc', 'usdm', 'usdm_usdc', 'coinm']) for (const symbol of ['BTC', 'ETH']) assert.equal(bookSupported({ ...BTC, market, symbol }), true, `${market}/${symbol}`)
+  for (const s of [{ ...BTC, exchange: 'coinbase' }, { ...BTC, exchange: 'coinbase', market: 'usdc', symbol: 'SOL' }, { ...BTC, exchange: 'coinbase', market: 'drb' }, { ...BTC, exchange: 'coinbase', market: 'spot', symbol: 'SOL' }, { ...BTC, symbol: 'SOL' }, { ...BTC, market: 'coinm', symbol: 'SOL' }, { ...BTC, market: 'usdc' }]) assert.equal(bookSupported(s), false, JSON.stringify(s))
+  // M3A: Coinbase Exchange spot BTC/ETH (exchange-inclusive identity).
+  for (const symbol of ['BTC', 'ETH']) assert.equal(bookSupported({ exchange: 'coinbase', market: 'spot', symbol }), true, symbol)
+  // M3B: Coinbase DRB linear USDC perpetual BTC/ETH.
+  for (const symbol of ['BTC', 'ETH']) assert.equal(bookSupported({ exchange: 'coinbase', market: 'usdc', symbol }), true, symbol)
 })
 
 test('no plugin => no socket; unsupported source => no socket', async () => {
   const h = await harness()
   h.panel.setSource(BTC)
   assert.equal(h.sockets.length, 0)
-  h.panel.setSource({ ...BTC, market: 'spot' })
+  h.panel.setSource({ ...BTC, exchange: 'coinbase', market: 'usdm', symbol: 'ETH' })
   h.panel.setPlugins([plugin]); await flush()
   assert.equal(h.sockets.length, 0)
   assert.equal(h.panel.state().status.state, 'unsupported')

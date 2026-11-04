@@ -123,13 +123,18 @@ receive op 4. Implement `cvd_indicator_sdk::Indicator` with `type Domain = Book`
 `export_indicator!(Book: MyBook)`; the instance persists across snapshots.
 
 - **Input (`BookSnapshot`)**: one source only (`source.exchange/market/symbol`,
-  `base`, `quote`), `generation`, exchange `seq`, `bids` best first and `asks`
-  best first as `[price, base_quantity]`, and `coverage.bid_floor/ask_ceiling`
-  (positive, `bid_floor < ask_ceiling`). Coverage is complete for the levels
-  actually supplied: when only the top 500 levels per side are sent, it ends at
-  the 500th level, not at the server's wider snapshot range. Levels outside
-  coverage are unknown, not zero. Only live, validated books are delivered;
-  syncing/stale books are withdrawn by the host.
+  `base`, `quote`), `generation`, `seq`, `bids` best first and `asks` best
+  first as `[price, base_quantity]` (at most `MAX_BOOK_LEVELS` = 5000 per
+  side), positive exchange time, and `coverage.bid_floor/ask_ceiling`
+  (positive, `bid_floor < ask_ceiling`). Quantities are always base-asset
+  units (inverse/contract venues are converted by the server). `seq` is an
+  opaque revision scoped to the source and `generation`: only order within one
+  generation is meaningful; it may be the exchange's update id or a server
+  revision. Coverage is exactly the levels supplied, not the venue's full
+  book: e.g. Binance futures publish at most 1000 levels per side, spot and
+  Coinbase up to 5000 (Coinbase as a window anchored at the mid). Levels
+  outside coverage are unknown, not zero. Only live, validated books are
+  delivered; syncing/stale books are withdrawn by the host.
 - **Output (`PriceLevels`)**: `unit`, `best_bid`/`best_ask` echoing the input,
   and 1–400 `rows` of `{price, bid, ask}` strictly descending by price, with
   positive prices. A grouped bucket may extend past the supplied coverage edge.
@@ -138,8 +143,9 @@ receive op 4. Implement `cvd_indicator_sdk::Indicator` with `type Domain = Book`
   supplied depth. A parameter the current book cannot satisfy (for example a
   price group wider than the bid price) should return `invalid_params`; the
   panel shows the fault and recovers when the parameters change.
-- Today the server serves Binance USDⓈ-M BTC and ETH (`/book` WebSocket,
-  memory only); other sources show "unavailable".
+- The server serves BTC and ETH books (`/book` WebSocket, memory only) for the
+  configured Binance spot/USDⓈ-M/COIN-M, Coinbase Exchange spot and Coinbase
+  DRB USDC perpetual sources; other sources show "unavailable".
 
 ## 6. Runtime, failures and isolation
 
