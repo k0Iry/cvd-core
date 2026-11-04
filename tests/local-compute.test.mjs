@@ -68,6 +68,23 @@ test('live plugin: History once, then LiveInit (op2) and bounded LiveUpdate (op3
   host.pending.shift().reject(Object.assign(new Error(), { code: 'sequence_gap' })); await tick()
   assert.equal(host.pending[0].op, 2, 'reinit with LiveInit'); answer(host.pending.shift()); await tick()
   assert.equal(c.fault('a'), null)
+  // Retired coordinator JSON routes: absent from the binding and, with formerly
+  // valid payloads, rejected by the real coordinator wasm as unknown commands.
+  const binding = await createCoordinator(COORD)
+  for (const m of ['history', 'live', 'commit', 'reset', 'map']) assert.equal(binding[m], undefined, m)
+  const x = (await WebAssembly.instantiate(COORD, {})).instance.exports
+  const raw = cmd => {
+    const b = new TextEncoder().encode(JSON.stringify(cmd)); const p = x.coord_alloc(b.length)
+    new Uint8Array(x.memory.buffer, p, b.length).set(b); const st = x.coord_call(p, b.length); x.coord_free(p, b.length)
+    return [st, JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.coord_result_ptr(), x.coord_result_len())))]
+  }
+  assert.deepEqual(raw({ cmd: 'idle' }), [0, true], 'active route still served')
+  const old = [
+    { cmd: 'history', scope, revision: 1, bars: bars(3), context: 1, want_from_index: 0, want_to_index: 2, exhausted: false },
+    { cmd: 'live', plugin: 'a', scope_key: 's', scope, context: 1, tail: bars(3) },
+    { cmd: 'commit', plugin: 'a', ok: true }, { cmd: 'reset', plugin: 'a' }, { cmd: 'map', bars: bars(3) }, { cmd: 'stop' },
+  ]
+  for (const o of old) assert.deepEqual(raw(o), [1, { code: 'bad_command', message: 'unknown cmd' }], o.cmd)
 })
 
 test('prepend recomputes stateless History without resetting the live session', async () => {

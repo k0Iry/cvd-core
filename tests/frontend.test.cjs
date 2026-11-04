@@ -114,7 +114,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../static/j
 test('changed frontend modules share one coherent import version', () => {
     const html = fs.readFileSync(require('node:path').join(__dirname, '../static/index.html'), 'utf8')
     const versions = new Set([...html.matchAll(/\.js\?v=([\w-]+)/g), ...source.matchAll(/\?v=([\w-]+)/g)].map(m => m[1]))
-    assert.deepEqual([...versions], ['local-wasm-15'])
+    assert.deepEqual([...versions], ['local-wasm-16'])
 })
 const chartSource = fs.readFileSync(require('node:path').join(__dirname, '../static/js/chart.js'), 'utf8').replace(/^export /gm, '')
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }

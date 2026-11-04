@@ -173,6 +173,9 @@ try {
   host.disable(1)
   await expectErr('disable.pending_rejected', dp, 'disabled')
   for (const id of [...host.instances.keys()]) host.disable(id)
+  // Retired private host entries: no session-reset export; fence `cancel` is an unknown command.
+  step('retired.host_session_reset_absent', !('host_session_reset' in (await WebAssembly.instantiate(hostWasm, {})).instance.exports), 'export')
+  try { host._fence({ cmd: 'cancel', id: 1 }); step('retired.fence_cancel_rejected', false, 'accepted') } catch (e) { step('retired.fence_cancel_rejected', e.code === 'bad_command', e.code) }
   step('final.zero_residue', host.instances.size === 0 && clean(host), host.stats())
 } catch (e) { step('fatal', false, `${e.code}: ${e.message} ${e.stack}`) }
 window.__smoke = r

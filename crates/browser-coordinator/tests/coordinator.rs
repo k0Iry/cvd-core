@@ -108,11 +108,27 @@ fn scope_gap_and_removed_bars_reinit() {
 }
 
 #[test]
-fn ffi_dispatch_roundtrip() {
+fn ffi_dispatch_roundtrip_and_retired_routes() {
     let mut c = Coordinator::new();
-    let r = ffi::dispatch(&mut c, &json!({"cmd":"live","plugin":"p","scope_key":"k","scope":scope(),"context":1,"tail":bars(3)})).unwrap();
-    assert_eq!(r["op"], 2);
+    assert_eq!(c.plan_live_checked("p", "k", &scope(), 1, &bars(3), &[]).unwrap().op, OP_LIVE_INIT);
+    assert_eq!(ffi::dispatch(&mut c, &json!({"cmd":"idle"})).unwrap(), json!(true));
     assert_eq!(ffi::dispatch(&mut c, &json!({"cmd":"nope"})).unwrap_err().code, "bad_command");
+    // Retired coordinator JSON routes, with formerly valid payloads, are now unknown commands.
+    let sc = json!({"exchange":"binance","market":"spot","symbol":"BTCUSDT","tf":"1m","mode":"source"});
+    for old in [
+        json!({"cmd":"history","scope":sc,"revision":1,"bars":bars(3),"context":1,"want_from_index":0,"want_to_index":2,"exhausted":false}),
+        json!({"cmd":"live","plugin":"p","scope_key":"k","scope":sc,"context":1,"tail":bars(3)}),
+        json!({"cmd":"commit","plugin":"p","ok":true}),
+        json!({"cmd":"reset","plugin":"p"}),
+        json!({"cmd":"map","bars":bars(3)}),
+        json!({"cmd":"stop"}),
+    ] {
+        let e = ffi::dispatch(&mut c, &old).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("bad_command", "unknown cmd"), "{}", old["cmd"]);
+    }
+    // The retired `live` route did not touch the live session planned above.
+    c.commit("p", true);
+    assert_eq!(c.plan_live_checked("p", "k", &scope(), 1, &bars(4), &[]).unwrap().op, OP_LIVE_UPDATE);
 }
 
 fn req(p: &HistoryPlan) -> cvd_indicator_sdk::HistoryRequest { serde_json::from_str(&p.body).unwrap() }
@@ -279,8 +295,11 @@ fn live_session_never_bridges_invalid_bucket_and_recovers() {
 fn ffi_accepts_optional_invalid_times_and_rejects_malformed() {
     let mut c = Coordinator::new();
     let cache = cache_without(40, 1800);
-    let cmd = |inv: Value| json!({"cmd":"history","scope":scope(),"revision":1,"bars":cache,"context":2,"want_from_index":20,"want_to_index":39,"exhausted":false,"invalid_times":inv});
-    assert_eq!(ffi::dispatch(&mut c, &cmd(json!([1800]))).unwrap_err().code, "invalid_window");
+    assert_eq!(plan_history_checked(&scope(), 1, &cache, 2, 20, 39, false, &[1800]).unwrap_err().code, "invalid_window");
+    // Active `demand` route parses the same optional field.
+    let cmd = |inv: Value| json!({"cmd":"demand","scope":scope(),"scope_key":"k","revision":1,"history_revision":1,"bars":cache,"want_from_index":20,"want_to_index":39,"invalid_times":inv});
+    assert!(ffi::dispatch(&mut c, &cmd(json!([1800]))).is_ok(), "well-formed invalid_times admitted");
     assert!(ffi::dispatch(&mut c, &cmd(Value::Null)).is_ok(), "absent/null = none (back-compatible)");
     assert_eq!(ffi::dispatch(&mut c, &cmd(json!(["x"]))).unwrap_err().code, "invalid_input");
+    assert_eq!(ffi::dispatch(&mut c, &cmd(json!(7))).unwrap_err().code, "invalid_input");
 }

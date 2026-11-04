@@ -750,12 +750,4 @@ impl Coordinator {
     pub fn sched_running(&self) -> Vec<String> {
         self.sched.runtimes.iter().filter(|(_, rt)| rt.loaded).map(|(k, _)| k.clone()).collect()
     }
-    pub fn sched_ids(&self) -> Vec<String> { self.sched.runtimes.keys().cloned().collect() }
-    pub fn sched_stop(&mut self) -> Vec<Value> {
-        let mut ev = Vec::new();
-        for id in self.sched_ids() { self.sched_retire(&id, &mut ev) }
-        self.sched.runtimes.clear();
-        self.sched.vals.clear();
-        ev
-    }
 }

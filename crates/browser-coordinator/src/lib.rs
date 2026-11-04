@@ -21,9 +21,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub const OP_HISTORY: u32 = 1;
-pub const OP_LIVE_INIT: u32 = 2;
-pub const OP_LIVE_UPDATE: u32 = 3;
+pub use cvd_indicator_sdk::abi::{OP_HISTORY, OP_LIVE_INIT, OP_LIVE_UPDATE};
 
 const F64_FIELDS: [&str; 20] = [
     "po", "ph", "pl", "price_close", "apo", "aph", "apl", "apc", "cvd_usdt", "ac", "delta_usdt", "ad",

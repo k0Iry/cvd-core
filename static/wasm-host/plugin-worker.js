@@ -60,7 +60,6 @@ async function startHost (m) {
   if (!(m.hostWasm instanceof ArrayBuffer || ArrayBuffer.isView(m.hostWasm)) || !(m.pluginWasm instanceof ArrayBuffer)) throw fail('bad_command', 'bad load message')
   const h = await WebAssembly.instantiate(m.hostWasm, {})
   host = h.instance.exports
-  host.host_session_reset()
   const bytes = new Uint8Array(m.pluginWasm)
   return [bytes, hostCall('host_validate_module', [], bytes)] // bounded policy check BEFORE compile
 }

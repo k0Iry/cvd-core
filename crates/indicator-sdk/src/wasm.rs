@@ -63,7 +63,7 @@ pub trait WasmSession: Sized {
     fn invoke(&mut self, op: u32, input: &[u8]) -> Result<Vec<u8>, PluginError>;
 }
 
-/// Bar session. Item 8 semantics (mirror of the native runner): `OP_HISTORY`
+/// Bar session. `OP_HISTORY`
 /// always runs on a FRESH `Instance` built from the stored create-params and
 /// dropped after the call; `OP_LIVE_*` run on the one persistent live
 /// instance, which a History request never touches.

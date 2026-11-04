@@ -254,12 +254,6 @@ export async function createCoordinator(bytes) {
         return out
     }
     return {
-        history: (scope, revision, bars, context, wantFromIndex, wantToIndex, exhausted, invalidTimes = []) =>
-            call({ cmd: "history", scope, revision, bars, context, want_from_index: wantFromIndex, want_to_index: wantToIndex, exhausted: !!exhausted, invalid_times: invalidTimes }),
-        live: (plugin, scopeKey, scope, context, tail, invalidTimes = []) => call({ cmd: "live", plugin, scope_key: scopeKey, scope, context, tail, invalid_times: invalidTimes }),
-        commit: (plugin, ok) => call({ cmd: "commit", plugin, ok: !!ok }),
-        reset: plugin => call({ cmd: "reset", plugin }),
-        map: bars => call({ cmd: "map", bars }),
         // Rust-owned scheduling/result authority (crates/browser-coordinator/src/sched.rs).
         plugins: list => call({ cmd: "plugins", list }),
         // Order-book planning/admission (crates/browser-coordinator/src/book.rs).

@@ -2,7 +2,7 @@
 license.workspace = true
 rust-version.workspace = true
 name = "cvd-indicator-sdk"
-description = "Authoring SDK, stable C ABI and framed runner protocol for CVD indicator libraries"
+description = "Authoring SDK and browser WASM plugin ABI for CVD indicator libraries"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

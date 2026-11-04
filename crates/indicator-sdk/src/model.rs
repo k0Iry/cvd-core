@@ -1,4 +1,4 @@
-//! Typed JSON documents exchanged between host, runner and library.
+//! Typed JSON documents exchanged between the browser host and plugin.
 //!
 //! Field names of [`InputBar`] intentionally reuse the established CVD bar
 //! wire names (`po/ph/pl/price_close`, `apo/aph/apl/apc`, `cvd_usdt/ac`,
@@ -91,7 +91,7 @@ pub mod codes {
     ];
 
     /// Codes a library may report itself via `STATUS_ERROR`. Transport and
-    /// session codes are reserved for the runner/host.
+    /// session codes are reserved for the host.
     const LIBRARY: [&str; 7] =
         [INVALID_INPUT, INVALID_PARAMS, COMPUTE_FAILED, SEQUENCE_GAP, STALE_GENERATION, LIMIT_EXCEEDED, INVALID_OUTPUT];
 
@@ -579,7 +579,7 @@ impl Descriptor {
         self.inputs.contains(&InputField::OrderBook)
     }
 
-    /// Structural validation performed by runner and host at load time.
+    /// Structural validation performed by the host at load time.
     pub fn validate(&self) -> Result<(), PluginError> {
         let levels = self.outputs.iter().filter(|o| o.kind == OutputKind::PriceLevels).count();
         if self.is_book() {

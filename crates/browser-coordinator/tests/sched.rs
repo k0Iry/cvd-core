@@ -244,7 +244,7 @@ fn live_overlay_has_precedence_over_stateless_history() {
     assert_eq!(view(&r)["cols"]["a/x|source"]["set"], json!([[18000, 9]]));
     assert_eq!(view(&r)["changed"], json!([18000]));
     // History recompute on the SAME basis keeps the live value.
-    call(&mut c, json!({ "cmd": "reset", "plugin": "a" }));
+    c.reset("a");
     let vals = c.sched_values_json("a");
     assert_eq!(vals["a/x|source"]["18000"], 9);
 }

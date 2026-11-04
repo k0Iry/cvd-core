@@ -1,13 +1,12 @@
 //! wasm32 FFI: JSON command in, JSON result in a slot (status 0 ok / 1 err).
 //! `coord_alloc(n)`, `coord_free(p,n)`, `coord_call(p,n) -> status`,
 //! `coord_result_ptr()`, `coord_result_len()`. Commands:
-//! {cmd:"history", scope, revision, bars, context, want_from_index, want_to_index, exhausted}
-//! {cmd:"live", plugin, scope_key, scope, context, tail}
-//! Optional `invalid_times: [i64]` on history/live (fail-closed validity).
+//! {cmd:"plugins", list}  {cmd:"demand", ...}  {cmd:"next", plugin}
+//! Optional `invalid_times: [i64]` on demand (fail-closed validity).
 //! {cmd:"done", plugin, token, error?, descriptor?} + optional "\n" + raw output frame
 //! {cmd:"invalidate", times}  {cmd:"presentation_fault", plugin}
 //! {cmd:"approve", descriptor, params, strict} -> {descriptor, params}
-//! {cmd:"commit", plugin, ok}  {cmd:"reset", plugin}  {cmd:"map", bars}
+//! {cmd:"book_*", ...} (book.rs)
 use super::*;
 use std::cell::RefCell;
 
@@ -42,17 +41,6 @@ pub fn dispatch(c: &mut Coordinator, cmd: &Value) -> Result<Value, CoordError> {
     let s = |k| field(cmd, k).and_then(|v| v.as_str().ok_or_else(|| invalid(format!("{k} not a string"))));
     match s("cmd")? {
         c2 if c2.starts_with("book_") => c.book.dispatch(c2, cmd),
-        "history" => {
-            let p = plan_history_checked(&scope_of(cmd)?, field(cmd, "revision")?.as_u64().unwrap_or(0), arr(cmd, "bars")?, usize_of(cmd, "context")?,
-                usize_of(cmd, "want_from_index")?, usize_of(cmd, "want_to_index")?, field(cmd, "exhausted")?.as_bool().unwrap_or(false), &invalid_of(cmd)?)?;
-            Ok(serde_json::to_value(p).unwrap())
-        }
-        "live" => {
-            let p = c.plan_live_checked(s("plugin")?, s("scope_key")?, &scope_of(cmd)?, usize_of(cmd, "context")?, arr(cmd, "tail")?, &invalid_of(cmd)?)?;
-            Ok(serde_json::to_value(p).unwrap())
-        }
-        "commit" => { c.commit(s("plugin")?, field(cmd, "ok")?.as_bool().unwrap_or(false)); Ok(Value::Null) }
-        "reset" => { c.reset(s("plugin")?); Ok(Value::Null) }
         "plugins" => {
             let list = arr(cmd, "list")?.iter().map(|p| {
                 let id = p.get("id").and_then(Value::as_str).ok_or_else(|| invalid("plugin id"))?.to_string();
@@ -97,9 +85,7 @@ pub fn dispatch(c: &mut Coordinator, cmd: &Value) -> Result<Value, CoordError> {
         "idle" => Ok(Value::Bool(c.sched_idle())),
         "inspect" => Ok(c.sched_inspect(s("plugin")?)),
         "running" => Ok(serde_json::json!(c.sched_running())),
-        "stop" => Ok(serde_json::json!({ "events": c.sched_stop() })),
         "approve" => approve(field(cmd, "descriptor")?, cmd.get("params").unwrap_or(&Value::Null), cmd.get("strict").and_then(Value::as_bool).unwrap_or(false)),
-        "map" => Ok(serde_json::to_value(input_bars(arr(cmd, "bars")?)?).unwrap()),
         _ => Err(CoordError { code: "bad_command", message: "unknown cmd".into() }),
     }
 }

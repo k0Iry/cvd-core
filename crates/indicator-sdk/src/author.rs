@@ -49,7 +49,7 @@ struct LiveState {
     cap: usize,
 }
 
-/// Opaque per-handle state (boxed behind the ABI handle).
+/// Opaque per-session plugin state.
 pub struct Instance<P: Indicator<Domain = Bars>> {
     desc: Descriptor,
     params: ParamValues,

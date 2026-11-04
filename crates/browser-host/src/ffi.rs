@@ -64,10 +64,6 @@ pub unsafe extern "C" fn host_validate_module(ptr: usize, len: usize) -> i32 {
     finish(module_check::validate_module(input(ptr, len)))
 }
 #[no_mangle]
-pub extern "C" fn host_session_reset() {
-    st().session = PluginSession::new();
-}
-#[no_mangle]
 pub extern "C" fn host_accept_abi(v: u32) -> i32 {
     let r = st().session.accept_abi(v);
     finish(r)
@@ -136,7 +132,6 @@ enum FenceCmd {
     Issue { instance: u64, scope_key: String, revision: u64, op: u32 },
     Supersede { instance: u64, scope_key: String, revision: u64 },
     Accept { response: Response },
-    Cancel { id: u64 },
     Stats,
 }
 
@@ -166,7 +161,6 @@ pub unsafe extern "C" fn host_fence(ptr: usize, len: usize) -> i32 {
             FenceCmd::Supersede { instance, scope_key, revision } => {
                 Ok(serde_json::json!({ "dropped": f.supersede(instance, &scope_key, revision) }))
             }
-            FenceCmd::Cancel { id } => Ok(serde_json::json!({ "cancelled": f.cancel(id) })),
             FenceCmd::Accept { response } => Ok(serde_json::to_value(f.accept(&response)).unwrap_or_default()),
             FenceCmd::Stats => Ok(serde_json::json!({ "pending": f.pending_len(), "live": f.live_len(), "rejected": f.rejected })),
         }

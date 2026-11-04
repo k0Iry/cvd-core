@@ -80,11 +80,6 @@ impl Controller {
         ids
     }
 
-    /// Cancel one outstanding request (bridge-side timeout); true if it was pending.
-    pub fn cancel(&mut self, id: u64) -> bool {
-        self.pending.remove(&id).is_some()
-    }
-
     pub fn generation(&self, instance: u64) -> Option<u64> {
         self.live.get(&instance).copied()
     }
