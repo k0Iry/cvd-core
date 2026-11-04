@@ -27,13 +27,16 @@ the app is running.
 
 ## Use indicators
 
-1. Download `cvd_indicator_cvd.wasm` and/or `cvd_indicator_flow.wasm` from the
-   [cvd-indicators v0.1.0 release](https://github.com/k0Iry/cvd-indicators/releases/tag/v0.1.0).
-   Your own custom `.wasm` files work the same way.
+1. Download CVD, Flow and Order Book from the current
+   [`dev` pre-release](https://github.com/k0Iry/cvd-indicators/releases/tag/dev)
+   — see the [download guide](https://github.com/k0Iry/cvd-indicators#use).
+   [v0.1.0](https://github.com/k0Iry/cvd-indicators/releases/tag/v0.1.0) predates
+   Order Book. Your own `.wasm` files work the same way.
 2. Open the app, click **Indicators → Import**, choose the file, then enable it.
 
 Your browser remembers imported indicators for this site. If you clear site
-data or switch browser, import them again. No server restart is ever needed.
+data or switch browser, import them again. Updating the server does not update
+them: import a newer `.wasm` to replace one. No server restart is ever needed.
 
 ## Supported markets
 

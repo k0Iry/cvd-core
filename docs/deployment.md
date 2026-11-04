@@ -19,11 +19,14 @@ docker compose up -d --no-deps --no-build cvd &&
 docker compose logs --tail=50 cvd
 ```
 
-After an upgrade, Coinbase USDC contracts automatically backfill from your
-existing closed-minute history, which can take a while; the toolbar shows
-`Source recovering` until it shows `Source live`. Keep the database and outbox — no reset or
-new segment is needed. The server must be able to reach `history.deribit.com`
-(public HTTPS) in addition to the live feeds.
+After an upgrade, Coinbase USDC contracts backfill automatically from that same
+source's own stored history (never old INTX data), which can take a while; the
+toolbar shows `Source recovering` until `Source live`. Keep the database and
+outbox — no reset or new segment is needed. The server must also reach
+`history.deribit.com` (public HTTPS).
+
+Server upgrades do not replace indicators stored in your browser. To get a newer
+Order Book, download and import it again.
 
 <details>
 <summary>Upgrading an older source-build or TOML installation?</summary>
@@ -73,6 +76,8 @@ Check locally on the server:
 ```bash
 curl -fsS http://127.0.0.1:8080/health && echo OK
 ```
+
+`OK` only means the server answers; check the toolbar for each source's status.
 
 Use your existing reverse-proxy URL. Otherwise, run this on your computer and
 keep it open, then visit `http://127.0.0.1:8080`:

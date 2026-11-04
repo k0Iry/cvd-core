@@ -18,10 +18,11 @@ docker compose up -d --no-deps --no-build cvd &&
 docker compose logs --tail=50 cvd
 ```
 
-升级后，Coinbase USDC 合约会从已有的已收盘分钟历史自动回补，可能需要一段时间；
-恢复期间工具栏显示 `Source recovering`，完成后显示 `Source live`。请保留数据库和
-outbox，无需重置或新建分段。服务器除实时行情外，还需能访问公共 HTTPS
-`history.deribit.com`。
+升级后，Coinbase USDC 合约会从该来源自身已存的历史自动回补（不使用旧 INTX 数据），
+可能需要一段时间；工具栏显示 `Source recovering`，完成后显示 `Source live`。请保留
+数据库和 outbox，无需重置或新建分段。服务器还需能访问公共 HTTPS `history.deribit.com`。
+
+升级服务器不会替换浏览器中已导入的指标。需要新版 Order Book 时，请重新下载并导入。
 
 <details>
 <summary>仍在使用旧的源码构建或 TOML 配置？</summary>
@@ -70,6 +71,8 @@ docker compose logs --tail=50 cvd
 ```bash
 curl -fsS http://127.0.0.1:8080/health && echo OK
 ```
+
+`OK` 只表示服务器可访问；各数据源状态以工具栏为准。
 
 已有反向代理时，用原来的网址访问。否则在自己的电脑上运行以下命令并保持终端打开，
 然后访问 `http://127.0.0.1:8080`：
