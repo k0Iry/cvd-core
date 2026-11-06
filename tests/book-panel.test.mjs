@@ -355,3 +355,157 @@ test('row partition keeps the original ask predicate and descending order (group
   assert.equal(bids.kids[0].dataset.side, 'both')
   assert.match(root.kids[1].kids[2].textContent, /bid 100\.05 · spread 0\.10 · ask 100\.15/)
 })
+
+// Page lifecycle (U): Safari suspends a hidden page's Workers while the host
+// deadline timer keeps wall time. The Book panel is its own host driver, so it
+// must stop dispatching and physically cancel its own Worker work while
+// hidden, then recover from the latest valid frame on return (fake host/WS,
+// injected suspend/resume; real Chromium coverage in tests/book-browser.mjs).
+async function lifecycleHarness() {
+  // compute never answers by itself; disable() settles the exact instance
+  // like host-bridge `_kill` (reject `disabled`); kill(.., 'deadline') models
+  // the foreground watchdog.
+  const live = new Map()
+  const kill = (inst, code) => { const w = live.get(inst); if (w) { live.delete(inst); w.reject(Object.assign(new Error(code), { code })) } }
+  const h = await harness({ computeImpl: inst => new Promise((resolve, reject) => { live.set(inst, { resolve, reject }) }) })
+  const disable = h.host.disable
+  h.host.disable = inst => { disable(inst); kill(inst, 'disabled') }
+  const answer = () => { for (const [inst, w] of live) { live.delete(inst); w.resolve(JSON.stringify(rowsFor(h.calls.compute.at(-1).body))) } }
+  return { ...h, live, kill, answer }
+}
+
+test('U: hide cancels the in-flight Book compute without a fault; nothing dispatched hidden; quiet return recomputes the latest frame', async () => {
+  const h = await lifecycleHarness()
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 10)); await flush()
+  assert.equal(h.calls.compute.length, 1)
+  const inst = h.calls.compute[0].inst
+  assert.equal(h.live.size, 1, 'compute in flight')
+  h.panel.suspend(); await flush()
+  assert.deepEqual(h.calls.disable, [inst], 'exact Worker terminated')
+  assert.equal(h.live.size, 0, 'no live unbounded compute after hide')
+  assert.equal(h.panel.state().plugins[0].fault, null, 'planned interruption is not a fault')
+  // Hidden: newer frames are admitted (socket kept) but no Worker work.
+  h.sockets[0].onmessage(frame('BTC', 1, 11)); h.advance(2000); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 12)); await flush()
+  assert.equal(h.calls.compute.length, 1, 'no hidden compute')
+  assert.equal(h.calls.load.length, 1, 'no hidden load')
+  assert.equal(h.sockets.length, 1); assert.equal(h.sockets[0].closed, false)
+  // Return on a quiet source: reload once, recompute from the latest frame.
+  h.panel.resume(); await flush()
+  assert.equal(h.calls.load.length, 2, 'cancelled Worker reloaded once')
+  assert.equal(h.calls.compute.length, 2, 'no new tick needed')
+  assert.equal(h.calls.compute[1].body.seq, 12)
+  h.answer(); await flush()
+  const s = h.panel.state()
+  assert.equal(s.status.state, 'live'); assert.equal(s.plugins[0].fault, null)
+  assert.equal(s.plugins[0].seq, 12); assert.equal(s.plugins[0].rows, 2)
+  assert.equal(h.sockets.length, 1, 'no duplicate socket')
+})
+
+test('U: away beyond the deadline: an expired frame is withdrawn, not relabelled fresh', async () => {
+  const h = await lifecycleHarness()
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 10)); await flush()
+  h.panel.suspend(); await flush()
+  h.advance(6000)   // > 5000 ms compute deadline and > BOOK_STALE_MS
+  h.panel.resume(); await flush()
+  const s = h.panel.state()
+  assert.equal(s.status.state, 'stale'); assert.equal(s.plugins[0].rows, 0)
+  assert.equal(s.plugins[0].fault, null, 'no deadline fault after return')
+  assert.equal(h.calls.compute.length, 1, 'stale frame not recomputed')
+  h.sockets[0].onmessage(frame('BTC', 1, 20)); await flush()
+  assert.equal(h.calls.compute.at(-1).body.seq, 20)
+  h.answer(); await flush()
+  assert.equal(h.panel.state().status.state, 'live'); assert.equal(h.panel.state().plugins[0].seq, 20)
+})
+
+test('U: hidden before first Book work (async init); load starts only on return', async () => {
+  const h = await lifecycleHarness()
+  h.panel.suspend()
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0]?.onmessage(frame('BTC', 1, 5)); await flush()
+  assert.equal(h.calls.load.length, 0, 'no hidden load')
+  assert.equal(h.calls.compute.length, 0, 'no hidden compute')
+  assert.equal(h.panel.state().plugins[0].state, 'starting')
+  h.panel.resume(); await flush()
+  assert.equal(h.calls.load.length, 1)
+  assert.equal(h.calls.compute.length, 1, 'latest frame computed after load')
+})
+
+test('U: in-flight load cancelled on hide is reloaded on return, not reported as a load fault', async () => {
+  const h = await lifecycleHarness()
+  let rejectLoad
+  h.host.load = inst => { h.calls.load.push(inst); return h.calls.load.length === 1 ? new Promise((_, rej) => { rejectLoad = rej }) : Promise.resolve() }
+  const disable = h.host.disable
+  h.host.disable = inst => { disable(inst); rejectLoad?.(Object.assign(new Error('disabled'), { code: 'disabled' })) }
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.panel.suspend(); await flush()
+  assert.equal(h.calls.disable.length, 1, 'loading Worker terminated')
+  assert.equal(h.panel.state().plugins[0].fault, null)
+  assert.equal(h.panel.state().plugins[0].state, 'starting')
+  h.panel.resume(); await flush()
+  assert.equal(h.calls.load.length, 2)
+  h.sockets.at(-1).onmessage(frame('BTC', 1, 3)); await flush()
+  assert.equal(h.calls.compute.length, 1)
+  assert.equal(h.panel.state().plugins[0].fault, null)
+})
+
+test('U: source/params/disable changes while hidden; old completion cannot affect replacements; foreground deadline still faults', async () => {
+  const h = await lifecycleHarness()
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 10)); await flush()
+  h.panel.suspend(); await flush()
+  h.panel.setSource({ ...BTC, symbol: 'ETH' })
+  h.panel.setPlugins([{ ...plugin, loadKey: 'b' }])
+  h.panel.setPlugins([])
+  assert.equal(h.panel.state().status.state, 'off')
+  h.panel.setPlugins([{ ...plugin, loadKey: 'c' }]); await flush()
+  h.sockets.at(-1).onmessage(frame('ETH', 1, 1)); await flush()
+  assert.equal(h.calls.compute.length, 1, 'no hidden compute')
+  assert.equal(h.calls.load.length, 1, 'no hidden load')
+  h.panel.resume(); await flush()
+  assert.equal(h.sockets.filter(s => !s.closed).length, 1)
+  assert.match(h.sockets.at(-1).url, /symbol=ETH/)
+  const c = h.calls.compute.at(-1)
+  assert.equal(c.body.source.symbol, 'ETH')
+  // Genuine FOREGROUND deadline still faults (watchdog unchanged) ...
+  h.kill(c.inst, 'deadline'); await flush()
+  assert.equal(h.panel.state().plugins[0].fault, 'deadline')
+  // ... and a later hide/return does not silently restart it.
+  const loads = h.calls.load.length
+  h.panel.suspend(); h.panel.resume(); await flush()
+  assert.equal(h.panel.state().plugins[0].fault, 'deadline')
+  assert.equal(h.calls.load.length, loads)
+})
+
+test('U: repeated hide/return transitions stay bounded (one socket, one Worker per plugin, no orphan compute)', async () => {
+  const h = await lifecycleHarness()
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  for (let i = 0; i < 20; i++) {
+    h.sockets[0].onmessage(frame('BTC', 1, 100 + i)); await flush()
+    h.panel.suspend(); h.panel.suspend(); h.panel.resume(); h.panel.resume(); await flush()
+  }
+  assert.equal(h.sockets.length, 1)
+  assert.equal(h.live.size, 1, 'exactly the current compute in flight')
+  assert.equal(h.calls.compute.at(-1).body.seq, 119)
+  assert.equal(h.calls.load.length, 21, 'one reload per transition')
+  h.answer(); await flush()
+  assert.equal(h.panel.state().plugins[0].fault, null); assert.equal(h.panel.state().plugins[0].seq, 119)
+})
+
+test('U: recoverable fault before hide + newer frame while hidden + quiet return recomputes the newer frame; fatal stays', async () => {
+  const h = await lifecycleHarness()
+  h.panel.setSource(BTC); h.panel.setPlugins([plugin]); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 10)); await flush()
+  h.kill(h.calls.compute[0].inst, 'plugin_error'); await flush()
+  assert.equal(h.panel.state().plugins[0].fault, 'plugin_error')
+  h.panel.suspend(); await flush()
+  h.sockets[0].onmessage(frame('BTC', 1, 11)); await flush()
+  assert.equal(h.calls.compute.length, 1, 'no hidden compute')
+  h.panel.resume(); await flush()
+  assert.equal(h.calls.compute.length, 2, 'newer frame recomputed without a new tick')
+  assert.equal(h.calls.compute[1].body.seq, 11)
+  h.answer(); await flush()
+  assert.equal(h.panel.state().plugins[0].fault, null); assert.equal(h.panel.state().plugins[0].seq, 11)
+})

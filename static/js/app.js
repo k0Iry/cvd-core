@@ -5,9 +5,9 @@
 // view. Descriptor/renderer/readout presentation lives in ./chart.js.
 import * as LightweightCharts from "lightweight-charts"
 import { createDualRangeHistogramSeries } from "@tradingview/lwc-plugin-dual-range-histogram-series"
-import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-16"
-import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-16"
-import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-16"
+import { activeGroupOutput, buildRegistry, readoutText, createOutputRenderer, createTimeLabelFormatters, mergeHistoryQuality, qualityDisplay, sourceStatusDisplay, PRICE_UP_COLOR, PRICE_DOWN_COLOR, CURRENT_PRICE_COLOR, barClose, candlePoint } from "./chart.js?v=local-wasm-17"
+import { createBookPanel, isBookDescriptor } from "./book-panel.js?v=local-wasm-17"
+import { WasmPluginHost, createCoordinator, createLocalCompute, openPluginDb, checkImportFile, classifyImport, sha256Hex, sameBytes, importMessage, validRecord, parseParamInput } from "/wasm-host/host-bridge.js?v=local-wasm-17"
 
 // ============================================================ configuration
 const CONFIG = {
@@ -2547,9 +2547,12 @@ screenshotBtn.onclick = () => downloadChartScreenshot()
 // calls and issue none (Safari suspends Workers while the deadline timer keeps
 // wall time); visible -> rebuild from the latest demand without a new tick.
 function syncLocalComputeLifecycle() {
-    if (!localCompute) return
-    if (visualWorkSuspended()) localCompute.suspend()
-    else localCompute.resume()
+    // The Book panel is a separate driver of the same host: same rule.
+    for (const d of [bookPanel, localCompute]) {
+        if (!d) continue
+        if (visualWorkSuspended()) d.suspend()
+        else d.resume()
+    }
 }
 
 document.addEventListener("visibilitychange", () => {

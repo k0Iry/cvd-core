@@ -291,6 +291,52 @@ try {
     const tfBack = { st: await mailbox({ op: 'state' }), sockets: sockets.filter(u => u.includes('/book')).length, bs: await bookState() }
     check('tf_back_keeps_book_subscription', tfBack.sockets === tfBefore.sockets && tfBack.st.connects.BTCUSDT === tfBefore.st.connects.BTCUSDT && tfBack.bs.generation === tfBefore.gen && tfBack.bs.status.state === 'live', JSON.stringify([tfBack.sockets, tfBack.st.connects, tfBack.bs.generation]))
     btcPump = false; await pumpBtc
+    // U. Page lifecycle for the Book driver. SYNTHETIC visibility injection
+    // (overridden document.hidden + visibilitychange) in headless Chromium:
+    // NOT Safari emulation or Safari acceptance. The hide fires synchronously
+    // right after a real Book compute was posted to its Worker (in flight).
+    {
+      const H = `${L}.host()`
+      const bookWorkers = `[...${H}.instances.keys()].filter(i => i >= 2 ** 29).length`
+      const bookBusy = `[...${H}.waiters.values()].some(w => w.instance >= 2 ** 29)`
+      const setHid = v => `(globalThis.__hid = ${v}, document.dispatchEvent(new Event('visibilitychange')), true)`
+      await evaluate(`(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => globalThis.__hid === true })
+        const p = globalThis.__wpm = { n: 0 }; Worker.prototype.__realPost ??= Worker.prototype.postMessage
+        Worker.prototype.postMessage = function (...a) { p.n++; return Worker.prototype.__realPost.apply(this, a) }
+        const h = ${H}, real = h.compute; globalThis.__armHide = true
+        h.compute = function (inst, ...a) { const r = real.call(this, inst, ...a)
+          if (inst >= 2 ** 29 && globalThis.__armHide) { globalThis.__armHide = false; globalThis.__busyAtHide = ${bookBusy}; ${setHid(true)} }
+          return r }
+        return true })()`)
+      const sockets0 = sockets.filter(u => u.includes('/book')).length, c0 = (await mailbox({ op: 'state' })).connects.BTCUSDT
+      const step = async () => { await mailbox({ op: 'event', sym: 'BTCUSDT', U: btcU + 1, u: btcU + 1, pu: btcU, b: [], a: [] }); btcU++ }
+      for (let i = 0; i < 50 && !(await evaluate('document.hidden')); i++) { await step(); await sleep(100) }
+      const atHide = await evaluate(`({ hidden: document.hidden, busyAtHide: globalThis.__busyAtHide, busy: ${bookBusy}, workers: ${bookWorkers}, posts: __wpm.n })`)
+      check('lifecycle_book_hidden_with_compute_in_flight', atHide.hidden === true && atHide.busyAtHide === true, JSON.stringify(atHide))
+      check('lifecycle_book_inflight_worker_terminated_on_hide', atHide.busy === false && atHide.workers === 0, JSON.stringify(atHide))
+      // Away > 5000 ms compute deadline while the feed keeps ticking.
+      for (let i = 0; i < 10; i++) { await step(); await sleep(600) }
+      const hid = await evaluate(`({ posts: __wpm.n, workers: ${bookWorkers}, bs: ${B}.state(), bars: ${L}.compute().suspended() })`)
+      check('lifecycle_book_no_worker_work_hidden', hid.posts === atHide.posts && hid.workers === 0 && hid.bs.seq === btcU, JSON.stringify({ a: atHide.posts, h: hid.posts, w: hid.workers, seq: hid.bs.seq, btcU }))
+      check('lifecycle_book_no_fault_hidden', hid.bs.plugins[0].fault === null && hid.bars === true, JSON.stringify(hid.bs.plugins[0]))
+      // Return on a now-quiet source: latest frame recomputed without a new tick.
+      await evaluate(setHid(false))
+      await waitFor(`${B}.state().plugins[0].seq === ${btcU} && ${B}.state().plugins[0].rows > 0`, 10000).catch(() => {})
+      const back = await bookState(); d = await dom()
+      check('lifecycle_book_quiet_return_latest_frame', back.plugins[0].seq === btcU && back.status.state === 'live' && back.plugins[0].fault === null && JSON.stringify(d.rows) === JSON.stringify(want), JSON.stringify({ seq: back.plugins[0].seq, btcU, st: back.status, f: back.plugins[0].fault }))
+      // > 5000 ms more with the feed ticking: any late reply/deadline of the
+      // cancelled call would land here. (Expired-frame withdrawal on a quiet
+      // return is covered in tests/book-panel.test.mjs; keeping the replay
+      // feed alive here preserves the following sections' server state.)
+      for (let i = 0; i < 10; i++) { await step(); await sleep(600) }
+      await waitFor(`${B}.state().plugins[0].seq === ${btcU}`, 10000).catch(() => {})
+      const late = await evaluate(`({ bs: ${B}.state(), workers: ${bookWorkers}, bars: ${L}.compute().suspended() })`); d = await dom()
+      check('lifecycle_book_no_late_fault_keeps_advancing', late.bs.plugins[0].fault === null && late.bs.status.state === 'live' && late.bs.plugins[0].seq === btcU && JSON.stringify(d.rows) === JSON.stringify(want) && late.workers === 1, JSON.stringify({ st: late.bs.status, f: late.bs.plugins[0].fault, seq: late.bs.plugins[0].seq, btcU, w: late.workers }))
+      const st1 = await mailbox({ op: 'state' })
+      check('lifecycle_book_one_socket_one_upstream', sockets.filter(u => u.includes('/book')).length === sockets0 && st1.connects.BTCUSDT === c0 && JSON.stringify(st1.active) === JSON.stringify([['binance/usdm/BTC', 1]]), JSON.stringify([sockets0, st1.connects, st1.active]))
+      check('lifecycle_bars_driver_resumed_healthy', late.bars === false && (!LEGACY || await evaluate(valuesReady)), String(late.bars))
+      await evaluate(`(delete ${H}.compute, true)`)
+    }
     // C. pu gap => server withdraws (stale), resyncs with a new generation.
     await mailbox({ op: 'event', sym: 'BTCUSDT', U: btcU + 1, u: btcU + 5, pu: btcU, b: [['29999.80', '1.25']], a: [] })
     await waitFor(`${B}.state().seq === ${btcU + 5}`, 10000)

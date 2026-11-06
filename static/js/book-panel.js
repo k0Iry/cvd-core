@@ -45,6 +45,18 @@ export function createBookPanel({ host, coord, container, wsUrl, bookSupported =
     let views = new Map()
     const counters = { frames: 0, computes: 0, fenced: 0, renders: 0, rowBuilds: 0 }
     let lastInput = null
+    // Page lifecycle (tab hidden/pagehide). Safari suspends the page and its
+    // Workers while the host deadline timer keeps wall time, so a call in
+    // flight across a tab-away would be reported `deadline` on return although
+    // nothing hung. While suspended this driver issues no load/compute: its
+    // own healthy Workers are terminated (host.disable) and any in-flight
+    // token is retired in the coordinator first, so the late rejection is
+    // fenced (never a fault). The /book socket stays (network, like bars), so
+    // the coordinator keeps the latest admitted frame and its receipt age.
+    // resume() reloads those Workers; `loaded` replans from that latest frame
+    // (no new tick needed); an expired frame is withdrawn by the existing stale
+    // rules, never relabelled fresh. Foreground deadlines and faults unchanged.
+    let suspended = false
     const book = (cmd, args) => coord.book(cmd, args)
 
     const active = () => plugins.size > 0
@@ -140,7 +152,9 @@ export function createBookPanel({ host, coord, container, wsUrl, bookSupported =
         for (const a of actions ?? []) {
             const p = plugins.get(a.plugin)
             const f = lastFrame
-            if (!p || !f || f.seq !== a.seq || f.generation !== a.generation) { complete(a.plugin, a.token, "superseded"); continue }
+            // Hidden, or the Worker is (re)loading: no compute; `loaded`
+            // replans from the latest frame.
+            if (!p || !f || suspended || p.reload || f.seq !== a.seq || f.generation !== a.generation) { complete(a.plugin, a.token, "superseded"); continue }
             p.inflight.set(a.token, f)
             counters.computes++
             // Bounded diagnostic: level counts/bytes handed to the Worker and
@@ -175,9 +189,14 @@ export function createBookPanel({ host, coord, container, wsUrl, bookSupported =
     }
 
     async function start(p) {
+        if (suspended) { p.reload = true; return }   // loaded by resume()
+        const seq = p.loadSeq = (p.loadSeq ?? 0) + 1
+        p.reload = true
         let ok = true, code = null, pub = null
         try { await host.load(p.instance, p.spec.bytes, JSON.stringify(p.spec.params ?? {})) } catch (err) { ok = false; code = err?.code || "load_failed"; pub = publicCode(err) }
         if (plugins.get(p.id) !== p) { host.disable(p.instance); return }
+        if (p.loadSeq !== seq) return   // cancelled by suspend(); resume() reloads
+        p.reload = false
         const r = book("loaded", { plugin: p.id, load_key: p.loadKey, ok, error: code, public_code: pub })
         if (r.admit) run(r.actions)
         render()
@@ -216,6 +235,31 @@ export function createBookPanel({ host, coord, container, wsUrl, bookSupported =
             if (host.supersede(p.instance, `book:${srcKey(next)}`, 0) > 0) start(p)
         }
         if (active()) connect(); else render()
+    }
+
+    function suspend() {
+        if (suspended) return
+        suspended = true
+        for (const p of plugins.values()) {
+            // A fatal fault is left as is (no silent restart on return). A
+            // recoverable one keeps the coordinator's retry-on-newer-frame
+            // policy: hidden frames are not computed, so its `loaded` replans.
+            if (!p.reload && views.get(p.id)?.fatal) continue
+            // Retire in-flight tokens now: the coordinator drops them, so the
+            // `disabled` rejection below arrives as a fenced stale token.
+            for (const token of [...p.inflight.keys()]) complete(p.id, token, "superseded", null, p)
+            p.loadSeq = (p.loadSeq ?? 0) + 1
+            p.reload = true
+            try { host.disable(p.instance) } catch (_) {}
+        }
+        render()
+    }
+
+    function resume() {
+        if (!suspended) return
+        suspended = false
+        for (const p of plugins.values()) if (p.reload) start(p)
+        render()
     }
 
     function venueLabel(f) {
@@ -358,6 +402,8 @@ export function createBookPanel({ host, coord, container, wsUrl, bookSupported =
     return {
         setPlugins,
         setSource,
+        suspend,
+        resume,
         destroy() { disconnect(); if (viewTimer) { timers.clearTimeout(viewTimer); viewTimer = null } for (const p of plugins.values()) host.disable(p.instance); plugins.clear(); book("plugins", { list: [] }); render() },
         state: () => ({ status: { ...status }, source: source && { ...source }, epoch, connected: !!ws, generation: lastFrame?.generation ?? null, seq: lastFrame?.seq ?? null,
             plugins: [...plugins.values()].map(p => {
