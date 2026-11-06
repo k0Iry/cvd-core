@@ -653,3 +653,171 @@ async fn spot_first_heartbeat_origin_is_not_a_retained_obligation() {
     drop(tx);
     tokio::time::timeout(Duration::from_secs(5), w).await.unwrap().unwrap();
 }
+
+// ---- Cleanup characterization: last-attempt cause and shared input accounting ----
+
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    Hole,
+    Empty,
+    Invalid,
+    Transport,
+}
+
+/// Run one spot worker (cursor 100, gap to buffered 104) whose history answers
+/// `first` once and `rest` afterwards; return the first bounded episode's
+/// outcome: Ok(detail) when it backs off as transient, Err(detail) when terminal.
+async fn spot_first_episode(first: Answer, rest: Answer) -> std::result::Result<String, String> {
+    let state = seeded().await;
+    let shard = crate::pick_shard(&state, Exchange::Coinbase, Market::Spot, Symbol::Btc);
+    let (tx, rx) = mpsc::channel(RECOVERY_CHANNEL_CAPACITY);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let w = tokio::spawn(run_spot_worker_with_fetch(state.clone(), Symbol::Btc, rx, move |_| {
+        let answer = if c.fetch_add(1, SeqCst) == 0 { first } else { rest };
+        async move {
+            match answer {
+                Answer::Hole => Ok([100, 101, 103, 104].into_iter().map(t).collect()),
+                Answer::Empty => Ok(Vec::new()),
+                Answer::Invalid => Err(anyhow::anyhow!("invalid replay trade side")),
+                Answer::Transport => Err(reqwest::Client::new().get("http://127.0.0.1:1/").send().await.unwrap_err().into()),
+            }
+        }
+    }));
+    enqueue_spot(&state, Symbol::Btc, &tx, SpotInput::Trade(t(104))).await;
+    let out = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let d = shard.recovery.read().await.clone();
+            let detail = d.detail.clone().unwrap_or_default();
+            if d.needs_backfill() {
+                break Err(detail);
+            }
+            assert_ne!(d.state, "live");
+            if detail.contains("temporarily unavailable") {
+                break Ok(detail);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("first bounded episode did not end");
+    assert!(calls.load(SeqCst) <= RECOVERY_ATTEMPTS, "unchanged attempt cap");
+    assert_eq!(shard.engine.lock().await.last_trade_id.as_deref(), Some("100"));
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(5), w).await.unwrap().unwrap();
+    out
+}
+
+/// Only the last attempt's cause decides the episode: later results override
+/// earlier ones in both directions, and existing diagnostics are unchanged.
+#[tokio::test]
+async fn spot_last_attempt_cause_overrides_earlier_attempts() {
+    use Answer::*;
+    let hole = "spot history has not closed the ID gap: Coinbase spot handoff has a trade ID gap";
+    for (first, rest, terminal, needle) in [
+        (Hole, Empty, false, "public history returned no trades"),
+        (Empty, Hole, true, hole),
+        (Hole, Invalid, true, "history response error: invalid replay trade side"),
+        (Invalid, Empty, false, "public history returned no trades"),
+        (Invalid, Transport, false, "history transport error:"),
+        (Transport, Hole, true, hole),
+    ] {
+        let out = spot_first_episode(first, rest).await;
+        let detail = match (&out, terminal) {
+            (Err(d), true) => {
+                assert!(d.starts_with("spot recovery budget exhausted after"), "{first:?}/{rest:?}: {d}");
+                d
+            }
+            (Ok(d), false) => d,
+            _ => panic!("{first:?}/{rest:?}: unexpected {out:?}"),
+        };
+        assert!(detail.contains(needle), "{first:?}/{rest:?}: {detail}");
+        tokio::time::resume();
+    }
+}
+
+/// A heartbeat observed in any waiting phase (fetch in flight, inter-attempt
+/// pause, outage cooldown) advances the known frontier: recovery continues
+/// through it before live, without a new trade.
+#[tokio::test]
+async fn spot_heartbeat_in_each_waiting_phase_extends_required_frontier() {
+    for phase in ["in-flight", "pause", "cooldown"] {
+        let state = seeded().await;
+        let shard = crate::pick_shard(&state, Exchange::Coinbase, Market::Spot, Symbol::Btc);
+        let up = Arc::new(Upstream {
+            down: AtomicBool::new(true),
+            hole: None,
+            top: AtomicUsize::new(110),
+            calls: AtomicUsize::new(0),
+            inflight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let (tx, rx) = mpsc::channel(RECOVERY_CHANNEL_CAPACITY);
+        let w = spawn_worker(state.clone(), up.clone(), rx);
+        enqueue_spot(&state, Symbol::Btc, &tx, SpotInput::Trade(t(103))).await;
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let detail = shard.recovery.read().await.detail.clone().unwrap_or_default();
+                let (calls, inflight) = (up.calls.load(SeqCst), up.inflight.load(SeqCst));
+                let ready = match phase {
+                    "in-flight" => inflight == 1,
+                    "pause" => calls == 1 && inflight == 0 && detail.contains("history transport error"),
+                    _ => detail.contains("episode 1 ended"),
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{phase}: phase not reached"));
+        enqueue_spot(&state, Symbol::Btc, &tx, SpotInput::Heartbeat(110)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        up.down.store(false, SeqCst);
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                let d = shard.recovery.read().await.clone();
+                assert!(!d.needs_backfill(), "{phase}: {:?}", d.detail);
+                if d.state == "live" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{phase}: never live"));
+        assert_eq!(shard.engine.lock().await.last_trade_id.as_deref(), Some("110"), "{phase}: live below heartbeat frontier");
+        assert_eq!(up.peak.load(SeqCst), 1);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), w).await.unwrap().unwrap();
+        tokio::time::resume();
+    }
+}
+
+/// The coordinator's producers carry the hole/transient cause as a type, with
+/// their existing diagnostic text unchanged.
+#[test]
+fn spot_coordinator_types_hole_apart_from_transient_retries() {
+    let anchor = || RecoveryAnchor { cursor: Some("100".into()), from_ms: 0 };
+    let mut c = RecoveryCoordinator::new(anchor(), 8);
+    c.set_spot_target(104);
+    c.push_ws(t(104)).unwrap();
+    match c.observe_rest([100, 101, 103, 104].into_iter().map(t).collect()) {
+        RecoveryDecision::Hole(d) => {
+            assert_eq!(d, "spot history has not closed the ID gap: Coinbase spot handoff has a trade ID gap")
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut c = RecoveryCoordinator::new(anchor(), 8);
+    c.set_spot_target(105);
+    c.push_ws(t(103)).unwrap();
+    match c.observe_rest((100..=103).map(t).collect()) {
+        RecoveryDecision::Retry(d) => assert_eq!(d, "spot history has not reached required-through ID 105"),
+        other => panic!("{other:?}"),
+    }
+    let mut c = RecoveryCoordinator::new(anchor(), 8);
+    c.push_ws(t(104)).unwrap();
+    assert!(matches!(c.observe_rest(Vec::new()), RecoveryDecision::Retry(d) if d == "public history returned no trades"));
+    assert!(matches!(c.observe_rest(vec![t(99)]), RecoveryDecision::Retry(d) if d == "public history is still behind the recovery cursor"));
+}

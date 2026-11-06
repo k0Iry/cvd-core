@@ -28,9 +28,6 @@ pub async fn enqueue_spot(state: &AppState, symbol: Symbol, sender: &mpsc::Sende
     }
 }
 
-/// Prefix of the coordinator's Retry detail for an authoritative ID hole.
-const SPOT_HOLE: &str = "spot history has not closed the ID gap";
-
 /// Why the last attempt of a bounded episode did not finish. Only `Transient`
 /// episodes back off and retry indefinitely; the others fail closed as before.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,6 +123,19 @@ fn owes_recovery(engine: &crate::ingestion::SymbolState, known: u64) -> bool {
 fn note_known(known: &mut u64, trade: &Trade) {
     if let Ok(id) = trade.id.parse::<u64>() {
         *known = (*known).max(id);
+    }
+}
+
+/// Account one input received while a recovery waits (fetch in flight,
+/// inter-attempt pause or outage cooldown): every observation advances the
+/// known frontier; a trade is also buffered with coalescing.
+fn observe_waiting(known: &mut u64, coordinator: &mut RecoveryCoordinator, input: SpotInput) {
+    match input {
+        SpotInput::Trade(trade) => {
+            note_known(known, &trade);
+            coordinator.push_ws_coalescing(trade)
+        }
+        SpotInput::Heartbeat(id) => *known = (*known).max(id),
     }
 }
 
@@ -260,11 +270,7 @@ async fn spot_worker<F, Fut>(
                 let result = loop {
                     tokio::select! {
                         input = rx.recv() => match input {
-                            Some(SpotInput::Trade(trade)) => {
-                                note_known(known, &trade);
-                                coordinator.push_ws_coalescing(trade)
-                            }
-                            Some(SpotInput::Heartbeat(id)) => *known = (*known).max(id),
+                            Some(input) => observe_waiting(known, &mut coordinator, input),
                             None => return, // socket closed: cancel pending REST, retain committed cursor
                         },
                         result = &mut request => break Some(result),
@@ -276,69 +282,67 @@ async fn spot_worker<F, Fut>(
                     last_error = "history request outlived the episode deadline".into();
                     break 'attempts;
                 };
-                let decision = match result {
+                let (cause, detail) = match result {
                     Ok(rows) => {
                         diagnostics.rest_count = rows.len();
                         diagnostics.rest_earliest_ms = rows.iter().map(|t| t.timestamp_ms).min();
                         diagnostics.rest_latest_ms = rows.iter().map(|t| t.timestamp_ms).max();
-                        coordinator.observe_batch(rows, None)
-                    }
-                    Err(error) => {
-                        end = classify_fetch_error(&error);
-                        RecoveryDecision::Retry(format!(
-                            "history {} error: {error}",
-                            if end == AttemptEnd::Transient { "transport" } else { "response" }
-                        ))
-                    }
-                };
-                match decision {
-                    RecoveryDecision::Ready(trades) => {
-                        if let Err(error) = validate_spot_handoff(&anchor, &trades) {
-                            reject_source(&state, exchange, market, symbol, error.to_string()).await;
-                            return;
-                        }
-                        if shard.recovery.read().await.needs_backfill() {
-                            return;
-                        }
-                        for trade in &trades {
-                            if let Err(error) = ingest_trade(&state, exchange, market, symbol, trade.clone()).await {
-                                reject_source(&state, exchange, market, symbol, format!("spot replay failed: {error}"))
-                                    .await;
+                        match coordinator.observe_batch(rows, None) {
+                            RecoveryDecision::Ready(trades) => {
+                                if let Err(error) = validate_spot_handoff(&anchor, &trades) {
+                                    reject_source(&state, exchange, market, symbol, error.to_string()).await;
+                                    return;
+                                }
+                                if shard.recovery.read().await.needs_backfill() {
+                                    return;
+                                }
+                                for trade in &trades {
+                                    if let Err(error) =
+                                        ingest_trade(&state, exchange, market, symbol, trade.clone()).await
+                                    {
+                                        reject_source(
+                                            &state,
+                                            exchange,
+                                            market,
+                                            symbol,
+                                            format!("spot replay failed: {error}"),
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                                shard.engine.lock().await.remember_replay(&trades);
+                                recovered = true;
+                                break;
+                            }
+                            RecoveryDecision::NeedsBackfill(detail) => {
+                                reject_source(&state, exchange, market, symbol, detail).await;
                                 return;
                             }
-                        }
-                        shard.engine.lock().await.remember_replay(&trades);
-                        recovered = true;
-                        break;
-                    }
-                    RecoveryDecision::NeedsBackfill(detail) => {
-                        reject_source(&state, exchange, market, symbol, detail).await;
-                        return;
-                    }
-                    RecoveryDecision::Retry(detail) => {
-                        if detail.starts_with(SPOT_HOLE) {
-                            end = AttemptEnd::Hole;
-                        } else if !detail.starts_with("history ") {
-                            end = AttemptEnd::Transient; // lagging/empty/behind-cursor history
-                        }
-                        last_error = detail.chars().take(300).collect();
-                        diagnostics.detail = Some(detail);
-                        diagnostics.buffered_trades = coordinator.buffered_len();
-                        if !store_recovery(&shard, diagnostics.clone()).await {
-                            return;
+                            RecoveryDecision::Hole(detail) => (AttemptEnd::Hole, detail),
+                            // Lagging/empty/behind-cursor history.
+                            RecoveryDecision::Retry(detail) => (AttemptEnd::Transient, detail),
                         }
                     }
+                    Err(error) => {
+                        let cause = classify_fetch_error(&error);
+                        let kind = if cause == AttemptEnd::Transient { "transport" } else { "response" };
+                        (cause, format!("history {kind} error: {error}"))
+                    }
+                };
+                end = cause;
+                last_error = detail.chars().take(300).collect();
+                diagnostics.detail = Some(detail);
+                diagnostics.buffered_trades = coordinator.buffered_len();
+                if !store_recovery(&shard, diagnostics.clone()).await {
+                    return;
                 }
                 let sleep = tokio::time::sleep(RECOVERY_RETRY_DELAY);
                 tokio::pin!(sleep);
                 loop {
                     tokio::select! {
                         input = rx.recv() => match input {
-                            Some(SpotInput::Trade(trade)) => {
-                                note_known(known, &trade);
-                                coordinator.push_ws_coalescing(trade)
-                            }
-                            Some(SpotInput::Heartbeat(id)) => *known = (*known).max(id),
+                            Some(input) => observe_waiting(known, &mut coordinator, input),
                             None => return,
                         },
                         _ = &mut sleep => break,
@@ -381,11 +385,7 @@ async fn spot_worker<F, Fut>(
             loop {
                 tokio::select! {
                     input = rx.recv() => match input {
-                        Some(SpotInput::Trade(trade)) => {
-                                note_known(known, &trade);
-                                coordinator.push_ws_coalescing(trade)
-                            }
-                        Some(SpotInput::Heartbeat(id)) => *known = (*known).max(id),
+                        Some(input) => observe_waiting(known, &mut coordinator, input),
                         None => return,
                     },
                     _ = tokio::time::sleep_until(until) => break,

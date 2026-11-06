@@ -88,7 +88,11 @@ pub struct RecoveryAnchor {
 
 #[derive(Debug)]
 pub enum RecoveryDecision {
+    /// History is lagging, empty, behind the cursor or short of the known
+    /// required-through ID: transient, try again.
     Retry(String),
+    /// History overlapped but skipped an ID: an authoritative hole.
+    Hole(String),
     Ready(Vec<Trade>),
     NeedsBackfill(String),
 }
@@ -184,7 +188,10 @@ impl RecoveryCoordinator {
 
         let buffered_ids: HashSet<&str> = self.buffer.iter().map(|trade| trade.id.as_str()).collect();
         let buffered_overlap = rest.iter().rev().find(|trade| buffered_ids.contains(trade.id.as_str())).cloned();
-        let target_overlap = self.spot_target.and_then(|id| rest.iter().find(|t| t.id == id.to_string()).cloned());
+        let target_overlap = self.spot_target.and_then(|id| {
+            let id = id.to_string();
+            rest.iter().find(|t| t.id == id).cloned()
+        });
         // Take the later proven overlap: a stale lower buffered duplicate must not
         // cut the handoff below the known required-through ID.
         let overlap = match (buffered_overlap, target_overlap) {
@@ -210,7 +217,7 @@ impl RecoveryCoordinator {
         handoff.retain(|trade| seen.insert(trade.id.clone()));
         if self.spot_target.is_some() {
             if let Err(error) = validate_spot_handoff(&self.anchor, &handoff) {
-                return RecoveryDecision::Retry(format!("spot history has not closed the ID gap: {error}"));
+                return RecoveryDecision::Hole(format!("spot history has not closed the ID gap: {error}"));
             }
         }
         // The handoff must reach the known required-through ID (the trigger, or the

@@ -141,7 +141,7 @@ async fn get(
             },
         );
     }
-    let response: Value = response.json().await.map_err(|e| if e.is_decode() { fatal(e) } else { retry(e) })?;
+    let mut response: Value = response.json().await.map_err(|e| if e.is_decode() { fatal(e) } else { retry(e) })?;
     if response["jsonrpc"] != "2.0" {
         return Err(fatal("invalid DRB RPC version"));
     }
@@ -162,7 +162,9 @@ async fn get(
             },
         );
     }
-    response.get("result").cloned().ok_or_else(|| fatal("missing DRB RPC result"))
+    // Move the owned result out (an explicit null is still returned for the
+    // caller's validation; only an absent member is an error).
+    response.as_object_mut().and_then(|o| o.remove("result")).ok_or_else(|| fatal("missing DRB RPC result"))
 }
 pub(super) async fn metadata(
     client: &reqwest::Client,
@@ -200,18 +202,35 @@ pub(super) async fn latest(
 
 #[derive(Debug)]
 pub(super) enum HistoryError {
-    Retry(String),
+    Retry(RetryDetail),
     Fatal(String),
+}
+/// A retryable failure. `hole` marks the authoritative tape itself skipping a
+/// sequence (not an outage): after the unchanged bounded episode the worker
+/// fails closed. The message is diagnostic output only.
+#[derive(Debug)]
+pub(super) struct RetryDetail {
+    pub(super) message: String,
+    pub(super) hole: bool,
+}
+impl std::fmt::Display for RetryDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 impl std::fmt::Display for HistoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Retry(s) | Self::Fatal(s) => write!(f, "{s}"),
+            Self::Retry(s) => write!(f, "{s}"),
+            Self::Fatal(s) => write!(f, "{s}"),
         }
     }
 }
 fn retry(e: impl std::fmt::Display) -> HistoryError {
-    HistoryError::Retry(e.to_string())
+    HistoryError::Retry(RetryDetail { message: e.to_string(), hole: false })
+}
+fn hole(e: impl std::fmt::Display) -> HistoryError {
+    HistoryError::Retry(RetryDetail { message: e.to_string(), hole: true })
 }
 fn fatal(e: impl std::fmt::Display) -> HistoryError {
     HistoryError::Fatal(e.to_string())
@@ -335,7 +354,7 @@ pub(super) async fn history_until(
                 return Err(fatal("page outside requested sequence range or non-progressing"));
             }
             if seq != next {
-                return Err(retry(format!("unproven sequence {next} before {seq}")));
+                return Err(hole(format!("unproven sequence {next} before {seq}")));
             }
             if previous_ms.is_some_and(|ms| trade.timestamp_ms < ms) {
                 return Err(fatal("sequence timestamps reversed"));
@@ -540,19 +559,13 @@ pub(super) async fn archive_chunk(
                 break; // deliver the validated prefix; the next attempt retries the hole
             }
             let upto = rows.keys().next().map_or(end, |s| s - 1);
-            return Err(retry(format!("archive missing sequence interval {next}-{upto}")));
+            return Err(hole(format!("archive missing sequence interval {next}-{upto}")));
         }
         if previous_ms.is_some_and(|ms| target_ms - ms <= ARCHIVE_AFTER_MS) {
             break; // back inside the primary window: hand off to the primary gateway
         }
     }
     Ok(output)
-}
-
-/// Retry details where the authoritative tape itself skipped a sequence. These
-/// are not outages: after the unchanged bounded episode the source fails closed.
-fn is_hole(detail: &str) -> bool {
-    detail.starts_with("unproven sequence ") || detail.starts_with("archive missing sequence interval ")
 }
 
 fn same(a: &Trade, b: &Trade) -> bool {
@@ -586,6 +599,33 @@ pub(super) fn drop_below_high_water(pending: &mut BTreeMap<u64, Trade>) {
     if let Some(&below) = pending.range(..high).next_back().map(|(k, _)| k) {
         pending.remove(&below);
     }
+}
+
+/// Admit one WS trade received while a recovery waits (request in flight,
+/// retry pause or outage cooldown): validate its sequence, remember its
+/// identity, buffer it above the episode cursor unless it duplicates a pending
+/// trade, and keep the buffer bounded below the high-water mark. `Err` is the
+/// rejection detail; terminal checks and the rejection itself stay with the caller.
+fn admit_waiting(
+    seen: &mut BTreeMap<u64, Trade>,
+    pending: &mut BTreeMap<u64, Trade>,
+    cursor: Option<u64>,
+    t: Trade,
+    conflict: &str,
+) -> std::result::Result<(), String> {
+    let n: u64 = t.id.parse().map_err(|_| "invalid buffered sequence".to_string())?;
+    remember(seen, n, &t).map_err(|error| error.to_string())?;
+    if let Some(old) = pending.get(&n) {
+        if !same(old, &t) {
+            return Err(format!("{conflict} {n}"));
+        }
+    } else if cursor.is_none_or(|c| n > c) {
+        pending.insert(n, t);
+    }
+    if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY {
+        drop_below_high_water(pending);
+    }
+    Ok(())
 }
 
 pub(crate) async fn worker(state: Arc<AppState>, symbol: Symbol, rx: mpsc::Receiver<Trade>, base: String, size: f64) {
@@ -806,11 +846,10 @@ async fn run_worker(
                         incoming=rx.recv()=> match incoming {
                             Some(t)=> {
                                 if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await { return; }
-                                let n: u64=match t.id.parse() {Ok(n)=>n,Err(_)=>{crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,"invalid buffered sequence".into()).await;return;}};
-                                if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
-                                if let Some(old)=pending.get(&n) { if !same(old,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting buffered sequence {n}")).await;return;} }
-                                else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                                if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { drop_below_high_water(pending); }
+                                if let Err(detail) = admit_waiting(&mut seen, pending, cursor, t, "conflicting buffered sequence") {
+                                    crate::recovery::reject_source(&state, Exchange::Coinbase, market, symbol, detail).await;
+                                    return;
+                                }
                             },
                             None=>return, // no partial replay, join happens at caller
                         },
@@ -883,9 +922,9 @@ async fn run_worker(
                         return;
                     }
                     Some(Err(HistoryError::Retry(e))) => {
-                        hole = is_hole(&e);
-                        last_error = e.chars().take(300).collect();
-                        diag.detail = Some(e);
+                        hole = e.hole;
+                        last_error = e.message.chars().take(300).collect();
+                        diag.detail = Some(e.message);
                         if !crate::recovery::store_recovery(&shard, diag.clone()).await {
                             return;
                         }
@@ -901,11 +940,10 @@ async fn run_worker(
                     tokio::select! {
                         incoming=rx.recv()=> if let Some(t)=incoming {
                             if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await { return; }
-                            let n: u64=match t.id.parse(){Ok(n)=>n,Err(_)=>{crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,"invalid buffered sequence".into()).await;return;}};
-                            if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
-                            if let Some(old)=pending.get(&n) {if !same(old,&t){crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting sequence {n}")).await;return;}}
-                            else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { drop_below_high_water(pending); }
+                            if let Err(detail) = admit_waiting(&mut seen, pending, cursor, t, "conflicting sequence") {
+                                crate::recovery::reject_source(&state, Exchange::Coinbase, market, symbol, detail).await;
+                                return;
+                            }
                         } else {return},
                         _=tokio::time::sleep_until(pause)=>break,
                     }
@@ -949,11 +987,10 @@ async fn run_worker(
                     tokio::select! {
                         incoming=rx.recv()=> if let Some(t)=incoming {
                             if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await { return; }
-                            let n: u64=match t.id.parse(){Ok(n)=>n,Err(_)=>{crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,"invalid buffered sequence".into()).await;return;}};
-                            if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
-                            if let Some(old)=pending.get(&n) {if !same(old,&t){crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting sequence {n}")).await;return;}}
-                            else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { drop_below_high_water(pending); }
+                            if let Err(detail) = admit_waiting(&mut seen, pending, cursor, t, "conflicting sequence") {
+                                crate::recovery::reject_source(&state, Exchange::Coinbase, market, symbol, detail).await;
+                                return;
+                            }
                         } else {return},
                         _=tokio::time::sleep_until(until)=>break,
                     }

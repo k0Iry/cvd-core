@@ -1593,3 +1593,6 @@ async fn drb_startup_handoff_keeps_known_frontier_without_cursor() {
 
 #[path = "drb_optional_contracts_tests.rs"]
 mod optional_contracts;
+
+#[path = "drb_recovery_cleanup_tests.rs"]
+mod recovery_cleanup;
