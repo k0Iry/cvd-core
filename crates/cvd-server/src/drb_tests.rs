@@ -365,20 +365,24 @@ async fn recovery_episode_keeps_fixed_target_and_20_attempt_limit_despite_new_tr
         tx.send(t(n, 1000)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    // Lagging history is a transient condition: the bounded episode still ends at
+    // exactly 20 attempts, then the source stays recovering (never terminal/live).
     tokio::time::timeout(Duration::from_secs(25), async {
-        while !shard.recovery.read().await.needs_backfill() {
+        while !shard.recovery.read().await.detail.as_deref().is_some_and(|d| d.contains("episode 1 ")) {
+            assert!(!shard.recovery.read().await.needs_backfill());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
     .unwrap();
-    drop(tx);
-    task.await.unwrap();
     let diag = shard.recovery.read().await.clone();
+    assert_eq!(diag.state, "recovering");
     assert_eq!(diag.attempts, 20);
     assert_eq!(calls.load(Ordering::SeqCst), 40); // two fixed-range pages per attempt
     assert_eq!(shard.engine.lock().await.last_trade_id.as_deref(), Some("100"));
-    assert!(diag.detail.unwrap().contains("target 105"));
+    assert!(diag.detail.unwrap().contains("after 20 attempts without committed progress; processed cursor 100; target 105"));
+    drop(tx);
+    task.await.unwrap();
 }
 
 #[tokio::test]
@@ -1357,4 +1361,232 @@ async fn primary_hole_after_progress_still_ends_bounded_without_skipping() {
     // structural bound is the unchanged 20-attempt cap once progress stops.
     assert!(outcome.contains("after 20 attempts without committed progress"), "{outcome}");
     let _ = elapsed;
+}
+
+// ---- Transient upstream outage longer than one bounded recovery episode ----
+// (incident 2026-11-05: `error sending request` exhausted 30s/20 attempts and
+// made the source sticky `needs_backfill` until a manual restart/reset).
+struct Outage {
+    down: std::sync::atomic::AtomicBool,
+    calls: AtomicUsize,
+    inflight: AtomicUsize,
+    peak: AtomicUsize,
+}
+fn ot_ms(seq: u64) -> i64 { 60_000 + seq as i64 * 7 }
+fn ot_row(seq: u64) -> Value {
+    json!({"instrument_name":drb::product(Symbol::Btc),"trade_seq":seq,"timestamp":ot_ms(seq),"price":100.0 + (seq % 5) as f64,"amount":0.001,"contracts":10.0,"direction":if seq.is_multiple_of(3) {"sell"} else {"buy"},"trade_id":format!("USDC-{seq}")})
+}
+fn ot_trade(seq: u64) -> Trade { drb::parse_trade(&ot_row(seq), drb::product(Symbol::Btc), 0.0001).unwrap() }
+async fn ot_fixture(top: u64) -> (String, Arc<Outage>) {
+    let o = Arc::new(Outage { down: true.into(), calls: AtomicUsize::new(0), inflight: AtomicUsize::new(0), peak: AtomicUsize::new(0) });
+    let o2 = o.clone();
+    let o3 = o.clone();
+    let app = axum::Router::new().route(
+        "/get_last_trades_by_instrument_and_time",
+        // Closed-minute predecessor for startup recovery (boundary = ot_ms(100)).
+        axum::routing::get(move || {
+            let o = o3.clone();
+            async move {
+                if o.down.load(Ordering::SeqCst) {
+                    return axum::response::IntoResponse::into_response(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                }
+                axum::response::IntoResponse::into_response(axum::Json(json!({"jsonrpc":"2.0","result":{"trades":[ot_row(99)]}})))
+            }
+        }),
+    ).route(
+        "/get_last_trades_by_instrument",
+        axum::routing::get(move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let o = o2.clone();
+            async move {
+                o.calls.fetch_add(1, Ordering::SeqCst);
+                let now = o.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                o.peak.fetch_max(now, Ordering::SeqCst);
+                struct Done(Arc<Outage>);
+                impl Drop for Done { fn drop(&mut self) { self.0.inflight.fetch_sub(1, Ordering::SeqCst); } }
+                let guard = Done(o.clone());
+                tokio::time::sleep(Duration::from_millis(150)).await; // held response: in-flight witness
+                drop(guard);
+                if o.down.load(Ordering::SeqCst) {
+                    return axum::response::IntoResponse::into_response(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                }
+                let start = q["start_seq"].parse::<u64>().unwrap();
+                let end = q["end_seq"].parse::<u64>().unwrap().min(top);
+                let count = q["count"].parse::<u64>().unwrap();
+                let last = end.min(start + count - 1);
+                let rows: Vec<Value> = (start..=last).map(ot_row).collect();
+                axum::response::IntoResponse::into_response(axum::Json(json!({"jsonrpc":"2.0","result":{"trades":rows,"has_more":last < q["end_seq"].parse::<u64>().unwrap()}})))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), o)
+}
+async fn ot_seeded() -> Arc<AppState> {
+    let s = Arc::new(crate::tests::state().await);
+    crate::ingestion::ingest_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, ot_trade(100)).await.unwrap();
+    s
+}
+async fn ot_oracle(top: u64) -> Arc<AppState> {
+    let s = Arc::new(crate::tests::state().await);
+    for n in 100..=top { crate::ingestion::ingest_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, ot_trade(n)).await.unwrap(); }
+    s
+}
+async fn ot_assert_parity(s: &AppState, top: u64) {
+    let o = ot_oracle(top).await;
+    let (a, b) = (crate::pick_shard(s, Exchange::Coinbase, Market::Usdc, Symbol::Btc), crate::pick_shard(&o, Exchange::Coinbase, Market::Usdc, Symbol::Btc));
+    assert_eq!(a.engine.lock().await.last_trade_id.as_deref(), Some(top.to_string().as_str()));
+    assert_eq!(m1(a).await, m1(b).await, "exact bars/volume/CVD");
+    assert_eq!(*a.cvd_closed_usdt.read().await, *b.cvd_closed_usdt.read().await);
+    assert_eq!(a.engine.lock().await.sec.trades, b.engine.lock().await.sec.trades);
+}
+/// Poll until live; the source must never become terminal and must never be
+/// reported live before `want` is ingested. Returns whether an in-flight request
+/// was positively observed while polling.
+async fn ot_until_live(sh: &crate::Shard, o: &Outage, want: u64, restore_at: Option<std::time::Instant>, secs: u64) -> bool {
+    let mut witnessed = false;
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            let d = sh.recovery.read().await.clone();
+            assert!(!d.needs_backfill(), "transient outage became terminal: {:?}", d.detail);
+            witnessed |= o.inflight.load(Ordering::SeqCst) == 1;
+            if d.state == "live" {
+                let c = sh.engine.lock().await.last_trade_id.clone();
+                assert_eq!(c.as_deref(), Some(want.to_string().as_str()), "early live");
+                break;
+            }
+            if restore_at.is_some_and(|t| std::time::Instant::now() >= t) { o.down.store(false, Ordering::SeqCst); }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("did not return live; {:?}", sh.recovery.try_read().map(|d| d.detail.clone())));
+    witnessed
+}
+
+#[tokio::test]
+async fn drb_outage_longer_than_episode_resumes_without_restart_or_new_trade() {
+    let (base, o) = ot_fixture(10_000).await;
+    let s = ot_seeded().await;
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    let eth = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Eth);
+    let (tx, rx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base.clone(), 0.0001));
+    let (etx, erx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let ew = tokio::spawn(drb::worker(s.clone(), Symbol::Eth, erx, base.clone(), 0.0001));
+    // Phase 1: gap 101..105, upstream down 40s (> 30s episode), no further input.
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(105)).await;
+    etx.send(t(1, 60_000)).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let w1 = ot_until_live(sh, &o, 105, Some(t0 + Duration::from_secs(40)), 150).await;
+    assert!(t0.elapsed() > Duration::from_secs(40));
+    let phase1_calls = o.calls.load(Ordering::SeqCst);
+    // Bounded: <=20 attempts per 30s episode (2 pages max when up), capped backoff between.
+    assert!(phase1_calls <= 2 * 20 + 4, "phase1 calls {phase1_calls}");
+    ot_assert_parity(&s, 105).await;
+    assert_eq!(eth.recovery.read().await.state, "live", "other symbol unaffected");
+
+    // Phase 2: second outage under a continuous tail larger than the pending bound.
+    o.down.store(true, Ordering::SeqCst);
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(107)).await;
+    let top = 107 + crate::recovery::RECOVERY_CHANNEL_CAPACITY as u64 + 900;
+    let mut max_buffered = 0;
+    for (i, n) in (108..=top).enumerate() {
+        crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(n)).await;
+        if i.is_multiple_of(256) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let d = sh.recovery.read().await.clone();
+            assert!(!d.needs_backfill(), "{:?}", d.detail);
+            assert_ne!(d.state, "live");
+            max_buffered = max_buffered.max(d.buffered_trades);
+        }
+    }
+    assert!(max_buffered <= crate::recovery::RECOVERY_CHANNEL_CAPACITY + 1, "{max_buffered}");
+    let t1 = std::time::Instant::now();
+    let w2 = ot_until_live(sh, &o, top, Some(t1 + Duration::from_secs(35)), 200).await;
+    assert!(w1 || w2, "positive in-flight witness missing");
+    assert_eq!(o.peak.load(Ordering::SeqCst), 1, "at most one active request");
+    ot_assert_parity(&s, top).await;
+
+    // Phase 3: socket closes while backing off; a reconnect resumes exactly.
+    o.down.store(true, Ordering::SeqCst);
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(top + 5)).await;
+    tokio::time::sleep(Duration::from_secs(33)).await;
+    assert_eq!(sh.recovery.read().await.state, "recovering");
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), w).await.expect("worker leaked on close").unwrap();
+    let (tx, rx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(top + 9)).await;
+    ot_until_live(sh, &o, top + 9, Some(std::time::Instant::now() + Duration::from_secs(5)), 120).await;
+    ot_assert_parity(&s, top + 9).await;
+    assert_eq!(o.peak.load(Ordering::SeqCst), 1);
+    drop(tx);
+    drop(etx);
+    tokio::time::timeout(Duration::from_secs(10), w).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ew).await.unwrap().unwrap();
+}
+
+/// R1 socket handoff (DRB): old worker knows 8294 with cursor 100 while history
+/// is down; FIFO closes. New worker on the same shard receives only a valid
+/// lower prefix 103, history is restored, no higher execution follows. Must not
+/// report live below 8294, and must catch up to 8294 without a reset.
+#[tokio::test]
+async fn drb_socket_handoff_keeps_known_frontier_on_lower_prefix() {
+    const FRONTIER: u64 = 8294;
+    let (base, o) = ot_fixture(FRONTIER).await;
+    let s = ot_seeded().await;
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    let (tx, rx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base.clone(), 0.0001));
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(FRONTIER)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(sh.recovery.read().await.state, "recovering");
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), w).await.expect("worker leaked on close").unwrap();
+    assert_eq!(sh.engine.lock().await.last_trade_id.as_deref(), Some("100"));
+    assert_eq!(sh.engine.lock().await.drb_known_frontier.as_ref().map(|t| t.id.clone()), Some(FRONTIER.to_string()), "obligation handed to the runtime owner");
+    let (tx, rx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+    o.down.store(false, Ordering::SeqCst);
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(103)).await;
+    ot_until_live(sh, &o, FRONTIER, None, 120).await;
+    ot_assert_parity(&s, FRONTIER).await;
+    assert_eq!(o.peak.load(Ordering::SeqCst), 1);
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), w).await.unwrap().unwrap();
+    assert!(sh.engine.lock().await.drb_known_frontier.is_none(), "obligation released after the worker joins");
+}
+
+/// R1b startup frontier (DRB): runtime initialized from history (closed-minute
+/// boundary, no ingested cursor). The old worker sees 8294 while history is
+/// down and commits nothing; FIFO closes. Successor sees only lower 103 with
+/// history restored. Must not go live below 8294; must catch up to 8294.
+#[tokio::test]
+async fn drb_startup_handoff_keeps_known_frontier_without_cursor() {
+    const FRONTIER: u64 = 8294;
+    let (base, o) = ot_fixture(FRONTIER).await;
+    let s = Arc::new(crate::tests::state().await);
+    let sh = crate::pick_shard(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc);
+    sh.engine.lock().await.recovery_from_ms = Some(ot_ms(100));
+    let (tx, rx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base.clone(), 0.0001));
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(FRONTIER)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(sh.recovery.read().await.state, "recovering");
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), w).await.expect("worker leaked on close").unwrap();
+    assert_eq!(sh.engine.lock().await.last_trade_id, None, "no replay commit while history was down");
+    assert_eq!(sh.engine.lock().await.drb_known_frontier.as_ref().map(|t| t.id.clone()), Some(FRONTIER.to_string()), "startup obligation handed to the runtime owner");
+    let (tx, rx) = mpsc::channel(crate::recovery::RECOVERY_CHANNEL_CAPACITY);
+    let w = tokio::spawn(drb::worker(s.clone(), Symbol::Btc, rx, base, 0.0001));
+    o.down.store(false, Ordering::SeqCst);
+    crate::recovery::enqueue_trade(&s, Exchange::Coinbase, Market::Usdc, Symbol::Btc, &tx, ot_trade(103)).await;
+    ot_until_live(sh, &o, FRONTIER, None, 120).await;
+    ot_assert_parity(&s, FRONTIER).await;
+    assert_eq!(o.peak.load(Ordering::SeqCst), 1);
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), w).await.unwrap().unwrap();
+    assert!(sh.engine.lock().await.drb_known_frontier.is_none(), "obligation released after the worker joins");
 }

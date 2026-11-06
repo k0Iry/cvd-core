@@ -30,6 +30,16 @@ pub const RECOVERY_CHANNEL_CAPACITY: usize = 8_192;
 const RECOVERY_ATTEMPTS: usize = 20;
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Cap of the pause between bounded recovery episodes during a transient outage.
+const OUTAGE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Pause before the next bounded recovery episode after `episode` consecutive
+/// episodes ended without committed progress for transient reasons
+/// (2s, 4s, ... capped at 60s). Per-request deadlines and the per-episode
+/// attempt/deadline limits are unchanged; this only spaces episodes apart.
+pub(crate) fn outage_backoff(episode: u32) -> Duration {
+    Duration::from_secs(1_u64 << episode.clamp(1, 6)).min(OUTAGE_BACKOFF_MAX)
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RecoveryDiagnostics {
@@ -96,6 +106,7 @@ impl RecoveryCoordinator {
         Self { anchor, buffer: VecDeque::with_capacity(buffer_capacity), buffer_capacity, spot_target: None }
     }
 
+    #[cfg(test)]
     pub fn push_ws(&mut self, trade: Trade) -> Result<()> {
         anyhow::ensure!(
             self.buffer.len() < self.buffer_capacity,
@@ -104,6 +115,19 @@ impl RecoveryCoordinator {
         );
         self.buffer.push_back(trade);
         Ok(())
+    }
+
+    /// Bounded buffering for a long recovery: when full, coalesce the buffered
+    /// executions into the known required-through frontier (their highest ID).
+    /// REST must then prove contiguous coverage through that ID before the
+    /// handoff, so nothing known is skipped and memory stays bounded.
+    fn push_ws_coalescing(&mut self, trade: Trade) {
+        if self.buffer.len() >= self.buffer_capacity {
+            let high = self.buffer.iter().filter_map(|t| t.id.parse::<u64>().ok()).max();
+            self.spot_target = self.spot_target.max(high);
+            self.buffer.clear();
+        }
+        self.buffer.push_back(trade);
     }
 
     pub fn buffered_len(&self) -> usize {
@@ -159,12 +183,14 @@ impl RecoveryCoordinator {
         };
 
         let buffered_ids: HashSet<&str> = self.buffer.iter().map(|trade| trade.id.as_str()).collect();
-        let overlap = rest
-            .iter()
-            .rev()
-            .find(|trade| buffered_ids.contains(trade.id.as_str()))
-            .cloned()
-            .or_else(|| self.spot_target.and_then(|id| rest.iter().find(|t| t.id == id.to_string()).cloned()));
+        let buffered_overlap = rest.iter().rev().find(|trade| buffered_ids.contains(trade.id.as_str())).cloned();
+        let target_overlap = self.spot_target.and_then(|id| rest.iter().find(|t| t.id == id.to_string()).cloned());
+        // Take the later proven overlap: a stale lower buffered duplicate must not
+        // cut the handoff below the known required-through ID.
+        let overlap = match (buffered_overlap, target_overlap) {
+            (Some(b), Some(t)) => Some(if compare_trades(&t, &b) == Ordering::Greater { t } else { b }),
+            (b, t) => b.or(t),
+        };
         if overlap.is_none() {
             return RecoveryDecision::Retry(format!(
                 "public history through {latest_ms} has not overlapped {} buffered websocket trades",
@@ -185,6 +211,14 @@ impl RecoveryCoordinator {
         if self.spot_target.is_some() {
             if let Err(error) = validate_spot_handoff(&self.anchor, &handoff) {
                 return RecoveryDecision::Retry(format!("spot history has not closed the ID gap: {error}"));
+            }
+        }
+        // The handoff must reach the known required-through ID (the trigger, or the
+        // frontier retained by coalescing); a lower overlap is not completion.
+        if let Some(target) = self.spot_target {
+            let reached = handoff.iter().filter_map(|t| t.id.parse::<u64>().ok()).max();
+            if reached.is_none_or(|top| top < target) {
+                return RecoveryDecision::Retry(format!("spot history has not reached required-through ID {target}"));
             }
         }
         self.buffer.clear();
@@ -528,6 +562,10 @@ mod safety_tests;
 #[cfg(test)]
 #[path = "recovery_spot_tests.rs"]
 mod spot_tests;
+
+#[cfg(test)]
+#[path = "recovery_outage_tests.rs"]
+mod outage_tests;
 
 #[cfg(test)]
 mod tests {

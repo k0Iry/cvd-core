@@ -524,6 +524,12 @@ pub(super) async fn archive_chunk(
     Ok(output)
 }
 
+/// Retry details where the authoritative tape itself skipped a sequence. These
+/// are not outages: after the unchanged bounded episode the source fails closed.
+fn is_hole(detail: &str) -> bool {
+    detail.starts_with("unproven sequence ") || detail.starts_with("archive missing sequence interval ")
+}
+
 fn same(a: &Trade, b: &Trade) -> bool {
     a.id == b.id
         && a.timestamp_ms == b.timestamp_ms
@@ -557,21 +563,46 @@ pub(super) fn drop_below_high_water(pending: &mut BTreeMap<u64, Trade>) {
     }
 }
 
-pub(crate) async fn worker(
+pub(crate) async fn worker(state: Arc<AppState>, symbol: Symbol, rx: mpsc::Receiver<Trade>, base: String, size: f64) {
+    // The shard (runtime owner) carries the highest known WS execution above the
+    // committed cursor across socket workers: a successor that only sees a lower
+    // valid prefix must still recover through the predecessor's known frontier.
+    let shard = crate::pick_shard(&state, Exchange::Coinbase, Market::Usdc, symbol).clone();
+    let handed_over = shard.engine.lock().await.drb_known_frontier.clone();
+    let mut pending = BTreeMap::<u64, Trade>::new();
+    run_worker(state, symbol, rx, base, size, handed_over, &mut pending).await;
+    let mut engine = shard.engine.lock().await;
+    let committed = engine.last_trade_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+    let seq = |t: &Trade| t.id.parse::<u64>().unwrap_or(0);
+    let known = [engine.drb_known_frontier.take(), pending.pop_last().map(|(_, t)| t)]
+        .into_iter()
+        .flatten()
+        .max_by_key(seq);
+    // Without an ingested cursor, a startup trade on/after the uncommitted
+    // closed-minute boundary is still owed by the recovery.
+    let from = engine.recovery_from_ms;
+    engine.drb_known_frontier = known.filter(|t| match committed {
+        Some(c) => seq(t) > c,
+        None => from.is_some_and(|f| t.timestamp_ms >= f),
+    });
+}
+
+async fn run_worker(
     state: Arc<AppState>,
     symbol: Symbol,
     mut rx: mpsc::Receiver<Trade>,
     base: String,
     size: f64,
+    mut handed_over: Option<Trade>,
+    pending: &mut BTreeMap<u64, Trade>,
 ) {
     let market = Market::Usdc;
     let shard = crate::pick_shard(&state, Exchange::Coinbase, market, symbol).clone();
-    let mut pending = BTreeMap::<u64, Trade>::new();
     let mut seen = BTreeMap::<u64, Trade>::new();
     let mut budget: Option<(Instant, usize)> = None;
-    // True while the durable anchor is older than the primary window and the
-    // gap is being bridged from the archive in bounded chunks.
-    let mut long_gap = false;
+    // Consecutive bounded recovery episodes that ended without progress for
+    // transient reasons; spaces the next episode with a capped backoff.
+    let mut outage = 0_u32;
     let (initial_cursor, initial_from) = {
         let e = shard.engine.lock().await;
         (e.last_trade_id.clone(), e.recovery_from_ms)
@@ -588,7 +619,11 @@ pub(crate) async fn worker(
         return;
     }
     let mut startup = initial_from.is_some() && initial_cursor.is_none();
-    while let Some(trade) = rx.recv().await {
+    // A handed-over obligation is processed first, without waiting for new input.
+    while let Some(trade) = match handed_over.take() {
+        Some(trade) => Some(trade),
+        None => rx.recv().await,
+    } {
         if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await {
             break;
         }
@@ -634,14 +669,12 @@ pub(crate) async fn worker(
         } else {
             pending.insert(seq, trade);
         }
-        if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY && long_gap {
-            // Archive bridge: keep the fixed target and memory bounded by retaining the
-            // highest buffered identity and evicting the entry just below it; evicted
-            // sequences stay unproven until replay supplies them contiguously.
-            drop_below_high_water(&mut pending);
-        } else if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY {
-            crate::recovery::mark_buffer_exhausted(&state, Exchange::Coinbase, market, symbol).await;
-            break;
+        if pending.len() > crate::recovery::RECOVERY_CHANNEL_CAPACITY {
+            // Archive bridge or prolonged outage: keep the fixed target and memory
+            // bounded by retaining the highest buffered identity and evicting the entry
+            // just below it; evicted sequences stay unproven until replay supplies them
+            // contiguously (the known high-water stays required before live).
+            drop_below_high_water(pending);
         }
         loop {
             let Some((&first, first_trade)) = pending.first_key_value() else {
@@ -687,7 +720,9 @@ pub(crate) async fn worker(
             let anchor_ms = if startup { initial_from } else { shard.engine.lock().await.last_trade_ms };
             let (&high_seq, high_trade) = pending.last_key_value().expect("non-empty");
             let fresh = (high_seq, high_trade.timestamp_ms);
-            long_gap = anchor_ms.is_some_and(|ms| fresh.1 - ms > ARCHIVE_AFTER_MS);
+            // True while the durable anchor is older than the primary window and the
+            // gap is being bridged from the archive in bounded chunks (diagnostic only).
+            let long_gap = anchor_ms.is_some_and(|ms| fresh.1 - ms > ARCHIVE_AFTER_MS);
             diag.detail = Some(if long_gap {
                 format!(
                     "DRB archive bridge; cursor {} at {} ms; fixed target {target} at {first_ms} ms",
@@ -710,6 +745,10 @@ pub(crate) async fn worker(
             drop(current);
             let mut completed = false;
             let mut progressed = false;
+            // Last attempt saw an authoritative sequence hole (not an outage).
+            let mut hole = false;
+            // Last bounded error of this episode only (never prior cooldown text).
+            let mut last_error = String::new();
             while *attempts < ATTEMPTS && Instant::now() < *deadline {
                 if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await {
                     return;
@@ -746,7 +785,7 @@ pub(crate) async fn worker(
                                 if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
                                 if let Some(old)=pending.get(&n) { if !same(old,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting buffered sequence {n}")).await;return;} }
                                 else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                                if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { if long_gap { drop_below_high_water(&mut pending); } else {crate::recovery::mark_buffer_exhausted(&state,Exchange::Coinbase,market,symbol).await;return;} }
+                                if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { drop_below_high_water(pending); }
                             },
                             None=>return, // no partial replay, join happens at caller
                         },
@@ -819,12 +858,18 @@ pub(crate) async fn worker(
                         return;
                     }
                     Some(Err(HistoryError::Retry(e))) => {
+                        hole = is_hole(&e);
+                        last_error = e.chars().take(300).collect();
                         diag.detail = Some(e);
                         if !crate::recovery::store_recovery(&shard, diag.clone()).await {
                             return;
                         }
                     }
-                    None => break,
+                    None => {
+                        hole = false; // in-flight request outlived the episode: transient
+                        last_error = "history request outlived the episode deadline".into();
+                        break;
+                    }
                 }
                 let pause = (Instant::now() + Duration::from_secs(1)).min(*deadline);
                 loop {
@@ -835,27 +880,63 @@ pub(crate) async fn worker(
                             if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
                             if let Some(old)=pending.get(&n) {if !same(old,&t){crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting sequence {n}")).await;return;}}
                             else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
-                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { if long_gap { drop_below_high_water(&mut pending); } else {crate::recovery::mark_buffer_exhausted(&state,Exchange::Coinbase,market,symbol).await;return;} }
+                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { drop_below_high_water(pending); }
                         } else {return},
                         _=tokio::time::sleep_until(pause)=>break,
                     }
                 }
             }
             if !completed {
-                crate::recovery::reject_source(
-                    &state,
-                    Exchange::Coinbase,
-                    market,
-                    symbol,
-                    format!(
-                        "DRB recovery budget exhausted after {attempts} attempts without committed progress; processed cursor {}; target {target}; {}",
-                        cursor.map_or("none".into(), |c| c.to_string()),
-                        diag.detail.unwrap_or_default()
-                    ),
-                )
-                .await;
-                return;
+                let reason = format!(
+                    "budget exhausted after {attempts} attempts without committed progress; processed cursor {}; target {target}; {}",
+                    cursor.map_or("none".into(), |c| c.to_string()),
+                    last_error
+                );
+                if hole {
+                    // Authoritative history skips a sequence: fail closed as before.
+                    crate::recovery::reject_source(
+                        &state,
+                        Exchange::Coinbase,
+                        market,
+                        symbol,
+                        format!("DRB recovery {reason}"),
+                    )
+                    .await;
+                    return;
+                }
+                // Transient unavailability (transport/HTTP/RPC retryable, lagging or empty
+                // history, request outliving the episode): stay recovering and never live,
+                // back off (capped), then start a new bounded episode from the committed
+                // cursor and the same fixed target, without waiting for a new trade.
+                outage = outage.saturating_add(1);
+                let wait = crate::recovery::outage_backoff(outage);
+                diag.state = "recovering".into();
+                diag.buffered_trades = pending.len();
+                diag.detail = Some(format!(
+                    "DRB history temporarily unavailable; episode {outage} {reason}; automatic retry in {}s",
+                    wait.as_secs()
+                ));
+                if !crate::recovery::store_recovery(&shard, diag).await {
+                    return;
+                }
+                let until = Instant::now() + wait;
+                loop {
+                    tokio::select! {
+                        incoming=rx.recv()=> if let Some(t)=incoming {
+                            if crate::recovery::is_terminal(&state, Exchange::Coinbase, market, symbol).await { return; }
+                            let n: u64=match t.id.parse(){Ok(n)=>n,Err(_)=>{crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,"invalid buffered sequence".into()).await;return;}};
+                            if let Err(error)=remember(&mut seen,n,&t) {crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,error.to_string()).await;return;}
+                            if let Some(old)=pending.get(&n) {if !same(old,&t){crate::recovery::reject_source(&state,Exchange::Coinbase,market,symbol,format!("conflicting sequence {n}")).await;return;}}
+                            else if cursor.is_none_or(|c|n>c) {pending.insert(n,t);}
+                            if pending.len()>crate::recovery::RECOVERY_CHANNEL_CAPACITY { drop_below_high_water(pending); }
+                        } else {return},
+                        _=tokio::time::sleep_until(until)=>break,
+                    }
+                }
+                budget = None;
+                continue;
             }
+            outage = 0;
             // Keep the same budget across chained gaps; a new incoming trade cannot reset it.
             if pending.is_empty() {
                 budget = None;

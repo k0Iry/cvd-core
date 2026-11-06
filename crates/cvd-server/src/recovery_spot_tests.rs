@@ -453,7 +453,7 @@ async fn missing_authoritative_cursor_enters_terminal_backfill_without_advancing
 }
 
 #[tokio::test]
-async fn exhausted_rest_attempts_pause_without_silent_resume() {
+async fn exhausted_rest_attempts_stay_recovering_without_silent_resume() {
     let state = Arc::new(crate::tests::state().await);
     let shard = crate::pick_shard(&state, Exchange::Coinbase, Market::Spot, Symbol::Btc);
     {
@@ -464,8 +464,11 @@ async fn exhausted_rest_attempts_pause_without_silent_resume() {
     let (tx, rx) = mpsc::channel(8);
     let worker = tokio::spawn(run_spot_worker_with_fetch(state.clone(), Symbol::Btc, rx, |_| async { Ok(Vec::new()) }));
     tx.send(SpotInput::Heartbeat(101)).await.unwrap();
+    // Empty history is transient: the bounded episode ends, the source stays
+    // recovering (not live, cursor unchanged) and backs off before retrying.
     tokio::time::timeout(Duration::from_secs(25), async {
-        while !shard.recovery.read().await.needs_backfill() {
+        while !shard.recovery.read().await.detail.as_deref().is_some_and(|d| d.contains("episode 1 ")) {
+            assert!(!shard.recovery.read().await.needs_backfill());
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -474,7 +477,8 @@ async fn exhausted_rest_attempts_pause_without_silent_resume() {
     drop(tx);
     worker.await.unwrap();
     let diagnostics = shard.recovery.read().await;
+    assert_eq!(diagnostics.state, "recovering");
     assert_eq!(diagnostics.attempts, RECOVERY_ATTEMPTS);
-    assert!(diagnostics.detail.as_deref().unwrap().contains("budget exhausted"));
+    assert!(diagnostics.detail.as_deref().unwrap().contains(&format!("after {RECOVERY_ATTEMPTS} attempts without progress")));
     assert_eq!(shard.engine.lock().await.last_trade_id.as_deref(), Some("100"));
 }

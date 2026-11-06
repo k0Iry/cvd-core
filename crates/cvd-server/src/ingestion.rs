@@ -18,6 +18,11 @@ pub struct SymbolState {
     // First witnessed spot heartbeat: an origin, not an ingested trade.
     // Retained across socket workers until the first actual trade is committed.
     pub(crate) spot_bootstrap_id: Option<u64>,
+    // In-memory recovery obligations handed from a closed socket worker to its
+    // successor on the same shard: the highest known execution above the
+    // committed cursor. Not persisted; a process restart does not carry it.
+    pub(crate) spot_known_frontier: Option<u64>,
+    pub(crate) drb_known_frontier: Option<Trade>,
     pub last_trade_ms: Option<i64>,
     pub recovery_from_ms: Option<i64>,
     replay_frontier_ms: Option<i64>,
@@ -38,6 +43,8 @@ impl SymbolState {
             cvd_closed_usdt: 0.0,
             last_trade_id: None,
             spot_bootstrap_id: None,
+            spot_known_frontier: None,
+            drb_known_frontier: None,
             last_trade_ms: None,
             recovery_from_ms: None,
             replay_frontier_ms: None,
