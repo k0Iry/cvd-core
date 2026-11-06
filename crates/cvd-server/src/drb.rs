@@ -82,6 +82,10 @@ pub(super) fn parse_trade(v: &Value, product: &str, contract_size: f64) -> Resul
         .and_then(Value::as_u64)
         .filter(|n| *n > 0)
         .ok_or_else(|| anyhow!("invalid integer trade_seq"))?;
+    // Bounded diagnostic: product/sequence only, never the payload.
+    parse_fields(v, seq, contract_size).map_err(|e| anyhow!("{e} ({product} trade_seq {seq})"))
+}
+fn parse_fields(v: &Value, seq: u64, contract_size: f64) -> Result<Trade> {
     let ms = v
         .get("timestamp")
         .and_then(Value::as_i64)
@@ -89,12 +93,19 @@ pub(super) fn parse_trade(v: &Value, product: &str, contract_size: f64) -> Resul
         .ok_or_else(|| anyhow!("invalid millisecond timestamp"))?;
     let price = positive(v, "price")?;
     let base = positive(v, "amount")?;
-    let contracts = positive(v, "contracts")?;
-    let expected = contracts * contract_size;
-    anyhow::ensure!(
-        expected.is_finite() && (base - expected).abs() <= (base * 1e-8).max(1e-10),
-        "amount does not match contracts * contract_size"
-    );
+    anyhow::ensure!(contract_size.is_finite() && contract_size > 0.0, "invalid contract_size");
+    let tolerance = (base * 1e-8).max(1e-10);
+    // `contracts` is documented optional and absent on some historical rows;
+    // the required `amount` (base units for linear futures) is authoritative.
+    // Absent: no extra quantity rule. Present (including null/non-numeric):
+    // strict positive + consistency.
+    if v.get("contracts").is_some() {
+        let expected = positive(v, "contracts")? * contract_size;
+        anyhow::ensure!(
+            expected.is_finite() && (base - expected).abs() <= tolerance,
+            "amount does not match contracts * contract_size"
+        );
+    }
     let quote = base * price;
     anyhow::ensure!(quote.is_finite() && quote > 0.0, "invalid quote");
     let side = field(v, "direction")?;
@@ -350,13 +361,24 @@ pub(super) async fn history_until(
     Ok(output) // bounded contiguous prefix; the worker resumes from its new cursor
 }
 
-const IDENTITY_FIELDS: [&str; 8] =
-    ["trade_seq", "trade_id", "timestamp", "price", "amount", "contracts", "direction", "instrument_name"];
+const IDENTITY_FIELDS: [&str; 7] = ["trade_seq", "trade_id", "timestamp", "price", "amount", "direction", "instrument_name"];
+
+/// Same trade on one tape: every required identity field present and equal;
+/// the documented-optional `contracts` may be absent on either side but must
+/// be equal when both carry it. Each row is validated separately by parse_trade.
+fn same_row(a: &Value, b: &Value) -> bool {
+    IDENTITY_FIELDS.iter().all(|k| a.get(*k).is_some() && a.get(*k) == b.get(*k))
+        && match (a.get("contracts"), b.get("contracts")) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
+}
 
 async fn seq_rows(
     client: &reqwest::Client,
     base: &str,
     name: &str,
+    size: f64,
     start: u64,
     end: u64,
 ) -> std::result::Result<BTreeMap<u64, Value>, HistoryError> {
@@ -385,8 +407,11 @@ async fn seq_rows(
         if seq < start || seq > end {
             continue;
         }
+        // Validate every in-range row, so an invalid duplicate cannot hide behind
+        // a good earlier one.
+        parse_trade(row, name, size).map_err(fatal)?;
         if let Some(old) = out.get(&seq) {
-            if !IDENTITY_FIELDS.iter().all(|k| old.get(*k) == row.get(*k)) {
+            if !same_row(old, row) {
                 return Err(fatal(format!("conflicting duplicate archive sequence {seq}")));
             }
         } else {
@@ -426,13 +451,13 @@ pub(super) async fn archive_identity(
     let lo = target.saturating_sub(GATE_BACK).max(1);
     let hi = lo + GATE_LEN - 1;
     let name = product(symbol);
-    let a = seq_rows(client, primary, name, lo, hi).await?;
-    let b = seq_rows(client, archive, name, lo, hi).await?;
+    let a = seq_rows(client, primary, name, size, lo, hi).await?;
+    let b = seq_rows(client, archive, name, size, lo, hi).await?;
     if a.len() as u64 != GATE_LEN || b.len() as u64 != GATE_LEN {
         return Err(retry(format!("archive identity window {lo}-{hi} incomplete ({}/{})", a.len(), b.len())));
     }
     for (seq, row) in &a {
-        if !IDENTITY_FIELDS.iter().all(|k| row.get(*k).is_some() && row.get(*k) == b[seq].get(*k)) {
+        if !same_row(row, &b[seq]) {
             return Err(fatal(format!("archive identity mismatch at sequence {seq}")));
         }
     }
@@ -495,7 +520,7 @@ pub(super) async fn archive_chunk(
             tokio::time::sleep(ARCHIVE_PACE).await;
         }
         let end = (next + ARCHIVE_SPAN - 1).min(target - 1);
-        let rows = seq_rows(client, archive, name, next, end).await?;
+        let rows = seq_rows(client, archive, name, size, next, end).await?;
         let mut progressed = false;
         for (seq, row) in rows.range(next..=end) {
             if *seq != next {

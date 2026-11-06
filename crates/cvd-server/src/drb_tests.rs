@@ -1590,3 +1590,6 @@ async fn drb_startup_handoff_keeps_known_frontier_without_cursor() {
     tokio::time::timeout(Duration::from_secs(10), w).await.unwrap().unwrap();
     assert!(sh.engine.lock().await.drb_known_frontier.is_none(), "obligation released after the worker joins");
 }
+
+#[path = "drb_optional_contracts_tests.rs"]
+mod optional_contracts;

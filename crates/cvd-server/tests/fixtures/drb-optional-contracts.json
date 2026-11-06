@@ -1,0 +1,280 @@
+{
+ "provenance": {
+  "description": "Verbatim public Deribit-protocol trade rows (no credentials). Middle row of each primary window omits the documented OPTIONAL `contracts` field; archive counterparts carry it. Instrument metadata from the primary gateway.",
+  "schema": "https://docs.deribit.com/api-reference/market-data/public-get_last_trades_by_instrument.md (contracts: optional, may be absent in historical trades; amount required, base currency for linear futures)",
+  "sources": {
+   "BTC.primary": {
+    "url": "https://drb.coinbase.com/api/v2/public/get_last_trades_by_instrument?instrument_name=BTC_USDC-PERPETUAL&start_seq=29230820&end_seq=29230822&count=10&sorting=asc",
+    "fetched": "2026-11-06T13:21:34.094981+00:00"
+   },
+   "BTC.archive": {
+    "url": "https://history.deribit.com/api/v2/public/get_last_trades_by_instrument?instrument_name=BTC_USDC-PERPETUAL&start_seq=29230820&end_seq=29230822&count=10&sorting=asc",
+    "fetched": "2026-11-06T13:21:34.424364+00:00"
+   },
+   "ETH.primary": {
+    "url": "https://drb.coinbase.com/api/v2/public/get_last_trades_by_instrument?instrument_name=ETH_USDC-PERPETUAL&start_seq=28713628&end_seq=28713630&count=10&sorting=asc",
+    "fetched": "2026-11-06T13:28:34.196795+00:00"
+   },
+   "ETH.archive": {
+    "url": "https://history.deribit.com/api/v2/public/get_last_trades_by_instrument?instrument_name=ETH_USDC-PERPETUAL&start_seq=28713628&end_seq=28713630&count=10&sorting=asc",
+    "fetched": "2026-11-06T13:28:34.613790+00:00"
+   },
+   "BTC.instrument": {
+    "url": "https://drb.coinbase.com/api/v2/public/get_instrument?instrument_name=BTC_USDC-PERPETUAL",
+    "fetched": "2026-11-06T13:19:14.776916+00:00"
+   },
+   "ETH.instrument": {
+    "url": "https://drb.coinbase.com/api/v2/public/get_instrument?instrument_name=ETH_USDC-PERPETUAL",
+    "fetched": "2026-11-06T13:19:14.877229+00:00"
+   }
+  }
+ },
+ "BTC": {
+  "instrument": {
+   "tick_size_steps": [],
+   "taker_commission": 0.00035,
+   "quote_currency": "USDC",
+   "max_liquidation_commission": 0.01,
+   "lot_size": 1,
+   "product_group": "BTC",
+   "tick_size": 0.1,
+   "is_active": true,
+   "state": "open",
+   "index_id": 1000004,
+   "instrument_name": "BTC_USDC-PERPETUAL",
+   "block_trade_tick_size": 0.1,
+   "block_trade_min_trade_amount": 200000,
+   "base_currency_uuid": "5b71fc48-3dd3-540c-809b-f8c94d0e68b5",
+   "maker_commission": 0.00015,
+   "min_trade_amount": 0.0001,
+   "settlement_period": "perpetual",
+   "quote_currency_uuid": "2b92315d-eab7-5bef-84fa-089a131333f5",
+   "base_currency": "BTC",
+   "contract_size": 0.0001,
+   "future_type": "linear",
+   "instrument_id": 211704,
+   "block_trade_commission": 0.00025,
+   "counter_currency": "USDC",
+   "price_index": "btc_usdc",
+   "underlying_type": "crypto",
+   "creation_timestamp": 1646824342000,
+   "settlement_currency": "USDC",
+   "max_non_default_leverage": 5.0,
+   "max_leverage": 50,
+   "kind": "future",
+   "expiration_timestamp": 32503708800000,
+   "instrument_type": "linear"
+  },
+  "primary": [
+   {
+    "timestamp": 1793921827615,
+    "price": 75871.4,
+    "direction": "buy",
+    "index_price": 75855.69,
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "trade_seq": 29230820,
+    "amount": 0.1323,
+    "mark_price": 75875.01,
+    "tick_direction": 0,
+    "starbase_match_id": 244243665214517248,
+    "trade_id": "USDC-108546428",
+    "contracts": 1323.0,
+    "starbase_timestamp": 1793921827615355317
+   },
+   {
+    "timestamp": 1793921827674,
+    "price": 75871.3,
+    "direction": "sell",
+    "index_price": 75855.69,
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "trade_seq": 29230821,
+    "amount": 0.1323,
+    "mark_price": null,
+    "tick_direction": 2,
+    "starbase_match_id": 244243665461981184,
+    "trade_id": "USDC-108546430",
+    "starbase_timestamp": 1793921827674687936
+   },
+   {
+    "timestamp": 1793921828103,
+    "price": 75860.3,
+    "direction": "buy",
+    "index_price": 75855.69,
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "trade_seq": 29230822,
+    "amount": 0.1323,
+    "mark_price": 75874.89,
+    "tick_direction": 2,
+    "starbase_match_id": 244243667261337600,
+    "trade_id": "USDC-108546440",
+    "contracts": 1323.0,
+    "starbase_timestamp": 1793921828103849164
+   }
+  ],
+  "archive": [
+   {
+    "trade_seq": 29230820,
+    "trade_id": "USDC-108546428",
+    "timestamp": 1793921827615,
+    "tick_direction": 0,
+    "price": 75871.4,
+    "mark_price": 75875.01,
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "index_price": 75855.69,
+    "direction": "buy",
+    "contracts": 1323.0,
+    "amount": 0.1323
+   },
+   {
+    "trade_seq": 29230821,
+    "trade_id": "USDC-108546430",
+    "timestamp": 1793921827674,
+    "tick_direction": 2,
+    "price": 75871.3,
+    "mark_price": 75874.89,
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "index_price": 75855.69,
+    "direction": "sell",
+    "contracts": 1323.0,
+    "amount": 0.1323
+   },
+   {
+    "trade_seq": 29230822,
+    "trade_id": "USDC-108546440",
+    "timestamp": 1793921828103,
+    "tick_direction": 2,
+    "price": 75860.3,
+    "mark_price": 75874.89,
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "index_price": 75855.69,
+    "direction": "buy",
+    "contracts": 1323.0,
+    "amount": 0.1323
+   }
+  ]
+ },
+ "ETH": {
+  "instrument": {
+   "tick_size_steps": [],
+   "taker_commission": 0.00035,
+   "quote_currency": "USDC",
+   "max_liquidation_commission": 0.01,
+   "lot_size": 10,
+   "product_group": "ETH",
+   "tick_size": 0.01,
+   "is_active": true,
+   "state": "open",
+   "index_id": 2000004,
+   "instrument_name": "ETH_USDC-PERPETUAL",
+   "block_trade_tick_size": 0.01,
+   "block_trade_min_trade_amount": 100000,
+   "base_currency_uuid": "d85dce9b-5b73-5c3c-8978-522ce1d1c1b4",
+   "maker_commission": 0.00015,
+   "min_trade_amount": 0.0001,
+   "settlement_period": "perpetual",
+   "quote_currency_uuid": "2b92315d-eab7-5bef-84fa-089a131333f5",
+   "base_currency": "ETH",
+   "contract_size": 0.0001,
+   "future_type": "linear",
+   "instrument_id": 211305,
+   "block_trade_commission": 0.00025,
+   "counter_currency": "USDC",
+   "price_index": "eth_usdc",
+   "underlying_type": "crypto",
+   "creation_timestamp": 1647262800000,
+   "settlement_currency": "USDC",
+   "max_non_default_leverage": 5.0,
+   "max_leverage": 50,
+   "kind": "future",
+   "expiration_timestamp": 32503708800000,
+   "instrument_type": "linear"
+  },
+  "primary": [
+   {
+    "timestamp": 1793902041390,
+    "price": 2242.75,
+    "direction": "sell",
+    "index_price": 2242.52,
+    "instrument_name": "ETH_USDC-PERPETUAL",
+    "trade_seq": 28713628,
+    "amount": 1.0035,
+    "mark_price": 2242.71,
+    "tick_direction": 3,
+    "starbase_match_id": 244160675771854848,
+    "trade_id": "USDC-107846385",
+    "contracts": 10035.0,
+    "starbase_timestamp": 1793902041390886104
+   },
+   {
+    "timestamp": 1793902041413,
+    "price": 2242.75,
+    "direction": "sell",
+    "index_price": 2242.52,
+    "instrument_name": "ETH_USDC-PERPETUAL",
+    "trade_seq": 28713629,
+    "amount": 0.6767,
+    "mark_price": null,
+    "tick_direction": 3,
+    "starbase_match_id": 244160675868323840,
+    "trade_id": "USDC-107846386",
+    "starbase_timestamp": 1793902041413634336
+   },
+   {
+    "timestamp": 1793902041636,
+    "price": 2242.75,
+    "direction": "sell",
+    "index_price": 2242.52,
+    "instrument_name": "ETH_USDC-PERPETUAL",
+    "trade_seq": 28713630,
+    "amount": 0.0079,
+    "mark_price": 2242.71,
+    "tick_direction": 3,
+    "starbase_match_id": 244160676803653632,
+    "trade_id": "USDC-107846389",
+    "contracts": 79.0,
+    "starbase_timestamp": 1793902041636814478
+   }
+  ],
+  "archive": [
+   {
+    "trade_seq": 28713628,
+    "trade_id": "USDC-107846385",
+    "timestamp": 1793902041390,
+    "tick_direction": 3,
+    "price": 2242.75,
+    "mark_price": 2242.71,
+    "instrument_name": "ETH_USDC-PERPETUAL",
+    "index_price": 2242.52,
+    "direction": "sell",
+    "contracts": 10035.0,
+    "amount": 1.0035
+   },
+   {
+    "trade_seq": 28713629,
+    "trade_id": "USDC-107846386",
+    "timestamp": 1793902041413,
+    "tick_direction": 3,
+    "price": 2242.75,
+    "mark_price": 2242.71,
+    "instrument_name": "ETH_USDC-PERPETUAL",
+    "index_price": 2242.52,
+    "direction": "sell",
+    "contracts": 6767.0,
+    "amount": 0.6767
+   },
+   {
+    "trade_seq": 28713630,
+    "trade_id": "USDC-107846389",
+    "timestamp": 1793902041636,
+    "tick_direction": 3,
+    "price": 2242.75,
+    "mark_price": 2242.71,
+    "instrument_name": "ETH_USDC-PERPETUAL",
+    "index_price": 2242.52,
+    "direction": "sell",
+    "contracts": 79.0,
+    "amount": 0.0079
+   }
+  ]
+ }
+}
